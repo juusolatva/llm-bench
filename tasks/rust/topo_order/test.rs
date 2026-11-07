@@ -2,13 +2,18 @@
 mod harness_tests {
     use super::*;
 
+    fn harness_check(n: usize, edges: &[(usize, usize)], want: &[usize]) {
+        let got = topo_order(n, edges);
+        assert!(got.as_deref() == Ok(want), "topo_order({}, {:?}) = {:?}, want Ok({:?})", n, edges, got, want);
+    }
+
     #[test] fn small() {
-        assert_eq!(topo_order(0, &[]), Ok(vec![]));
-        assert_eq!(topo_order(3, &[]), Ok(vec![0, 1, 2]));
-        assert_eq!(topo_order(3, &[(2, 0)]), Ok(vec![1, 2, 0]));
-        assert_eq!(topo_order(4, &[(3, 1), (2, 1), (3, 0)]), Ok(vec![2, 3, 0, 1]));
-        assert_eq!(topo_order(5, &[(4, 0), (4, 0), (1, 0), (3, 2)]), Ok(vec![1, 3, 2, 4, 0]));
-        assert_eq!(topo_order(6, &[(5, 2), (5, 0), (4, 0), (4, 1), (2, 3), (3, 1)]), Ok(vec![4, 5, 0, 2, 3, 1]));
+        harness_check(0, &[], &[]);
+        harness_check(3, &[], &[0, 1, 2]);
+        harness_check(3, &[(2, 0)], &[1, 2, 0]);
+        harness_check(4, &[(3, 1), (2, 1), (3, 0)], &[2, 3, 0, 1]);
+        harness_check(5, &[(4, 0), (4, 0), (1, 0), (3, 2)], &[1, 3, 2, 4, 0]);
+        harness_check(6, &[(5, 2), (5, 0), (4, 0), (4, 1), (2, 3), (3, 1)], &[4, 5, 0, 2, 3, 1]);
     }
 
     #[test] fn errors() {
