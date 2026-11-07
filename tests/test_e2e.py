@@ -99,3 +99,38 @@ def test_sandbox_enforces_time_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_bench, "CMD_TIMEOUT_S", 2)
     rc, _ = llm_bench.run_cmd(["/bin/sleep", "30"], tmp_path)
     assert rc != 0
+
+
+def test_private_tasks_dir(monkeypatch, tmp_path, mock_server):
+    task = tmp_path / "tasks" / "python" / "double"
+    task.mkdir(parents=True)
+    (task / "prompt.md").write_text("Write `double(x)` in solution.py.\n")
+    (task / "test_solution.py").write_text("from solution import double\nassert double(2) == 4\nprint('ok')\n")
+    s = mock_server(replies=["```python\ndef double(x):\n    return 2 * x\n```"])
+    run(monkeypatch, tmp_path / "out", f"m={s.url}", "--tasks-dir", str(tmp_path / "tasks"))
+    (row,) = read_rows(tmp_path / "out" / "results_m.csv")
+    assert (row["task"], row["passed"]) == ("py_double", "1")
+    assert s.requests[0]["messages"][1]["content"] == "Write `double(x)` in solution.py."
+
+
+RUST_WORD_COUNT = """```rust
+use std::collections::HashMap;
+
+pub fn word_count(text: &str) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for w in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        *m.entry(w.to_lowercase()).or_insert(0) += 1;
+    }
+    m
+}
+```"""
+
+
+def test_appended_harness_language(monkeypatch, tmp_path, mock_server):
+    """Rust harnesses are appended to the solution file instead of written separately."""
+    s = mock_server(replies=[RUST_WORD_COUNT])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "rust_word_count", "--attempts", "1")
+    (row,) = read_rows(tmp_path / "results_m.csv")
+    log = (tmp_path / "runs/m/test_model/rust_word_count/attempt_1/log.txt").read_text()
+    assert row["passed"] == "1", log
+    assert "4 passed" in log

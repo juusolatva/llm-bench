@@ -4,17 +4,25 @@ Guidance for coding agents working in this repository.
 
 ## Overview
 
-`llm_bench.py` is a single-file, standard-library-only Python script. It benchmarks LLMs served over an OpenAI-compatible API on coding tasks and builds and tests the generated code in a sandbox. See `README.md` for user-facing documentation; keep it in sync when you change options, output formats, requirements or tasks.
+`llm_bench.py` is a standard-library-only Python script, and `tasks/` holds the benchmark tasks it loads at startup. It benchmarks LLMs served over an OpenAI-compatible API on coding tasks and builds and tests the generated code in a sandbox. See `README.md` for user-facing documentation; keep it in sync when you change options, output formats, requirements or tasks.
 
-File layout, top to bottom:
+Repository layout:
 
-1. **Configuration**: defaults for CLI options, sandbox limits, the system prompt, and `LANGS` (per-language file names and build/test commands).
-2. **Tasks**: a `*_PROMPT` and a `*_TEST` string per task, then the `TASKS` registry.
-3. **Runner**: HTTP client, endpoint parsing, sandbox (`run_cmd`), task execution, the per-endpoint loop (`run_endpoint`), summary, CLI.
+- `llm_bench.py`, top to bottom:
+  1. **Configuration**: defaults for CLI options, sandbox limits, the system prompt, and `LANGS` (per language: task name prefix, solution and harness file names, build/test commands).
+  2. **Task loading**: `load_tasks()` reads task directories (layout below).
+  3. **Runner**: HTTP client, endpoint parsing, sandbox (`run_cmd`), task execution, the per-endpoint loop (`run_endpoint`), summary, CLI.
+- `tasks/<lang>/<task>/`: one directory per task, where `<lang>` is a `LANGS` key:
+  - `prompt.md`: sent to the model verbatim (surrounding whitespace trimmed).
+  - The hidden harness, named `LANGS[lang]["test"]` (`test_solution.py`, `test.c`, `test.cpp`, `test.rs`, `solution_test.go`, `test.sh`). Rust harnesses are appended to the solution file, not written separately.
+  - Other files are ignored by the loader, which leaves room for e.g. reference solutions.
+  - The task name is `<prefix>_<task>` (`tasks/python/parse_duration` is `py_parse_duration`). Directory names may only use `a-z`, `0-9` and `_`.
+  - `--tasks-dir` loads the same layout from other directories (private task sets).
+- `tests/`: pytest suite (see "Checking changes").
 
 ## Constraints
 
-- **Standard library only, single file.** Users run it by downloading one script. Don't add dependencies or split it into a package without being asked.
+- **Standard library only, one script.** Users run `llm_bench.py` from a clone with no install step. Don't add dependencies or turn it into a package without being asked. Task content belongs in `tasks/`, not in the script.
 - **Never weaken the sandbox.** All model-generated code must run through `run_cmd`. Don't add an option that runs generated code on the host, don't expose more host paths, the network or the user's home, and don't loosen the resource limits or the cgroup check. Changes in this area need explicit sign-off from the maintainer.
 - **Treat model output as untrusted.** Replies are size-capped before parsing and before anything is written to disk. Paths derived from model or endpoint names go through `UNSAFE_NAME_RE`. Keep both of these in place.
 - **Server-agnostic.** Use only the OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints. No vendor-specific APIs or code paths.
@@ -22,15 +30,17 @@ File layout, top to bottom:
 
 ## Task conventions
 
-- Each language has 4 tasks: 3 "write this" tasks of increasing difficulty and 1 "fix this code" task (named `<lang>_fix_*`).
+- Add a task by creating its directory under `tasks/<lang>/`; no code changes are needed.
+- Each language has 4 tasks: 3 "write this" tasks of increasing difficulty and 1 "fix this code" task (directory named `fix_*`).
 - **Tests check only what the prompt states.** Any behaviour a test checks must be specified in the prompt. Don't test unstated edge cases.
 - Test failures must print the input, the actual result and the expected result, because this output is the feedback for the next attempt.
 - Prefix harness-defined identifiers (`harness_`, `HARNESS_`, `harness_tests`) so they can't collide with names in the solution. This matters most for C++ headers, Rust (the test module is appended to the solution file) and Go (same package).
 - C/C++ harnesses use exact-size heap copies of their inputs so ASan catches out-of-bounds access.
 - Bash harnesses run with `set -u` and `LC_ALL=C`, use a `mktemp -d` scratch dir, and include file names with spaces.
 - Prompts name the target file (`solution.py`, `solution.c`, `solution.hpp`, `package solution`, …) to match `LANGS`.
-- Before registering a new task, check that a correct reference solution passes it and that plausible wrong solutions fail it. A `MockServer` that returns those solutions works for this (see below).
-- Renaming or changing a task makes old results incomparable. Mention this in the change description.
+- Task harnesses are data, excluded from ruff, and must stay verbatim: any change to a prompt or harness, including whitespace, changes what models see.
+- Before adding a new task, check that a correct reference solution passes it and that plausible wrong solutions fail it. A `MockServer` that returns those solutions works for this (see below).
+- Renaming, moving or changing a task makes old results incomparable. Mention this in the change description.
 
 ## Checking changes
 
@@ -43,20 +53,20 @@ uv run --group dev pytest
 
 (Or run `ruff check .` and `pytest` directly if both are installed.)
 
-- `tests/test_unit.py`: pure functions, the task registry and the CLI. No sandbox needed.
+- `tests/test_unit.py`: pure functions, task loading (including the built-in task set's consistency) and the CLI. No sandbox needed.
 - `tests/test_e2e.py` (marker `sandbox`): full runs against the `MockServer` in `tests/conftest.py`, an OpenAI-compatible stdlib server that returns scripted replies, plus checks that the sandbox hides the home directory, the network and the environment. These tests skip themselves when bwrap + a systemd user session aren't available (e.g. in containers and on CI), so run them on a Linux host after touching the runner or the sandbox. Check the output for skips with `pytest -rs`.
 - Add tests for new CLI options and runner behaviour. Use `MockServer(replies=[...])` to script model answers.
 - `ruff format` isn't enforced. Don't reformat the whole file in an unrelated change.
+- pytest collects only from `tests/` (`testpaths`), so Python harnesses under `tasks/` (named `test_solution.py`) are never run as tests themselves.
 
 ## Future plans
 
 Planned, not started. Discuss the design with the maintainer before implementing.
 
 - **Container version.** Ship the benchmark as a container image (Podman/Docker) with pinned toolchain versions, so it runs on hosts without bwrap, a systemd user session or locally installed toolchains, and results are comparable across machines. The current sandbox doesn't work inside an ordinary container (no systemd user manager, user namespaces usually blocked), so the likely design is to use the container runtime itself as the sandbox for each build/test: a fresh container per attempt with `--network=none`, memory/swap, PID and CPU limits, a read-only root, all capabilities dropped and `no-new-privileges`, and the same timeouts and output caps. It must keep the existing guarantees (no network, no host files beyond the task inputs, enforced resource limits) and fail closed when they can't be applied, just like the current cgroup check. The bwrap + systemd sandbox stays as the native option. A container-based sandbox would also let the end-to-end tests run on CI instead of being skipped.
-- **More tasks, mainly new languages.** Candidates: TypeScript/JavaScript (Node), Java or Kotlin, C#, SQL (SQLite), Zig, and possibly Haskell or OCaml. Keep the same structure (3 "write this" tasks of increasing difficulty + 1 "fix this code" task per language) and the task conventions above. Constraints for a new language: the toolchain must build and test fully offline inside the sandbox (no package downloads, so no test frameworks outside the standard distribution unless they're preinstalled system-wide under `/usr`); it must work within the sandbox limits (2 GiB memory, 128 tasks, 60 s per build+test), which can be tight for JVM/.NET startup and thread counts; and toolchains installed outside `/usr` need an explicit read-only mount like the Rust sysroot. Adding a language also means a `LANGS` entry, the toolchain check, the README task table and requirements, and the task consistency test in `tests/test_unit.py`.
-- **Reference solutions.** A known-correct solution for every task, plus a test that runs each through the real sandbox and expects it to pass. This catches broken or over-strict harnesses, which otherwise only show up as models failing. New tasks would require one.
-- **Private task sets.** Once the tasks are public they can leak into training data. A `--tasks-file` option (e.g. a JSON or Python file with the same fields as `TASKS`) would let users keep unpublished tasks, alone or alongside the built-in ones.
+- **More tasks, mainly new languages.** Candidates: TypeScript/JavaScript (Node), Java or Kotlin, C#, SQL (SQLite), Zig, and possibly Haskell or OCaml. Keep the same structure (3 "write this" tasks of increasing difficulty + 1 "fix this code" task per language) and the task conventions above. Constraints for a new language: the toolchain must build and test fully offline inside the sandbox (no package downloads, so no test frameworks outside the standard distribution unless they're preinstalled system-wide under `/usr`); it must work within the sandbox limits (2 GiB memory, 128 tasks, 60 s per build+test), which can be tight for JVM/.NET startup and thread counts; and toolchains installed outside `/usr` need an explicit read-only mount like the Rust sysroot. Adding a language also means a `LANGS` entry (with a unique task name prefix), a `tasks/<lang>/` directory, the toolchain check, the README task table and requirements, and the task consistency test in `tests/test_unit.py`.
+- **Reference solutions.** A known-correct solution for every task, stored next to it (e.g. `tasks/<lang>/<task>/reference/<solution file>`), plus a test that runs each through the real sandbox and expects it to pass. This catches broken or over-strict harnesses, which otherwise only show up as models failing. New tasks would require one.
 - **Repeated runs.** A `--runs N` option to run each model × task N times and report the mean pass rate and its spread, since a single run at temperature > 0 is noisy. Needs a `run` column in the CSV and a per-run `runs/` directory layout.
 - **Resume.** A `--resume` option that keeps an existing results CSV and skips the model × task pairs already in it, instead of truncating the file, so an interrupted multi-hour run can continue.
-- **Comparison report.** Combine several results CSVs (different endpoints, tags or settings) into one comparison table, e.g. Markdown, per model and per language. Probably a subcommand or a separate mode of the same script, to keep it a single file.
+- **Comparison report.** Combine several results CSVs (different endpoints, tags or settings) into one comparison table, e.g. Markdown, per model and per language. Probably a subcommand or a separate mode of the same script.
 - **Speed metrics.** Report tokens per second per model (completion tokens / request time, from data already collected), and reasoning tokens separately where the server returns them (`usage.completion_tokens_details.reasoning_tokens`).

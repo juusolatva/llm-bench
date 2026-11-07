@@ -58,19 +58,76 @@ def test_default_model_filter(model, keep):
     assert llm_bench.default_model_filter(model) is keep
 
 
-def test_tasks_are_consistent():
-    names = [t["name"] for t in llm_bench.TASKS]
+BUILTIN_TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
+
+
+def test_builtin_tasks_are_consistent():
+    names = [t["name"] for t in BUILTIN_TASKS]
     assert len(names) == len(set(names))
-    prefixes = {"python": "py_", "c": "c_", "cpp": "cpp_", "rust": "rust_", "go": "go_", "bash": "bash_"}
-    for t in llm_bench.TASKS:
-        assert t["lang"] in llm_bench.LANGS
-        assert t["name"].startswith(prefixes[t["lang"]])
-        assert t["prompt"].strip() and t["test"].strip()
-    per_lang = Counter(t["lang"] for t in llm_bench.TASKS)
+    for t in BUILTIN_TASKS:
+        assert t["name"].startswith(llm_bench.LANGS[t["lang"]]["prefix"] + "_")
+        assert t["prompt"] and t["test"].strip()
+    per_lang = Counter(t["lang"] for t in BUILTIN_TASKS)
     assert set(per_lang) == set(llm_bench.LANGS)
     assert all(n == 4 for n in per_lang.values())
-    assert all(sum(t["lang"] == lang and "_fix_" in t["name"] for t in llm_bench.TASKS) == 1
+    assert all(sum(t["lang"] == lang and "_fix_" in t["name"] for t in BUILTIN_TASKS) == 1
                for lang in llm_bench.LANGS)
+
+
+def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):
+    d = root / lang / name
+    d.mkdir(parents=True)
+    if prompt is not None:
+        (d / "prompt.md").write_text(prompt)
+    if test is not None:
+        (d / llm_bench.LANGS[lang]["test"]).write_text(test)
+    return d
+
+
+def test_load_tasks_layout_and_order(tmp_path):
+    make_task(tmp_path, "bash", "b_task")
+    make_task(tmp_path, "python", "zeta", prompt="\n  Do Z.\n\n")
+    make_task(tmp_path, "python", "alpha")
+    (make_task(tmp_path, "rust", "r") / "reference").mkdir()   # extra files/dirs are ignored
+    (tmp_path / "python" / "__pycache__").mkdir()
+    (tmp_path / "README.md").write_text("ignored")
+    tasks = llm_bench.load_tasks([tmp_path])
+    assert [(t["name"], t["lang"]) for t in tasks] == [
+        ("py_alpha", "python"), ("py_zeta", "python"), ("rust_r", "rust"), ("bash_b_task", "bash")]
+    assert tasks[1]["prompt"] == "Do Z."
+    assert tasks[0]["test"] == "echo ok\n"
+
+
+def test_load_tasks_multiple_roots(tmp_path):
+    make_task(tmp_path / "a", "go", "one")
+    make_task(tmp_path / "b", "python", "two")
+    make_task(tmp_path / "b", "go", "three")
+    names = [t["name"] for t in llm_bench.load_tasks([tmp_path / "a", tmp_path / "b"])]
+    assert names == ["py_two", "go_one", "go_three"]
+
+
+@pytest.mark.parametrize(("setup", "error"), [
+    (lambda r: make_task(r, "python", "x", prompt=None), "missing prompt.md"),
+    (lambda r: make_task(r, "python", "x", test=None), "missing test_solution.py"),
+    (lambda r: make_task(r, "python", "x", prompt=" \n"), "empty prompt"),
+    (lambda r: make_task(r, "python", "Bad-Name"), "only a-z"),
+    (lambda r: (r / "java" / "x").mkdir(parents=True), "unknown language"),
+    (lambda r: None, "not found"),
+])
+def test_load_tasks_rejects(tmp_path, setup, error):
+    root = tmp_path / "tasks"
+    if error != "not found":
+        root.mkdir()
+    setup(root)
+    with pytest.raises(ValueError, match=error):
+        llm_bench.load_tasks([root])
+
+
+def test_load_tasks_rejects_duplicates_across_roots(tmp_path):
+    make_task(tmp_path / "a", "c", "same")
+    make_task(tmp_path / "b", "c", "same")
+    with pytest.raises(ValueError, match="duplicate task c_same"):
+        llm_bench.load_tasks([tmp_path / "a", tmp_path / "b"])
 
 
 def test_http_json_sends_api_key(mock_server):
@@ -122,6 +179,20 @@ def test_cli_list_tasks(monkeypatch, capsys):
     run_main(monkeypatch, "--list-tasks", "--task", "rust_*")
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 4 and all(line.startswith("rust_") for line in lines)
+
+
+def test_cli_tasks_dir(monkeypatch, capsys, tmp_path):
+    make_task(tmp_path, "python", "mine")
+    run_main(monkeypatch, "--list-tasks", "--tasks-dir", str(tmp_path))
+    assert capsys.readouterr().out.split() == ["py_mine", "python"]
+    run_main(monkeypatch, "--list-tasks", "--tasks-dir", str(tmp_path),
+             "--tasks-dir", str(llm_bench.DEFAULT_TASKS_DIR))
+    assert len(capsys.readouterr().out.splitlines()) == 25
+
+
+def test_cli_bad_tasks_dir(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit, match="cannot load tasks"):
+        run_main(monkeypatch, "--list-tasks", "--tasks-dir", str(tmp_path / "nope"))
 
 
 def test_cli_rejects_duplicate_endpoint_names(monkeypatch):

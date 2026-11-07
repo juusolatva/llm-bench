@@ -1,6 +1,6 @@
 # llm-bench
 
-A single-file benchmark for checking how well LLMs write and fix code. It sends 24 small programming tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
+A dependency-free benchmark for checking how well LLMs write and fix code. It sends 24 small programming tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
 
 It works with any server that implements `GET /v1/models` and `POST /v1/chat/completions`, including Ollama, LM Studio, the llama.cpp server, vLLM and hosted OpenAI-compatible APIs.
 
@@ -19,11 +19,30 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 
 The tests check only what the prompt states. Run `./llm_bench.py --list-tasks` to list them.
 
+Each task is a directory under [`tasks/`](tasks):
+
+```
+tasks/<lang>/<task>/
+  prompt.md          # sent to the model as is
+  test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go or test.sh for other languages)
+```
+
+The task name is the language prefix plus the directory name, so `tasks/python/parse_duration` is `py_parse_duration`.
+
+### Private tasks
+
+Tasks published on the internet can end up in model training data. To benchmark with tasks of your own, create a directory with the same layout and pass it with `--tasks-dir`. It replaces the built-in tasks; to run both, also pass the built-in directory:
+
+```sh
+./llm_bench.py localhost:11434 --tasks-dir ~/my-tasks
+./llm_bench.py localhost:11434 --tasks-dir ~/my-tasks --tasks-dir ./tasks
+```
+
 ## Requirements
 
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`).
-- Python 3.13+ (standard library only, nothing to `pip install`).
+- Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
 - The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++20), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
@@ -53,6 +72,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | `-m, --model PATTERN` | all | Only models whose ID matches an exact ID or shell glob. Repeatable. Without `-m`, embedding models and vision-language (`vl`) variants are skipped. |
 | `--task PATTERN` | all | Only tasks whose name matches a shell glob, e.g. `'py_*'`. Repeatable. |
 | `--list-tasks` | | List tasks and exit. |
+| `--tasks-dir DIR` | `tasks/` | Load tasks from `DIR` instead of the built-in ones. Repeatable. |
 | `--api-key KEY` | | Bearer token sent to every endpoint. Also read from `LLM_BENCH_API_KEY` or `OPENAI_API_KEY`. |
 | `--timeout SEC` | 1800 | Per-request timeout. It must cover model load time plus generating `--max-tokens` tokens on your slowest model. |
 | `--max-tokens N` | 16384 | Completion token limit. The prompt (up to ~9k tokens with feedback) plus `N` must fit in the model's context window. |
@@ -93,7 +113,7 @@ uv run --group dev pytest -rs
 
 The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They skip themselves where the sandbox isn't available (containers, CI).
 
-Tasks are defined in `llm_bench.py` as a prompt plus a test harness, and registered in the `TASKS` list. See [AGENTS.md](AGENTS.md) for the conventions.
+To add a task, create its directory under `tasks/`. No code changes are needed. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
 
 ## License
 

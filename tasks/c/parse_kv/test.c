@@ -1,0 +1,43 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int parse_kv(const char *line, char *key, size_t keysz, char *val, size_t valsz);
+
+static int fails;
+static void t(const char *line, size_t ks, size_t vs, int want, const char *wk, const char *wv) {
+    size_t n = strlen(line) + 1;
+    char *l = malloc(n); memcpy(l, line, n);
+    char *k = malloc(ks), *v = malloc(vs);   /* exact sizes: ASan catches overflows */
+    int r = parse_kv(l, k, ks, v, vs);
+    if (r != want || (want == 1 && (strcmp(k, wk) != 0 || strcmp(v, wv) != 0))) {
+        fprintf(stderr, "parse_kv(\"%s\", %zu, %zu): got %d", line, ks, vs, r);
+        if (r == 1) fprintf(stderr, " key=\"%s\" val=\"%s\"", k, v);
+        fprintf(stderr, ", want %d", want);
+        if (want == 1) fprintf(stderr, " key=\"%s\" val=\"%s\"", wk, wv);
+        fprintf(stderr, "\n");
+        fails++;
+    }
+    free(l); free(k); free(v);
+}
+int main(void) {
+    t("name = Bob\n", 32, 32, 1, "name", "Bob");
+    t("  path=/usr/local/bin  ", 32, 32, 1, "path", "/usr/local/bin");
+    t("greeting = hello world \r\n", 32, 32, 1, "greeting", "hello world");
+    t("my key = v", 32, 32, 1, "my key", "v");
+    t("empty =", 32, 32, 1, "empty", "");
+    t("a=b=c", 32, 32, 1, "a", "b=c");
+    t("# comment", 32, 32, 0, 0, 0);
+    t("   # indented = comment", 32, 32, 0, 0, 0);
+    t("", 32, 32, 0, 0, 0);
+    t("   \n", 32, 32, 0, 0, 0);
+    t("novalue", 32, 32, -1, 0, 0);
+    t("= x", 32, 32, -1, 0, 0);
+    t("   =x", 32, 32, -1, 0, 0);
+    t("abc=1", 4, 32, 1, "abc", "1");
+    t("abcd=1", 4, 32, -1, 0, 0);
+    t("k=abc", 4, 4, 1, "k", "abc");
+    t("k=abcd", 4, 4, -1, 0, 0);
+    if (fails) return 1;
+    puts("ok");
+    return 0;
+}
