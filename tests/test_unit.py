@@ -158,7 +158,7 @@ def test_print_summary(capsys):
     llm_bench.print_summary(rows, 3)
     out = capsys.readouterr().out
     assert "pass@3" in out and "python" in out and "go" in out
-    assert "c " not in out.splitlines()[1]   # only languages that were run get a column
+    assert "c" not in out.splitlines()[1].split()   # only languages that were run get a column
     assert "a-long-endpoint-name m1" in out
 
 
@@ -204,4 +204,23 @@ def test_cli_rejects_duplicate_endpoint_names(monkeypatch):
 def test_cli_rejects_bad_numbers(monkeypatch, arg):
     with pytest.raises(SystemExit) as exc:
         run_main(monkeypatch, "localhost:1", arg)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(("spec", "want"), [
+    ("top_p=0.9", ("top_p", 0.9)),
+    ("seed=1", ("seed", 1)),
+    ("stop=[\"END\"]", ("stop", ["END"])),
+    ("reasoning_effort=low", ("reasoning_effort", "low")),
+    ("x=", ("x", "")),
+])
+def test_parse_param(spec, want):
+    assert llm_bench.parse_param(spec) == want
+
+
+@pytest.mark.parametrize("args", [["--param", "noequals"], ["--param", "max_tokens=5"],
+                                  ["--param", "model=x"], ["--temperature", "0.2", "--param", "temperature=0.5"]])
+def test_cli_rejects_bad_params(monkeypatch, args):
+    with pytest.raises(SystemExit) as exc:
+        run_main(monkeypatch, "localhost:1", *args)
     assert exc.value.code == 2

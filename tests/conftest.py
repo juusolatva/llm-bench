@@ -23,13 +23,23 @@ class Reply:
 
 
 class MockServer:
-    """Minimal OpenAI-compatible server. `replies` (str or Reply) is consumed one per chat request."""
+    """Minimal OpenAI-compatible server. `replies` (str or Reply) is consumed one per chat request.
 
-    def __init__(self, models=("test/model",), replies=(), api_key=None):
+    Probe requests (max_tokens=1: the warm-up and context check) don't consume replies and are kept in
+    `probes`. They report one prompt token per word plus 10; `context` caps the reported count (a server
+    that truncates prompts), `reject_over` answers HTTP 400 above that many tokens, and `probe_reply`
+    (a Reply) replaces the answer to every probe (e.g. a model that fails to load)."""
+
+    def __init__(self, models=("test/model",), replies=(), api_key=None, context=None, reject_over=None,
+                 probe_reply=None):
         self.models = list(models)
         self.replies = list(replies)
         self.api_key = api_key
+        self.context = context
+        self.reject_over = reject_over
+        self.probe_reply = probe_reply
         self.requests = []
+        self.probes = []
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -62,8 +72,22 @@ class MockServer:
                 if not self._authorized():
                     return
                 req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                server.requests.append(req)
-                reply = server.replies.pop(0) if server.replies else ""
+                if req.get("max_tokens") == 1:
+                    server.probes.append(req)
+                    if server.probe_reply is None:
+                        tokens = 10 + sum(len(m["content"].split()) for m in req["messages"])
+                        if server.reject_over and tokens > server.reject_over:
+                            self._send(400, {"error": "prompt exceeds context length"})
+                            return
+                        if server.context:
+                            tokens = min(tokens, server.context)
+                        self._send(200, {"choices": [{"message": {"content": "OK"}, "finish_reason": "length"}],
+                                         "usage": {"prompt_tokens": tokens, "completion_tokens": 1}})
+                        return
+                    reply = server.probe_reply
+                else:
+                    server.requests.append(req)
+                    reply = server.replies.pop(0) if server.replies else ""
                 if isinstance(reply, Reply):
                     if reply.sleep:
                         time.sleep(reply.sleep)

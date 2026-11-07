@@ -12,9 +12,12 @@ Run with --help for usage.
 """
 import argparse
 import csv
+import hashlib
 import http.client
 import json
+import math
 import os
+import random
 import re
 import shlex
 import shutil
@@ -28,17 +31,27 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import defaultdict
+from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import NamedTuple
 
 # --- CONFIGURATION ---
+# Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
+# code extraction, build/test handling), so rows from different versions are never mixed.
+BENCH_VERSION = "0.2.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
 DEFAULT_ATTEMPTS = 3           # 1 = no feedback; N = initial attempt + N-1 attempts with build/test feedback
 MAX_MODEL_ERRORS = 3           # skip the rest of a model after this many request errors in a row
 SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server is unreachable, then give up
+# Context check: a run needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
+# (system + task prompt; each retry adds the previous reply and the clipped build/test output).
+CONTEXT_BASE_TOKENS = 1000
+CONTEXT_PER_RETRY_TOKENS = 4000
+CONTEXT_CALIBRATION_WORDS = 2000   # filler words used to measure the tokenizer's tokens per word
+CONTEXT_TOLERANCE = 0.95           # reported prompt tokens below this share of the expected count = truncated
 FEEDBACK_CHARS = 6000          # max characters of failing build/test output sent back to the model
 CMD_TIMEOUT_S = 60
 SANDBOX_MEMORY_BYTES = 2 * 1024**3
@@ -50,6 +63,10 @@ MAX_RESPONSE_BYTES = 8 * 1024**2  # API reply body cap, enforced before JSON par
 MAX_CONTENT_CHARS = 1024**2        # completion text cap, enforced before anything is written under runs/
 # Only the resolved Rust toolchain is exposed, never ~/.cargo or all of ~/.rustup.
 RUST_SYSROOT = None
+# Host directory with a pre-built Go build cache (race-instrumented standard library), shown to each sandbox
+# through a throwaway overlay so attempts can't change it for each other. None: every sandbox starts empty.
+GO_CACHE = None
+GO_CACHE_WARM_TIMEOUT_S = 900   # warming compiles the whole standard library once, with -race
 
 SYSTEM = (
     "You are an expert programmer. Reply with exactly one fenced code block containing the complete "
@@ -124,8 +141,10 @@ def load_tasks(roots):
 # Runner
 # --------------------------------------------------------------------------------------------
 
-FIELDS = ["endpoint", "model", "task", "lang", "passed", "passed_on", "attempts", "prompt_tokens",
-          "completion_tokens", "seconds", "finish_reason", "fail_stage"]
+FIELDS = ["run_id", "endpoint", "model", "task", "lang", "passed", "passed_on", "attempts", "prompt_tokens",
+          "completion_tokens", "seconds", "load_seconds", "finish_reason", "fail_stage", "context", "params",
+          "config"]
+RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 CODE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
@@ -234,8 +253,12 @@ def stop_active_units():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
 
 
-def run_cmd(cmd, cwd):
-    """Run only inside a mandatory namespace sandbox and bounded systemd unit."""
+def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
+    """Run only inside a mandatory namespace sandbox and bounded systemd unit.
+    timeout: run time limit (default CMD_TIMEOUT_S). go_cache_rw: host directory mounted writable as the Go
+    build cache, used only to warm GO_CACHE with trusted code; otherwise GO_CACHE (if set) is mounted as an
+    overlay whose writes go to a private tmpfs."""
+    timeout = timeout or CMD_TIMEOUT_S
     tools = {name: shutil.which(name) for name in ("bwrap", "systemd-run", "systemctl")}
     if not all(tools.values()):
         return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
@@ -254,6 +277,10 @@ def run_cmd(cmd, cwd):
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/tmp",
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/work",
                 "--ro-bind", str(Path(cwd).resolve()), "/input", "--chdir", "/work"]
+    if go_cache_rw is not None:
+        sandbox += ["--bind", str(go_cache_rw), "/opt/go-cache"]
+    elif GO_CACHE is not None:
+        sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", "/opt/go-cache"]
     # Preserve system installations such as /usr/local/go/bin, while excluding
     # home/project/relative PATH entries that are not exposed inside the sandbox.
     system_path = [path for path in os.get_exec_path()
@@ -261,7 +288,8 @@ def run_cmd(cmd, cwd):
     sandbox_path = ":".join(["/opt/rust/bin", *system_path, "/usr/bin", "/bin"])
     for key, value in {
         "PATH": sandbox_path, "HOME": "/tmp", "TMPDIR": "/tmp", "LC_ALL": "C",
-        "GOCACHE": "/tmp/go-cache", "GOPATH": "/tmp/go", "GOPROXY": "off",
+        "GOCACHE": "/opt/go-cache" if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
+        "GOPATH": "/tmp/go", "GOPROXY": "off",
         "GOSUMDB": "off", "GOTOOLCHAIN": "local", "GOMAXPROCS": "2",
     }.items():
         sandbox += ["--setenv", key, value]
@@ -273,7 +301,7 @@ def run_cmd(cmd, cwd):
         tools["systemd-run"], "--user", "--quiet", "--wait", "--pipe", "--collect",
         f"--unit={unit}", f"--property=MemoryMax={SANDBOX_MEMORY_BYTES}",
         "--property=MemorySwapMax=0", f"--property=TasksMax={SANDBOX_TASKS}",
-        "--property=CPUQuota=200%", f"--property=RuntimeMaxSec={CMD_TIMEOUT_S}s",
+        "--property=CPUQuota=200%", f"--property=RuntimeMaxSec={timeout}s",
         "--property=TimeoutStopSec=2s", "--property=KillMode=control-group",
         "--property=OOMPolicy=kill", "--property=NoNewPrivileges=yes",
         "--property=LimitCORE=0", f"--property=LimitFSIZE={SANDBOX_FILE_BYTES}",
@@ -290,7 +318,7 @@ def run_cmd(cmd, cwd):
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT)
             try:
-                rc = process.wait(timeout=CMD_TIMEOUT_S + 10)
+                rc = process.wait(timeout=timeout + 10)
             finally:
                 # Also kill detached descendants after normal completion or interruption.
                 try:
@@ -305,14 +333,14 @@ def run_cmd(cmd, cwd):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
         # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
-        timed_out = rc != 0 and time.monotonic() - t0 >= CMD_TIMEOUT_S
+        timed_out = rc != 0 and time.monotonic() - t0 >= timeout
         output.seek(0)
         data = output.read(MAX_OUTPUT_BYTES + 1)
     text = data[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     if len(data) > MAX_OUTPUT_BYTES:
         return CmdResult(-1, text + "\n[output limit exceeded]", False)
     if timed_out:
-        text += "\n" + TIME_LIMIT_MARKER.format(limit=CMD_TIMEOUT_S)
+        text += "\n" + TIME_LIMIT_MARKER.format(limit=timeout)
     return CmdResult(rc, text, timed_out)
 
 
@@ -322,6 +350,49 @@ def check_sandbox():
         rc, out, _ = run_cmd(["/usr/bin/true"], Path(directory))
     if rc != 0:
         sys.exit(f"sandbox unavailable; refusing to run generated code:\n{out}")
+
+
+GO_WARM_TEST = """package solution
+
+import (
+	"testing"
+)
+
+func TestWarm(t *testing.T) {}
+"""
+
+
+def prepare_go_cache(directory):
+    """Warm a Go build cache in `directory` and enable it for all sandboxes (sets GO_CACHE).
+    Only trusted code runs while the cache is writable: `go build -race std` and an empty test package.
+    Falls back to an empty cache per sandbox (with a warning) if overlays or warming don't work."""
+    global GO_CACHE
+    directory = Path(directory)
+    work = directory / "warm-src"
+    cache = directory / "cache"
+    work.mkdir()
+    cache.mkdir()
+    for name, content in LANGS["go"].get("extra", {}).items():
+        (work / name).write_text(content)
+    (work / "solution_test.go").write_text(GO_WARM_TEST)
+    log("go: warming the build cache (race-instrumented standard library), this takes a minute...", err=True)
+    t0 = time.monotonic()
+    warm = run_cmd(["/bin/bash", "-ec", "go build -race std\n" + shlex.join(LANGS["go"]["cmds"][-1])], work,
+                   timeout=GO_CACHE_WARM_TIMEOUT_S, go_cache_rw=cache)
+    if warm.rc != 0:
+        log(f"go: warning: warming the build cache failed; each Go attempt compiles the standard library "
+            f"from scratch and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(warm.out)}", err=True)
+        return
+    GO_CACHE = cache
+    probe = run_cmd(["/bin/bash", "-ec", "touch /opt/go-cache/llm-bench-probe\n"
+                     + shlex.join(LANGS["go"]["cmds"][-1])], work)
+    if probe.rc != 0 or (cache / "llm-bench-probe").exists():
+        GO_CACHE = None
+        log("go: warning: the warmed build cache can't be mounted as a private overlay (needs bubblewrap 0.11+ "
+            f"and overlayfs in user namespaces); each Go attempt compiles the standard library from scratch "
+            f"and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(probe.out)}", err=True)
+        return
+    log(f"go: build cache ready in {time.monotonic() - t0:.0f}s", err=True)
 
 
 def feedback(stage, cmd, out):
@@ -493,9 +564,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
     for attempt in range(1, opts.attempts + 1):
         if stop.is_set():
             raise Interrupted
-        payload = {"model": model, "max_tokens": opts.max_tokens, "messages": messages}
-        if opts.temperature is not None:
-            payload["temperature"] = opts.temperature
+        payload = {**opts.params, "model": model, "max_tokens": opts.max_tokens, "messages": messages}
         log(f"{label}: attempt {attempt}/{opts.attempts}, waiting for response...", err=True)
         t0 = time.time()
         try:
@@ -536,6 +605,100 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
     return result
 
 
+def context_needed(opts):
+    return CONTEXT_BASE_TOKENS + (opts.attempts - 1) * CONTEXT_PER_RETRY_TOKENS + opts.max_tokens
+
+
+FILLER_WORDS = (  # noqa: SIM905 -- easier to read than a list literal
+    "time year people way day man thing woman life child world school state family student group country "
+    "problem hand part place case week company system program question work number night point home water "
+    "room mother area money story fact month lot right study book eye job word business issue side kind head "
+    "house service friend father power hour game line end member law car city community name team minute idea "
+    "body information back parent face level office door health person art history party result change "
+    "morning reason research girl moment air teacher force education"
+).split()
+
+
+def filler(words):
+    rng = random.Random(words)
+    return " ".join(rng.choice(FILLER_WORDS) for _ in range(words))
+
+
+def probe(label, base, model, content, opts, stop):
+    payload = {**opts.params, "model": model, "max_tokens": 1, "messages": [{"role": "user", "content": content}]}
+    return chat(label, base, payload, opts, stop)
+
+
+def check_context(label, base, model, opts, stop, base_tokens):
+    """Check that the model's context holds context_needed(opts) tokens. Tokenizers differ, so first
+    measure tokens per filler word, then send a prompt of the needed size and compare the prompt tokens
+    the server reports. Returns "ok", "short:<reported tokens>", "rejected:<error>" or "unchecked"."""
+    need = context_needed(opts)
+    prefix = "Reply with OK. Ignore the following text.\n\n"
+    _, _, usage, error = probe(label, base, model, prefix + filler(CONTEXT_CALIBRATION_WORDS), opts, stop)
+    sample_tokens = usage.get("prompt_tokens")
+    if error and error.startswith("http_"):   # even the short calibration prompt doesn't fit
+        log(f"{label}: warning: the server rejected a ~{CONTEXT_CALIBRATION_WORDS}-word prompt ({error}); the "
+            f"context is far below the {need} tokens needed", err=True)
+        return f"rejected:{error}"
+    if error or not base_tokens or not sample_tokens or sample_tokens <= base_tokens:
+        log(f"{label}: warning: can't check the context size ({error or 'the server reports no token usage'})",
+            err=True)
+        return "unchecked"
+    per_word = (sample_tokens - base_tokens) / CONTEXT_CALIBRATION_WORDS
+    words = math.ceil((need - base_tokens) / per_word)
+    expected = base_tokens + per_word * words
+    log(f"{label}: checking that the context holds {need} tokens...", err=True)
+    _, _, usage, error = probe(label, base, model, prefix + filler(words), opts, stop)
+    if error:
+        log(f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
+            f"smaller. Raise the server's context length or lower --max-tokens / --attempts", err=True)
+        return f"rejected:{error}"
+    got = usage.get("prompt_tokens") or 0
+    if got < CONTEXT_TOLERANCE * expected:
+        log(f"{label}: warning: the context holds only about {got} of the {need} tokens needed; long replies and "
+            f"retries will be cut off. Raise the server's context length or lower --max-tokens / --attempts",
+            err=True)
+        return f"short:{got}"
+    return "ok"
+
+
+def prepare_model(label, base, model, opts, stop):
+    """Load the model with a tiny request, so load time isn't counted against its first task, and check its
+    context size unless disabled. Returns (load_seconds, context, error)."""
+    log(f"{label}: loading...", err=True)
+    t0 = time.time()
+    _, _, usage, error = probe(label, base, model, "Reply with OK.", opts, stop)
+    load_seconds = round(time.time() - t0, 2)
+    if error:
+        return load_seconds, "unchecked", error
+    log(f"{label}: first reply after {load_seconds:.1f}s", err=True)
+    if not opts.context_check:
+        return load_seconds, "unchecked", None
+    return load_seconds, check_context(label, base, model, opts, stop, usage.get("prompt_tokens")), None
+
+
+def settings_fingerprint(opts):
+    """Everything besides the task itself that can change a result."""
+    return {"version": BENCH_VERSION, "system": SYSTEM, "max_tokens": opts.max_tokens, "attempts": opts.attempts,
+            "params": opts.params, "timeout": opts.timeout, "cmd_timeout": CMD_TIMEOUT_S,
+            "feedback_chars": FEEDBACK_CHARS, "sandbox": [SANDBOX_MEMORY_BYTES, SANDBOX_TASKS, SANDBOX_TMP_BYTES,
+                                                         SANDBOX_FILE_BYTES]}
+
+
+def config_hash(settings, task):
+    """Short hash of the settings plus this task's prompt, harness and language spec: rows with equal hashes
+    were produced under the same conditions."""
+    data = {"settings": settings, "task": {k: task[k] for k in ("name", "lang", "prompt", "test")},
+            "lang": LANGS[task["lang"]]}
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def skipped_result(finish_reason, fail_stage):
+    return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
+
+
 def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop):
     """Run the tasks for the given models of one endpoint. Appends each row to out_path (and to rows)
     as it completes."""
@@ -547,8 +710,11 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             w.writeheader()
             f.flush()
 
-        def record(model, task, result):
-            row = {"endpoint": name, "model": model, "task": task["name"], "lang": task["lang"], **result}
+        params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
+
+        def record(model, task, result, model_info):
+            row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
+                   "lang": task["lang"], **result, **model_info, "params": params, "config": task["config"]}
             rows.append(row)
             w.writerow(row)
             f.flush()
@@ -556,21 +722,26 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
 
         try:
             for model in models:
+                load_seconds, context, error = prepare_model(f"{name}/{model}", base, model, opts, stop)
+                model_info = {"load_seconds": load_seconds, "context": context}
+                if error:
+                    log(f"{name}/{model}: loading failed ({error}); skipping its {len(tasks)} task(s)", err=True)
+                    for task in tasks:
+                        record(model, task, skipped_result(error, "load"), model_info)
+                    continue
                 model_errors = 0   # consecutive tasks that ended in a request-level model error
                 for i, task in enumerate(tasks):
                     if model_errors >= MAX_MODEL_ERRORS:
                         log(f"{name}/{model}: {model_errors} request errors in a row; skipping its remaining "
                             f"{len(tasks) - i} task(s)", err=True)
                         for skipped in tasks[i:]:
-                            record(model, skipped, {"passed": 0, "passed_on": 0, "attempts": 0,
-                                                    "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0,
-                                                    "finish_reason": "skipped", "fail_stage": "request"})
+                            record(model, skipped, skipped_result("skipped", "request"), model_info)
                         break
                     taskdir = runs_dir / UNSAFE_NAME_RE.sub("_", model) / task["name"]
                     result = run_one_task(f"{name}/{model}/{task['name']}", base, model, task, taskdir, opts,
                                           stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
-                    record(model, task, result)
+                    record(model, task, result, model_info)
         except ServerDown as e:
             log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
         except Interrupted:
@@ -582,8 +753,9 @@ def print_summary(rows, max_attempts):
         print("\nno results")
         return
     langs = sorted({r["lang"] for r in rows}, key=list(LANGS).index)
-    agg = defaultdict(lambda: {"pass": 0, "p1": 0, "n": 0, "pt": 0, "ct": 0, "s": 0.0,
+    agg = defaultdict(lambda: {"pass": 0, "p1": 0, "n": 0, "pt": 0, "ct": 0, "s": 0.0, "load": 0.0,
                                **{lang: [0, 0] for lang in langs}})
+    contexts = {}
     for r in rows:
         a = agg[(r["endpoint"], r["model"])]
         a["pass"] += r["passed"]
@@ -592,17 +764,33 @@ def print_summary(rows, max_attempts):
         a["pt"] += r["prompt_tokens"]
         a["ct"] += r["completion_tokens"]
         a["s"] += r["seconds"]
+        a["load"] = max(a["load"], r.get("load_seconds") or 0.0)
+        contexts[(r["endpoint"], r["model"])] = r.get("context") or "unchecked"
         a[r["lang"]][0] += r["passed"]
         a[r["lang"]][1] += 1
 
     ew = max(8, *(len(e) for e, _ in agg))
     head = (f"\n{'endpoint':{ew}} {'model':40} {'pass@1':>6} {'pass@' + str(max_attempts):>6} "
             + " ".join(f"{lang:>6}" for lang in langs))
-    print(head + f" {'prompt_tok':>10} {'compl_tok':>10} {'sec':>8}")
+    print(head + f" {'prompt_tok':>10} {'compl_tok':>10} {'sec':>8} {'load':>6}")
     for (e, m), a in sorted(agg.items(), key=lambda kv: (-kv[1]["pass"], kv[1]["ct"])):
         per = " ".join(f"{a[lang][0]:>4}/{a[lang][1]}" for lang in langs)
         print(f"{e:{ew}} {m[:40]:40} {a['p1']:>3}/{a['n']:<2} {a['pass']:>3}/{a['n']:<2} {per} "
-              f"{a['pt']:>10} {a['ct']:>10} {a['s']:>8.1f}")
+              f"{a['pt']:>10} {a['ct']:>10} {a['s']:>8.1f} {a['load']:>6.1f}")
+    failed = [f"{e}/{m} ({c})" for (e, m), c in contexts.items() if c not in ("ok", "unchecked")]
+    if failed:
+        print(f"\nwarning: context check failed, results may be cut off: {', '.join(failed)}")
+
+
+def parse_param(spec):
+    """KEY=VALUE -> (key, value); VALUE is parsed as JSON if possible (numbers, true/false, lists), else a string."""
+    key, sep, value = spec.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {spec!r}")
+    try:
+        return key, json.loads(value)
+    except json.JSONDecodeError:
+        return key, value
 
 
 def positive_int(value):
@@ -655,7 +843,13 @@ def parse_args():
                     help="1 = no feedback; N = first attempt + N-1 retries with build/test output as "
                          "feedback (default: %(default)s)")
     ap.add_argument("--temperature", type=float, metavar="T",
-                    help="sampling temperature (default: the server's/model's default)")
+                    help="sampling temperature (default: the server's/model's default); same as --param temperature=T")
+    ap.add_argument("--param", action="append", type=parse_param, default=[], metavar="KEY=VALUE",
+                    help="extra request parameter, e.g. top_p=0.9 or seed=1 (VALUE is parsed as JSON when "
+                         "possible). Repeatable. Recorded in the results")
+    ap.add_argument("--no-context-check", dest="context_check", action="store_false",
+                    help="skip checking that each model's context holds a worst-case run (saves one long "
+                         "prompt per model)")
     ap.add_argument("-o", "--output-dir", type=Path, default=Path("."), metavar="DIR",
                     help="where results_<endpoint>.csv and runs/ are written (default: current directory)")
     ap.add_argument("-t", "--tag",
@@ -669,6 +863,14 @@ def parse_args():
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if args.tag:
         args.tag = UNSAFE_NAME_RE.sub("_", args.tag)
+    args.params = dict(args.param)
+    if args.temperature is not None and args.params.get("temperature", args.temperature) != args.temperature:
+        ap.error("--temperature conflicts with --param temperature=...")
+    if args.temperature is not None:
+        args.params["temperature"] = args.temperature
+    reserved = sorted(RESERVED_PARAMS & args.params.keys())
+    if reserved:
+        ap.error(f"--param can't set {', '.join(reserved)}")
     return args
 
 
@@ -712,6 +914,9 @@ def main():
 
     check_toolchains(tasks)
     check_sandbox()
+    args.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    settings = settings_fingerprint(args)
+    tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
 
     plan = {}
     for name, base in endpoints.items():
@@ -735,7 +940,19 @@ def main():
                for name in plan}
     for csv_path, _ in outputs.values():
         check_results_file(csv_path)
+    go_tmp = None
+    if any(t["lang"] == "go" for t in tasks):
+        go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
+        prepare_go_cache(go_tmp.name)
+    try:
+        run_all(args, plan, endpoints, tasks, outputs)
+    finally:
+        if go_tmp is not None:
+            go_tmp.cleanup()
 
+
+def run_all(args, plan, endpoints, tasks, outputs):
+    """Run every endpoint in its own thread; print the summary at the end or on Ctrl-C."""
     rows, stop, threads = [], threading.Event(), []
     for name, models in plan.items():
         csv_path, runs_dir = outputs[name]

@@ -41,7 +41,7 @@ Tasks published on the internet can end up in model training data. To benchmark 
 ## Requirements
 
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
-- [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`).
+- [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`); 0.11 or newer for the Go build cache (see [Go tasks](#go-tasks)).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
 - The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils. You only need the toolchains for the tasks you select with `--task`.
 
@@ -77,21 +77,39 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | `--timeout SEC` | 1800 | Per-request timeout. It must cover model load time plus generating `--max-tokens` tokens on your slowest model. |
 | `--max-tokens N` | 16384 | Completion token limit. The prompt (up to ~9k tokens with feedback) plus `N` must fit in the model's context window. |
 | `--attempts N` | 3 | `1` = single shot; `N` = first attempt plus `N-1` retries with build/test feedback. |
-| `--temperature T` | server default | Sampling temperature. |
+| `--temperature T` | server default | Sampling temperature. Same as `--param temperature=T`. |
+| `--param KEY=VALUE` | | Extra request parameter such as `top_p=0.9`, `seed=1` or `reasoning_effort=low`. `VALUE` is parsed as JSON when possible (numbers, `true`, lists), otherwise used as a string. Repeatable. |
+| `--no-context-check` | | Skip the per-model context check (see below). |
 | `-o, --output-dir DIR` | `.` | Where results and transcripts are written. |
 | `-t, --tag TAG` | | Write `results_<endpoint>_<TAG>.csv`, so runs with different settings don't overwrite each other. |
 
 ### Server setup tips
 
-- **Context length.** With the defaults a request can need about 25k tokens of context. Configure the server for at least 32k. Many servers default to much less and silently truncate the prompt. For example, Ollama uses `OLLAMA_CONTEXT_LENGTH=32768`, and LM Studio sets the context length in the model's load settings.
+- **Context length.** With the defaults a retry request can need about 25k tokens of context (roughly 1k + 4k per retry + `--max-tokens`). Configure the server for at least 32k. Many servers default to much less and silently truncate the prompt. For example, Ollama uses `OLLAMA_CONTEXT_LENGTH=32768`, and LM Studio sets the context length in the model's load settings. If you can't, lower `--max-tokens` or `--attempts` so the need fits.
+- **Context check.** Before each model's first task, the benchmark loads it with a tiny request (its time goes into `load_seconds`, not the first task) and then checks the context: it measures the model's tokens per word with a short filler prompt, sends a filler prompt of the needed size, and compares the prompt tokens the server reports. A server that truncates reports too few; one that refuses answers with an error. The result is recorded in the `context` column and a failed check is repeated under the summary. It costs one long prompt per model; `--no-context-check` skips it.
 - **One model at a time.** Models are benchmarked one after another. If the server keeps earlier models loaded, the next model may not fit in VRAM and run partly on the CPU, which only affects timing. Let the server evict old models: Ollama with `OLLAMA_MAX_LOADED_MODELS=1`, LM Studio with the auto-evict option for JIT-loaded models.
 - **Thinking models.** `<think>…</think>` blocks are removed before code extraction. Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
 
 ## Output
 
-- `results_<endpoint>[_<tag>].csv`: one row per model × task, written as each task finishes, so an interrupted run keeps its results. Rows are **appended**, so re-running a few models adds to an existing file instead of replacing it. Re-running the same model and task adds another row; the later row is the newer result. Columns: `endpoint, model, task, lang, passed, passed_on, attempts, prompt_tokens, completion_tokens, seconds, finish_reason, fail_stage`. The benchmark refuses to append to a file that has different columns (e.g. from an older version).
+- `results_<endpoint>[_<tag>].csv`: one row per model × task, written as each task finishes, so an interrupted run keeps its results. Rows are **appended**, so re-running a few models adds to an existing file instead of replacing it. Re-running the same model and task adds another row; the later row is the newer result. Columns:
+
+  | Column | Meaning |
+  |---|---|
+  | `run_id` | UTC start time of the run, e.g. `20261107T202918Z`. |
+  | `endpoint`, `model`, `task`, `lang` | What was run. |
+  | `passed`, `passed_on`, `attempts` | 1 if any attempt passed; which attempt passed (0 = none); attempts made. |
+  | `prompt_tokens`, `completion_tokens` | Token usage summed over all attempts, as reported by the server. |
+  | `seconds` | Time spent waiting for replies (not building and testing). |
+  | `load_seconds` | Time of the model's warm-up request, i.e. mostly load time. The same for all of a model's rows in a run. |
+  | `finish_reason`, `fail_stage` | See below. |
+  | `context` | Result of the context check: `ok`, `short:<tokens>` (truncated at about that many tokens), `rejected:<error>`, or `unchecked`. |
+  | `params` | Request parameters set with `--param` / `--temperature`, as JSON. Anything not listed is the server's default. |
+  | `config` | Hash of everything that affects the result: benchmark version, system prompt, `--max-tokens`, `--attempts`, `--timeout`, parameters, sandbox limits, and the task's own prompt, harness and build commands. Rows with equal hashes were produced under the same conditions. |
+
+  The benchmark refuses to append to a file that has different columns (e.g. from an older version).
 - `runs/<endpoint>[_<tag>]/<model>/<task>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. Re-running a model and task replaces its transcripts for the same tag.
-- A summary table on stdout, with pass@1 (passed on the first attempt), pass@N (passed within `--attempts`), per-language results, token counts and total time per model. Ctrl-C stops the run promptly and still prints the summary of the tasks finished so far.
+- A summary table on stdout, with pass@1 (passed on the first attempt), pass@N (passed within `--attempts`), per-language results, token counts, total reply time and load time per model. Ctrl-C stops the run promptly and still prints the summary of the tasks finished so far.
 
 `finish_reason` is the server's value for the last reply (`stop`, `length`, …) or one of these:
 
@@ -104,9 +122,15 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | `oversized` | The reply text exceeded 1 MiB. |
 | `skipped` | Not attempted: the model had 3 request errors (`http_*`, `bad_response`, `disconnected`) in a row, so its remaining tasks were skipped. |
 
+If the model's warm-up request fails (for example it can't be loaded), all its tasks get that request error as `finish_reason` with `fail_stage` `load`, and the next model runs.
+
 If the server itself becomes unreachable, the benchmark retries the request after 10, 30 and 60 seconds, then stops that endpoint. Tasks it didn't get to have no rows.
 
-`fail_stage` says where the last attempt failed: `build` (compiling), `test` (the test harness failed), `time_limit` (building and testing exceeded the 60 s sandbox limit), `no_code` (the reply contained no code), or `request` (one of the request-level failures above). It's empty when the task passed.
+`fail_stage` says where the last attempt failed: `build` (compiling), `test` (the test harness failed), `time_limit` (building and testing exceeded the 60 s sandbox limit), `no_code` (the reply contained no code), `request` (one of the request-level failures above) or `load` (the model failed to load). It's empty when the task passed.
+
+## Go tasks
+
+`go test -race` needs a race-instrumented build of the Go standard library, which takes about 35 s to compile from scratch on a 2-CPU sandbox: over half of the 60 s limit. So when Go tasks are selected, the benchmark first compiles it once into a temporary build cache (about 1–2 minutes, running only trusted code). Each sandbox then sees that cache through an overlay whose writes go to a private tmpfs, so attempts can't change it for each other. This needs bubblewrap 0.11+ and overlayfs in user namespaces (Linux 5.11+); otherwise the benchmark warns and every Go attempt compiles from scratch.
 
 ## Sandbox
 

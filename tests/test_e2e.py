@@ -202,3 +202,18 @@ def test_ctrl_c_stops_promptly(tmp_path, mock_server):
     out, err = proc.communicate(timeout=10)
     assert proc.returncode == 130
     assert "interrupted" in err and "no results" in out
+
+
+def test_go_cache_overlay_is_private(tmp_path, monkeypatch):
+    """Sandboxes see GO_CACHE's contents but their writes go to a throwaway layer."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "entry").write_text("cached\n")
+    monkeypatch.setattr(llm_bench, "GO_CACHE", cache)
+    work = tmp_path / "work"
+    work.mkdir()
+    script = 'cat /opt/go-cache/entry; echo "$GOCACHE"; echo tampered > /opt/go-cache/entry; touch /opt/go-cache/new'
+    result = llm_bench.run_cmd(["/bin/bash", "-ec", script], work)
+    assert result.rc == 0, result.out
+    assert result.out.split()[:2] == ["cached", "/opt/go-cache"]
+    assert (cache / "entry").read_text() == "cached\n" and not (cache / "new").exists()

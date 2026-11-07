@@ -40,7 +40,8 @@ Repository layout:
 - Prompts name the target file (`solution.py`, `solution.c`, `solution.hpp`, `package solution`, …) to match `LANGS`.
 - Task harnesses are data, excluded from ruff, and must stay verbatim: any change to a prompt or harness, including whitespace, changes what models see.
 - Before adding a new task, check that a correct reference solution passes it and that plausible wrong solutions fail it. A `MockServer` that returns those solutions works for this (see below).
-- Renaming, moving or changing a task makes old results incomparable. Mention this in the change description.
+- Renaming, moving or changing a task makes old results incomparable. Mention this in the change description. The row's `config` hash changes automatically with the task's prompt, harness or language spec.
+- Bump `BENCH_VERSION` in `llm_bench.py` (and `version` in `pyproject.toml`) whenever a code change can change results: the system prompt, feedback text, code extraction, build/test handling or the context-size estimate. It's part of every row's `config` hash, so rows from different versions are never mixed.
 
 ## Checking changes
 
@@ -56,7 +57,7 @@ uv run --locked --group dev pytest
 - `tests/test_unit.py`: pure functions, task loading (including the built-in task set's consistency) and the CLI. No sandbox needed.
 - `tests/test_runner.py`: request handling (`chat()` failure classification: HTTP errors, malformed or truncated replies, dropped connections, timeouts, server down) and the per-endpoint loop, against the mock server. No sandbox needed, so these replies never contain code.
 - `tests/test_e2e.py` (marker `sandbox`): full runs against the `MockServer` in `tests/conftest.py`, an OpenAI-compatible stdlib server that returns scripted replies, plus checks that the sandbox hides the home directory, the network and the environment. These tests skip themselves when bwrap + a systemd user session aren't available (e.g. in containers and on CI), so run them on a Linux host after touching the runner or the sandbox. Check the output for skips with `pytest -rs`.
-- Add tests for new CLI options and runner behaviour. Use `MockServer(replies=[...])` to script model answers; a `Reply(...)` entry scripts HTTP errors, raw bodies, dropped connections or slow replies.
+- Add tests for new CLI options and runner behaviour. Use `MockServer(replies=[...])` to script model answers; a `Reply(...)` entry scripts HTTP errors, raw bodies, dropped connections or slow replies. Warm-up and context-check requests (`max_tokens=1`) don't consume replies; they're recorded in `MockServer.probes`, and the `context`, `reject_over` and `probe_reply` options simulate truncating, refusing or failing servers.
 - `ruff format` isn't enforced. Don't reformat the whole file in an unrelated change.
 - pytest collects only from `tests/` (`testpaths`), so Python harnesses under `tasks/` (named `test_solution.py`) are never run as tests themselves.
 

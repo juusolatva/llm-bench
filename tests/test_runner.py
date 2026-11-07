@@ -11,7 +11,8 @@ import llm_bench
 
 
 def opts(**kwargs):
-    defaults = {"timeout": 30, "api_key": None, "attempts": 1, "max_tokens": 100, "temperature": None}
+    defaults = {"timeout": 30, "api_key": None, "attempts": 1, "max_tokens": 100, "params": {},
+                "context_check": True, "run_id": "test-run"}
     return SimpleNamespace(**{**defaults, **kwargs})
 
 
@@ -68,7 +69,8 @@ def test_chat_server_down_interrupted(monkeypatch):
         llm_bench.chat("label", f"http://127.0.0.1:{free_port()}/v1", {}, opts(), stop)
 
 
-TASKS = [{"name": f"py_t{i}", "lang": "python", "prompt": f"task {i}", "test": ""} for i in range(5)]
+TASKS = [{"name": f"py_t{i}", "lang": "python", "prompt": f"task {i}", "test": "", "config": "cfg"}
+         for i in range(5)]
 
 
 def run_endpoint(server, tmp_path, models=("test/model",), tasks=TASKS, **kwargs):
@@ -132,3 +134,65 @@ def test_feedback_messages():
     assert "Output of `./t`" in llm_bench.feedback("test", "./t", "boom")
     assert "time limit" in llm_bench.feedback("time_limit", "./t", "")
     assert "did not contain any code" in llm_bench.feedback("no_code", None, None)
+
+
+@pytest.mark.parametrize(("server", "options", "context"), [
+    ({}, {}, "ok"),
+    ({}, {"max_tokens": 5000}, "ok"),
+    ({"context": 500}, {}, "short:500"),                         # server truncates prompts to its context
+    ({"context": 3000}, {"max_tokens": 5000}, "short:3000"),
+    ({"reject_over": 800}, {}, "rejected:http_400"),              # even the calibration prompt is refused
+    ({"reject_over": 3000}, {"max_tokens": 5000}, "rejected:http_400"),   # only the full-size prompt is refused
+    ({"probe_reply": Reply(body=b'{"choices": [{"message": {"content": "OK"}}]}')}, {}, "unchecked"),  # no usage
+])
+def test_context_check(mock_server, tmp_path, server, options, context):
+    s = mock_server(replies=[""], **server)
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], **options)
+    assert row["context"] == context
+    assert row["finish_reason"] == "stop"   # the task still runs
+    if context == "ok":
+        need = llm_bench.context_needed(opts(**options))
+        assert len(s.probes) == 3
+        assert 10 + len(s.probes[2]["messages"][0]["content"].split()) >= 0.99 * need   # mock: 1 token per word
+
+
+def test_context_check_disabled(mock_server, tmp_path):
+    s = mock_server(replies=[""], context=500)
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], context_check=False)
+    assert row["context"] == "unchecked" and len(s.probes) == 1
+
+
+def test_load_failure_skips_model(mock_server, tmp_path):
+    s = mock_server(models=["a", "b"], probe_reply=Reply(status=500, body=b'{"error": "out of memory"}'))
+    rows = run_endpoint(s, tmp_path, models=["a", "b"], tasks=TASKS[:2])
+    assert [(r["model"], r["finish_reason"], r["fail_stage"]) for r in rows] == [
+        ("a", "http_500", "load"), ("a", "http_500", "load"), ("b", "http_500", "load"), ("b", "http_500", "load")]
+    assert s.requests == []   # no task was sent
+
+
+def test_load_time_is_separate_from_task_time(mock_server, tmp_path):
+    s = mock_server(replies=[""], probe_reply=Reply(text="OK", sleep=1))
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["load_seconds"] >= 1 and row["seconds"] < 1
+
+
+def test_params_metadata_and_config_in_rows(mock_server, tmp_path):
+    s = mock_server(replies=[""])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], params={"top_p": 0.5, "seed": 1})
+    assert s.requests[0]["top_p"] == 0.5 and s.probes[0]["seed"] == 1
+    assert (row["params"], row["run_id"], row["config"]) == ('{"seed":1,"top_p":0.5}', "test-run", "cfg")
+    (csv_row,) = read_csv(tmp_path / "results.csv")
+    assert list(csv_row) == llm_bench.FIELDS
+
+
+def test_config_hash():
+    task = {"name": "py_x", "lang": "python", "prompt": "p", "test": "t"}
+    base = {"timeout": 1800, "max_tokens": 100, "attempts": 3}
+    settings = llm_bench.settings_fingerprint(opts(**base))
+    h = llm_bench.config_hash(settings, task)
+    assert len(h) == 12 and h == llm_bench.config_hash(settings, dict(task))
+    assert h != llm_bench.config_hash(settings, {**task, "prompt": "p2"})
+    assert h != llm_bench.config_hash(settings, {**task, "test": "t2"})
+    for change in ({"max_tokens": 101}, {"attempts": 2}, {"params": {"seed": 1}}):
+        other = llm_bench.settings_fingerprint(opts(**{**base, **change}))
+        assert h != llm_bench.config_hash(other, task)
