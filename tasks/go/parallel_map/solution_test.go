@@ -113,8 +113,8 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	if a := h.active.Load(); a != 0 {
 		t.Fatalf("returned while %d calls of f were still running", a)
 	}
-	if s := h.started.Load(); s > 20 {
-		t.Fatalf("f was called %d times; no new calls may start after an error", s)
+	if s := h.started.Load(); s != 14 {
+		t.Fatalf("f was called %d times, want 14: inputs 0-13 start before input 10 fails (4 workers, in input order) and no new calls may start after the error", s)
 	}
 	if canceled == 0 {
 		t.Fatalf("no running call saw its context canceled")
@@ -129,12 +129,13 @@ func TestParentCancel(t *testing.T) {
 	watchdog := make(chan struct{})
 	time.AfterFunc(2*time.Second, func() { close(watchdog) })
 	start := time.Now()
+	stopped := errors.New("stopped")
 	got, err := ParallelMap(ctx, inputs, 3, func(ctx context.Context, x int) (int, error) {
 		h.enter()
 		defer h.leave()
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, stopped
 		case <-watchdog:
 			return x, nil
 		}
@@ -143,7 +144,7 @@ func TestParentCancel(t *testing.T) {
 		t.Fatalf("did not stop promptly after ctx was canceled (calls must get a context derived from ctx)")
 	}
 	if !errors.Is(err, context.Canceled) || got != nil {
-		t.Fatalf("got %v, %v; want nil and context.Canceled", got, err)
+		t.Fatalf("got %v, %v; want nil and context.Canceled (ctx.Err() wins over errors returned by f)", got, err)
 	}
 	if a := h.active.Load(); a != 0 {
 		t.Fatalf("returned while %d calls of f were still running", a)
@@ -156,10 +157,15 @@ func TestParentCancel(t *testing.T) {
 func TestAlreadyCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	var calls atomic.Int64
 	got, err := ParallelMap(ctx, []int{1, 2, 3}, 2, func(ctx context.Context, x int) (int, error) {
+		calls.Add(1)
 		return x, nil
 	})
 	if !errors.Is(err, context.Canceled) || got != nil {
 		t.Fatalf("canceled ctx: got %v, %v; want nil and context.Canceled", got, err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("canceled ctx: f was called %d times, want 0 (no calls may start once ctx is canceled)", n)
 	}
 }

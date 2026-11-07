@@ -30,13 +30,21 @@ def test_parse_endpoint_name_is_path_safe():
     assert "/" not in name
 
 
+@pytest.mark.parametrize(("name", "want"), [
+    ("qwen/qwen3:8b", "qwen_qwen3_8b"), ("..", "_."), (".", "_"), ("", "_"), (".hidden", "_hidden"),
+    ("a..b", "a..b"), ("../../etc", "_._.._etc"),
+])
+def test_safe_name(name, want):
+    assert llm_bench.safe_name(name) == want
+
+
 def test_extract_code_strips_think():
     text = "<think>```python\nbad\n```</think>intro\n```python\nfirst\n```"
     assert llm_bench.extract_code(text, "python") == "first\n"
 
 
 @pytest.mark.parametrize(("text", "want"), [
-    ("reasoning ```python\nbad\n```</think>\n```python\ngood\n```", "good\n"),   # unpaired </think>
+    ("reasoning\n```python\nbad\n```\n</think>\n```python\ngood\n```", "good\n"),   # unpaired </think>
     ("```python\ngood\n```\n<think>```python\ncut off", "good\n"),            # unclosed <think>
     ("<think>never finished ```python\nbad\n```", ""),
 ])
@@ -66,6 +74,11 @@ def test_extract_code_fence_details():
 def test_extract_code_without_fence_returns_text():
     assert llm_bench.extract_code("<think>x</think>plain", "python") == "plain"
     assert llm_bench.extract_code("plain") == "plain"
+
+
+def test_extract_code_keeps_think_tags_inside_code():
+    text = "<think>plan</think>\n```python\ndef render():\n    return '</think>' + '<think>x</think>'\n```"
+    assert llm_bench.extract_code(text, "python") == "def render():\n    return '</think>' + '<think>x</think>'\n"
 
 
 def test_strip_think():

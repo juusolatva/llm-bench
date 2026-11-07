@@ -9,7 +9,8 @@ import (
 // results in input order, or the first error.
 func ParallelMap(ctx context.Context, inputs []int, workers int,
 	f func(ctx context.Context, x int) (int, error)) ([]int, error) {
-	ctx, cancel := context.WithCancel(ctx)
+	parent := ctx
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	results := make([]int, len(inputs))
@@ -45,11 +46,11 @@ func ParallelMap(ctx context.Context, inputs []int, workers int,
 		}(i, x)
 	}
 	wg.Wait()
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	if firstErr != nil {
 		return nil, firstErr
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
 	}
 	return results, nil
 }

@@ -157,6 +157,12 @@ VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 
 
+def safe_name(name):
+    """A single path component derived from a model, endpoint or tag name: unsafe characters become "_",
+    and a leading dot too, so the result is never "", "." or ".." (or a hidden file)."""
+    return re.sub(r"^\.", "_", UNSAFE_NAME_RE.sub("_", name)) or "_"
+
+
 PRINT_LOCK = threading.Lock()
 
 
@@ -210,16 +216,23 @@ def parse_endpoint(spec):
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     if not name:
         name = parts.hostname if parts.port is None else f"{parts.hostname}_{parts.port}"
-    name = UNSAFE_NAME_RE.sub("_", name)
-    return name, base
+    return safe_name(name), base
+
+
+def _in_code(text, pos):
+    return any(m.start() <= pos < m.end() for m in CODE_RE.finditer(text))
 
 
 def strip_think(text):
     """Remove reasoning: <think>...</think> blocks, everything before an unpaired </think> (servers that
-    drop the opening tag) and everything after an unclosed <think> (reasoning cut off by max_tokens)."""
-    text = THINK_RE.sub("", text)
-    text = text.rpartition("</think>")[2]
-    return text.partition("<think>")[0]
+    drop the opening tag) and everything after an unclosed <think> (reasoning cut off by max_tokens).
+    Tags inside fenced code blocks are part of the code and kept."""
+    text = THINK_RE.sub(lambda m: m.group(0) if _in_code(text, m.start()) else "", text)
+    closes = [m.start() for m in re.finditer("</think>", text) if not _in_code(text, m.start())]
+    if closes:
+        text = text[closes[-1] + len("</think>"):]
+    opens = [m.start() for m in re.finditer("<think>", text) if not _in_code(text, m.start())]
+    return text[:opens[0]] if opens else text
 
 
 def extract_code(text, lang=None):
@@ -822,7 +835,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
                         break
                     repeat = numbered[(model, task["name"], task["config"])] + 1
                     label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    taskdir = runs_dir / UNSAFE_NAME_RE.sub("_", model) / task["name"] / f"repeat_{repeat}"
+                    taskdir = runs_dir / safe_name(model) / task["name"] / f"repeat_{repeat}"
                     result = run_one_task(label, base, model, task, taskdir, opts, stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
                     length_finishes += result["finish_reason"] == "length"
@@ -1008,7 +1021,7 @@ def parse_args():
                  "http://localhost:1234/v1 for LM Studio)")
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if args.tag:
-        args.tag = UNSAFE_NAME_RE.sub("_", args.tag)
+        args.tag = safe_name(args.tag)
     args.params = dict(args.param)
     if args.temperature is not None and args.params.get("temperature", args.temperature) != args.temperature:
         ap.error("--temperature conflicts with --param temperature=...")

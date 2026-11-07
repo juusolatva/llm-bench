@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,12 +23,18 @@ static void harness_expect(const IntervalSet& s, const harness_vec& want, const 
         harness_fails++;
     }
 }
-#define HARNESS_CHECK(c, msg) do { if (!(c)) { std::fprintf(stderr, "FAIL: %s\n", msg); harness_fails++; } } while (0)
+static void harness_contains(const IntervalSet& s, long x, bool want, const char* after) {
+    if (s.contains(x) != want) {
+        std::fprintf(stderr, "after %s: contains(%ld) = %s, want %s (intervals() = %s)\n", after, x,
+                     want ? "false" : "true", want ? "true" : "false", harness_str(s.intervals()).c_str());
+        harness_fails++;
+    }
+}
 
 int main() {
     IntervalSet s;
     harness_expect(s, {}, "construction");
-    HARNESS_CHECK(!s.contains(0), "empty set contains 0");
+    harness_contains(s, 0, false, "construction");
     s.add(5, 5);
     s.add(7, 3);
     harness_expect(s, {}, "add(5, 5), add(7, 3)");
@@ -37,8 +44,8 @@ int main() {
     s.add(10, 20);
     s.add(-5, -2);
     harness_expect(s, {{-5, -2}, {1, 5}, {10, 20}}, "add(10, 20), add(-5, -2)");
-    HARNESS_CHECK(s.contains(-5) && s.contains(4) && s.contains(19), "contains inside intervals");
-    HARNESS_CHECK(!s.contains(-2) && !s.contains(5) && !s.contains(20) && !s.contains(0), "contains outside intervals");
+    for (long x : {-5L, -3L, 1L, 4L, 10L, 19L}) harness_contains(s, x, true, "add(10, 20), add(-5, -2)");
+    for (long x : {-6L, -2L, 0L, 5L, 9L, 20L}) harness_contains(s, x, false, "add(10, 20), add(-5, -2)");
     s.add(4, 11);
     harness_expect(s, {{-5, -2}, {1, 20}}, "add(4, 11)");
     s.add(2, 8);
@@ -62,19 +69,34 @@ int main() {
     s.add(3, 4);
     harness_expect(s, {{0, 10}}, "remove(3, 4) then add(3, 4)");
 
+    // Large set: add [3i, 3i+1) for i < 200000, remove the even i, then add [3i, 3i+7) for i = 1, 5, 9, ...
+    // which merges each with the interval starting at 3(i+2). Expected: n/4 intervals [3i, 3i+7).
     auto t0 = std::chrono::steady_clock::now();
     IntervalSet big;
     const long n = 200000;
     for (long i = 0; i < n; i++) big.add(3 * i, 3 * i + 1);
-    for (long i = 0; i < n; i++)
-        HARNESS_CHECK(big.contains(3 * i) && !big.contains(3 * i + 1), "contains in a large set");
+    for (long i = 0; i < n; i++) {
+        if (!big.contains(3 * i) || big.contains(3 * i + 1)) {
+            std::fprintf(stderr, "large set after adding [3i, 3i+1) for i < %ld: contains(%ld) = %d, contains(%ld) = %d, "
+                         "want 1 and 0\n", n, 3 * i, big.contains(3 * i), 3 * i + 1, big.contains(3 * i + 1));
+            return 1;
+        }
+    }
     for (long i = 0; i < n; i += 2) big.remove(3 * i, 3 * i + 1);
     for (long i = 1; i + 1 < n; i += 4) big.add(3 * i, 3 * i + 7);
     auto iv = big.intervals();
-    HARNESS_CHECK(iv.size() == static_cast<std::size_t>(n / 4), "interval count in a large set");
-    HARNESS_CHECK(!iv.empty() && iv[0] == std::make_pair(3L, 10L), "first interval in a large set");
+    harness_vec head(iv.begin(), iv.begin() + std::min<std::size_t>(iv.size(), 3));
+    if (iv.size() != static_cast<std::size_t>(n / 4) || head != harness_vec{{3, 10}, {15, 22}, {27, 34}}) {
+        std::fprintf(stderr, "large set: intervals() has %zu intervals starting %s, want %ld starting { [3,10) [15,22) [27,34) }\n",
+                     iv.size(), harness_str(head).c_str(), n / 4);
+        harness_fails++;
+    }
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    HARNESS_CHECK(secs < 20, "too slow: operations are not O(log n)");
+    if (secs >= 20) {
+        std::fprintf(stderr, "too slow: %ld adds, %ld contains and %ld removes took %.1f s (limit 20 s); "
+                     "operations must be O(log n)\n", n + n / 4, 2 * n, n / 2, secs);
+        harness_fails++;
+    }
     if (harness_fails) return 1;
     std::puts("ok");
 }

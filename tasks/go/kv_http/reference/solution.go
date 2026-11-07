@@ -42,6 +42,8 @@ func (s *store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(value)
 	case http.MethodDelete:
