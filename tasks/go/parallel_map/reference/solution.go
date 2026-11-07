@@ -32,6 +32,9 @@ func ParallelMap(ctx context.Context, inputs []int, workers int,
 		go func(i, x int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if ctx.Err() != nil { // canceled while this goroutine was being scheduled
+				return
+			}
 			v, err := f(ctx, x)
 			if err != nil {
 				mu.Lock()

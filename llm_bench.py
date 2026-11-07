@@ -170,6 +170,14 @@ def safe_name(name):
     return re.sub(r"^\.", "_", UNSAFE_NAME_RE.sub("_", name)) or "_"
 
 
+def model_dirs(models):
+    """Transcript directory names for model IDs: safe_name(ID), plus "-" and a short hash of the ID for IDs
+    whose safe names would collide (".foo" and "_foo", "a/b" and "a_b"), so no model overwrites another's."""
+    counts = Counter(safe_name(m) for m in models)
+    return {m: safe_name(m) if counts[safe_name(m)] == 1
+            else f"{safe_name(m)}-{hashlib.sha256(m.encode()).hexdigest()[:8]}" for m in models}
+
+
 PRINT_LOCK = threading.Lock()
 
 
@@ -866,6 +874,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             f.flush()
 
         params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
+        dirs = model_dirs(models)
 
         def record(model, task, result, model_info):
             """Number the run, then append its row to the results file and to rows."""
@@ -914,7 +923,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
                         break
                     repeat = numbered[(model, task["name"], task["config"])] + 1
                     label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    taskdir = runs_dir / safe_name(model) / task["name"] / f"repeat_{repeat}"
+                    taskdir = runs_dir / dirs[model] / task["name"] / f"repeat_{repeat}"
                     result = run_one_task(label, base, model, task, taskdir, opts, stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
                     length_finishes += result["finish_reason"] == "length"
