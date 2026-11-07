@@ -95,6 +95,8 @@ def test_extract_code_loose_fallback(text, want):
     ("Put it below ```\n```python\ngood\n```", "good\n"),                 # untagged mid-line fence isn't either
     ("```python\nx = '``` inside'\n```", "x = '``` inside'\n"),        # backticks mid-line in code
     ("````markdown\n```python\nnested\n```\n````", "```python\nnested\n```\n"),   # longer outer fence
+    ("```python\nx = 1\n```text\ny = 2\n```", "x = 1\n```text\ny = 2\n"),       # ```text doesn't close
+    ("```python\nprint(\"```\")\n```", "print(\"```\")\n"),                # nor a fence inside a string
 ])
 def test_extract_code_fence_pairing(text, want):
     assert llm_bench.extract_code(text) == want
@@ -134,6 +136,16 @@ def test_strip_think_is_linear(monkeypatch):
     start = time.monotonic()
     assert llm_bench.strip_think(reply) == reply
     assert len(scans) <= 2
+    assert time.monotonic() - start < 2
+
+
+@pytest.mark.parametrize("reply", [
+    "`" * 200000, "```" + " " * 200000, "```py\n" + "`" * 200000, "x " * 100000 + "```" + "\t" * 100000 + "y",
+    "```py\na\n" * 50000, "Here: ```python\nx ```\n" * 50000, "````py\nx````\n" * 30000 + "```\n" * 30000,
+])
+def test_extract_code_degenerate_replies_are_fast(reply):
+    start = time.monotonic()
+    llm_bench.extract_code(reply, "python")
     assert time.monotonic() - start < 2
 
 

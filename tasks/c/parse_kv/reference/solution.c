@@ -2,11 +2,13 @@
 #include <stddef.h>
 #include <string.h>
 
+/* Narrow [*start, *end) to exclude leading and trailing whitespace. */
 static void strip(const char **start, const char **end) {
     while (*start < *end && isspace((unsigned char)**start)) (*start)++;
     while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
 }
 
+/* Parse "key = value": 1 on success, 0 for blank and comment lines, -1 for errors or too-small buffers. */
 int parse_kv(const char *line, char *key, size_t keysz, char *val, size_t valsz) {
     const char *p = line;
     while (*p && isspace((unsigned char)*p)) p++;

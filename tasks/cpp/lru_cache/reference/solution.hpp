@@ -5,11 +5,13 @@
 #include <unordered_map>
 #include <utility>
 
+// Least-recently-used cache: a list ordered by recency plus a hash map from key to list node (O(1) get/put).
 template <typename K, typename V>
 class LruCache {
 public:
     explicit LruCache(std::size_t capacity) : capacity_(capacity) {}
 
+    // The value for key, marking it most recently used; std::nullopt if absent.
     std::optional<V> get(const K& key) {
         auto it = index_.find(key);
         if (it == index_.end()) return std::nullopt;
@@ -17,6 +19,7 @@ public:
         return it->second->second;
     }
 
+    // Insert or update key as most recently used, evicting the least recently used key when over capacity.
     void put(const K& key, const V& value) {
         auto it = index_.find(key);
         if (it != index_.end()) {

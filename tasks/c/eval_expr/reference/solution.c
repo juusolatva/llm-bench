@@ -1,13 +1,17 @@
 #include <ctype.h>
 
+/* Recursive-descent parser: sum := product (('+'|'-') product)*, product := unary (('*'|'/') unary)*,
+   unary := '-' unary | '(' sum ')' | digits. p is the read position; error is set on any syntax error. */
 typedef struct { const char *p; int error; } parser;
 
 static long parse_sum(parser *ps);
 
+/* Advance past spaces. */
 static void skip_spaces(parser *ps) {
     while (*ps->p == ' ') ps->p++;
 }
 
+/* unary := '-' unary | '(' sum ')' | digits */
 static long parse_unary(parser *ps) {
     skip_spaces(ps);
     if (*ps->p == '-') {
@@ -28,6 +32,7 @@ static long parse_unary(parser *ps) {
     return v;
 }
 
+/* product := unary (('*'|'/') unary)*; division by zero is an error. */
 static long parse_product(parser *ps) {
     long v = parse_unary(ps);
     for (;;) {
@@ -48,6 +53,7 @@ static long parse_product(parser *ps) {
     }
 }
 
+/* sum := product (('+'|'-') product)* */
 static long parse_sum(parser *ps) {
     long v = parse_product(ps);
     for (;;) {
@@ -60,6 +66,7 @@ static long parse_sum(parser *ps) {
     }
 }
 
+/* Evaluate s into *out and return 0, or return -1 (leaving *out unchanged) if s is invalid. */
 int eval_expr(const char *s, long *out) {
     parser ps = {s, 0};
     long v = parse_sum(&ps);

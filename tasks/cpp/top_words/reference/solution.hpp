@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+// The n most frequent lowercase ASCII-letter words with their counts, ties ordered alphabetically.
 inline std::vector<std::pair<std::string, int>> top_words(const std::string& text, std::size_t n) {
     std::map<std::string, int> counts;
     std::string word;

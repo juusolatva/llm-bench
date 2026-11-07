@@ -1,4 +1,5 @@
 #!/bin/bash
+# Count HTTP status codes and sum response sizes in an access log.
 awk 'NF {
     count[$(NF - 1)]++
     if ($NF != "-") bytes += $NF

@@ -1,6 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+/// The lexicographically smallest topological order of nodes 0..n (Kahn's algorithm with a min-heap),
+/// or an error for out-of-range nodes, self-loops and cycles.
 pub fn topo_order(n: usize, edges: &[(usize, usize)]) -> Result<Vec<usize>, String> {
     let mut successors = vec![Vec::new(); n];
     let mut indegree = vec![0usize; n];

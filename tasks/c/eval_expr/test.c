@@ -4,6 +4,7 @@
 int eval_expr(const char *s, long *out);
 
 static int harness_fails;
+/* Check eval_expr(expr): want_rc 0 with result want, or -1 with *out left unchanged. */
 static void harness_t(const char *expr, int want_rc, long want) {
     size_t n = strlen(expr) + 1;
     char *s = malloc(n);              /* exact-size heap copy: ASan catches over-reads */

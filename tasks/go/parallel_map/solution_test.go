@@ -9,10 +9,12 @@ import (
 	"time"
 )
 
+// harnessTracker counts calls of f: started, currently active and the peak number active at once.
 type harnessTracker struct {
 	active, peak, started atomic.Int64
 }
 
+// enter records the start of a call.
 func (h *harnessTracker) enter() {
 	h.started.Add(1)
 	n := h.active.Add(1)
@@ -24,6 +26,7 @@ func (h *harnessTracker) enter() {
 	}
 }
 
+// leave records the end of a call.
 func (h *harnessTracker) leave() { h.active.Add(-1) }
 
 func TestOrderAndConcurrency(t *testing.T) {

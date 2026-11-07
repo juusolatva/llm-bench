@@ -11,6 +11,7 @@ TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
 
 
 def reference_file(task):
+    """tasks/<lang>/<task>/reference/<solution file> for a built-in task."""
     lang = llm_bench.LANGS[task["lang"]]
     directory = task["name"].removeprefix(lang["prefix"] + "_")
     return llm_bench.DEFAULT_TASKS_DIR / task["lang"] / directory / "reference" / lang["sol"]
@@ -18,6 +19,7 @@ def reference_file(task):
 
 @pytest.mark.parametrize("task", TASKS, ids=[t["name"] for t in TASKS])
 def test_reference_exists(task):
+    """Every built-in task has a non-empty reference solution."""
     path = reference_file(task)
     assert path.is_file(), f"missing reference solution {path}"
     assert path.read_text().strip()
@@ -38,6 +40,7 @@ def go_cache():
 @pytest.mark.sandbox
 @pytest.mark.parametrize("task", TASKS, ids=[t["name"] for t in TASKS])
 def test_reference_passes(task, tmp_path, request):
+    """The reference solution passes the task's harness in the sandbox (skipped without its toolchain)."""
     try:
         llm_bench.check_toolchains([task])
     except SystemExit as exc:

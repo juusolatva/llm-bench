@@ -7,6 +7,7 @@ import (
 	"sync"
 )
 
+// store is an in-memory key-value store served over HTTP.
 type store struct {
 	mu   sync.RWMutex
 	data map[string][]byte
@@ -17,6 +18,7 @@ func NewHandler() http.Handler {
 	return &store{data: map[string][]byte{}}
 }
 
+// ServeHTTP handles PUT, GET and DELETE on /kv/{key}.
 func (s *store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key, ok := strings.CutPrefix(r.URL.Path, "/kv/")
 	if !ok || key == "" || strings.Contains(key, "/") {

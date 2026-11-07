@@ -1,8 +1,10 @@
+/// Item quantities by name.
 pub struct Inventory {
     items: Vec<(String, u32)>,
 }
 
 impl Inventory {
+    /// An empty inventory.
     pub fn new() -> Self {
         Inventory { items: Vec::new() }
     }

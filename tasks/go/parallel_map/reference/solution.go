@@ -6,7 +6,7 @@ import (
 )
 
 // ParallelMap calls f for every input with at most `workers` calls running at once and returns the
-// results in input order, or the first error.
+// results in input order, or the first error returned by f (ctx.Err() if ctx was canceled).
 func ParallelMap(ctx context.Context, inputs []int, workers int,
 	f func(ctx context.Context, x int) (int, error)) ([]int, error) {
 	parent := ctx

@@ -13,7 +13,6 @@ Run with --help for usage.
 import argparse
 import bisect
 import csv
-import functools
 import hashlib
 import http.client
 import json
@@ -155,10 +154,12 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Fenced code blocks are found by a left-to-right scan (_code_blocks), so a fence is never used twice. An
 # opening fence is a run of 3+ backticks either at the start of a line with an optional info string (it
 # starts with the language tag: "python", "python:solution.py", "c++ title=x") or mid-line directly followed
-# by a (required) tag and the end of the line ("Here: ```python"). Possessive quantifiers (*+, ++) and the lookbehind
-# keep matching linear on degenerate replies such as long runs of backticks or spaces.
+# by a (required) tag and the end of the line ("Here: ```python"). Possessive quantifiers (*+, ++) and the
+# lookbehind keep matching linear on degenerate replies such as long runs of backticks or spaces.
 FENCE_OPEN_RE = re.compile(r"^[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n",
                            re.MULTILINE)
+# A closing fence: a run of 3+ backticks followed only by whitespace up to the end of the line.
+FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 
@@ -181,6 +182,8 @@ def log(msg, err=False):
 
 
 def http_json(url, payload=None, timeout=60, api_key=None):
+    """GET url (or POST payload as JSON) and return the decoded JSON reply. Raises ValueError if the reply
+    exceeds MAX_RESPONSE_BYTES or isn't JSON, and urllib/http.client errors on HTTP or connection failures."""
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -195,6 +198,7 @@ def http_json(url, payload=None, timeout=60, api_key=None):
 
 
 def list_models(name, base, api_key):
+    """The model IDs the endpoint serves, or [] (with a message) if they can't be listed."""
     try:
         return [m["id"] for m in http_json(f"{base}/models", timeout=10, api_key=api_key)["data"]]
     except (OSError, http.client.HTTPException, KeyError, TypeError, ValueError) as e:
@@ -225,29 +229,29 @@ def parse_endpoint(spec):
     return safe_name(name), base
 
 
-@functools.cache
-def _fence_close_re(length):
-    """A closing fence for an opening fence of `length` backticks: a line starting with at least as many."""
-    return re.compile(rf"^[ \t]*+`{{{length},}}", re.MULTILINE)
-
-
 def _code_blocks(text):
-    """Fenced blocks as (start, end, tag, code), in reply order. A block ends at the next line that starts
-    with at least as many backticks as its opening fence or, failing that, at the next such run of backticks
-    anywhere (a closing fence glued to the code). Scanning stops at an unclosed block."""
+    """Fenced blocks as (start, end, tag, code), in reply order. A block ends at the first closing fence after
+    it: a run of at least as many backticks as its opening fence followed only by whitespace up to the end of
+    the line, either on its own line or glued to the end of the code. Scanning stops at an unclosed block.
+    The closing fences are found in one pass, so this stays linear in the reply length."""
+    closes = [(m.start(), m.end(), len(m.group(1))) for m in FENCE_CLOSE_RE.finditer(text)]
+    starts = [c[0] for c in closes]
+    longest_after = [0] * (len(closes) + 1)   # longest closing fence at or after each index
+    for i in range(len(closes) - 1, -1, -1):
+        longest_after[i] = max(closes[i][2], longest_after[i + 1])
     blocks, pos = [], 0
     while (opening := FENCE_OPEN_RE.search(text, pos)):
         fence, tag = (opening.group(1), opening.group(2)) if opening.group(1) else (opening.group(3), opening.group(4))
-        body = opening.end()
-        closing = _fence_close_re(len(fence)).search(text, body)
-        if closing:
-            code_end, end = closing.start(), closing.end()
-        else:
-            code_end = text.find(fence, body)
-            if code_end < 0:
-                break
-            end = code_end + len(fence)
-        blocks.append((opening.start(), end, tag, text[body:code_end]))
+        i = bisect.bisect_left(starts, opening.end())
+        if longest_after[i] < len(fence):
+            break
+        while closes[i][2] < len(fence):   # shorter fences inside the block are code
+            i += 1
+        code_end, end, _ = closes[i]
+        line_start = text.rfind("\n", 0, code_end) + 1
+        if line_start >= opening.end() and not text[line_start:code_end].strip():
+            code_end = line_start   # a fence on its own (possibly indented) line: the code ends before it
+        blocks.append((opening.start(), end, tag, text[opening.end():code_end]))
         pos = end
     return blocks
 
@@ -342,6 +346,7 @@ ACTIVE_UNITS_LOCK = threading.Lock()
 
 
 def stop_active_units():
+    """Stop the transient systemd units of sandboxes that are still running (on Ctrl-C)."""
     with ACTIVE_UNITS_LOCK:
         units = list(ACTIVE_UNITS)
     for unit in units:
@@ -583,6 +588,7 @@ class Interrupted(Exception):
 
 
 def server_reachable(base, api_key):
+    """Whether the endpoint answers its /models request (used to tell a dead server from a failed request)."""
     try:
         http_json(f"{base}/models", timeout=10, api_key=api_key)
         return True
@@ -644,6 +650,7 @@ MODEL_ERRORS = ("bad_response", "disconnected")
 
 
 def is_model_error(finish):
+    """Whether a finish reason means the model or server failed the request (counts toward MAX_MODEL_ERRORS)."""
     return finish in MODEL_ERRORS or (finish or "").startswith("http_")
 
 
@@ -702,6 +709,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
 
 
 def context_needed(opts):
+    """Tokens of context the longest request needs: the prompt, feedback for each retry and max_tokens."""
     return CONTEXT_BASE_TOKENS + (opts.attempts - 1) * CONTEXT_PER_RETRY_TOKENS + opts.max_tokens
 
 
@@ -716,11 +724,13 @@ FILLER_WORDS = (  # noqa: SIM905 -- easier to read than a list literal
 
 
 def filler(words):
+    """A deterministic prompt of `words` common English words, for the context check."""
     rng = random.Random(words)
     return " ".join(rng.choice(FILLER_WORDS) for _ in range(words))
 
 
 def probe(label, base, model, content, opts, stop):
+    """Send a one-token request (warm-up and context check); returns chat()'s (text, finish, usage, error)."""
     payload = {**opts.params, "model": model, "max_tokens": 1, "messages": [{"role": "user", "content": content}]}
     return chat(label, base, payload, opts, stop)
 
@@ -796,6 +806,7 @@ def config_hash(settings, task):
 
 
 def skipped_result(finish_reason, fail_stage):
+    """The result fields of a run that was skipped without sending a request."""
     return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
 
@@ -830,6 +841,7 @@ def read_results(path):
 
 
 def is_finished(row):
+    """Whether a results row is final; --resume runs rows that failed for reasons outside the model again."""
     finish = row.get("finish_reason") or ""
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
@@ -854,6 +866,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
         params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
 
         def record(model, task, result, model_info):
+            """Number the run, then append its row to the results file and to rows."""
             key = (model, task["name"], task["config"])
             numbered[key] += 1
             row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
@@ -865,6 +878,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             log(str(row))
 
         def skip_rest(model, todo, why, finish_reason, fail_stage, model_info):
+            """Record the model's remaining runs as skipped with the given finish reason and fail stage."""
             log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} run(s)", err=True)
             for task in todo:
                 record(model, task, skipped_result(finish_reason, fail_stage), model_info)
@@ -951,6 +965,7 @@ def summarize(rows):
 
 
 def print_summary(rows):
+    """Print the per-endpoint and per-model pass table for result rows (means and spread over repeats)."""
     if not rows:
         print("\nno results")
         return
@@ -961,9 +976,11 @@ def print_summary(rows):
                    if x in LANGS else len(LANGS))
 
     def score(value, var, n):
+        """A pass count: mean±sd/n with repeats, otherwise count/n."""
         return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
     def lang_cell(value, n):
+        """A per-language pass count: the mean with repeats, otherwise the count, out of n."""
         return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
     ew = max(8, *(len(g["endpoint"]) for g in groups))
@@ -1006,6 +1023,7 @@ def parse_param(spec):
 
 
 def positive_int(value):
+    """argparse type: an integer >= 1."""
     n = int(value)
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
@@ -1027,6 +1045,7 @@ The API key is read from --api-key, LLM_BENCH_API_KEY or OPENAI_API_KEY, in that
 
 
 def parse_args():
+    """Parse and validate the command line (endpoints may also come from LLM_BENCH_ENDPOINTS)."""
     ap = argparse.ArgumentParser(
         description="Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go "
                     "and Bash coding tasks. Generated code is built and tested in a sandbox.",
@@ -1112,6 +1131,7 @@ def check_results_file(path):
 
 
 def main():
+    """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
     args = parse_args()
     if args.summary:
         try:

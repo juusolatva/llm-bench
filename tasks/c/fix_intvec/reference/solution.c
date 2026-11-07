@@ -3,8 +3,10 @@
 
 typedef struct { int *data; size_t len, cap; } intvec;
 
+/* Initialize an empty vector. */
 void iv_init(intvec *v) { v->data = NULL; v->len = 0; v->cap = 0; }
 
+/* Append x, doubling the capacity when full. Returns 0, or -1 if allocation fails (v is unchanged). */
 int iv_push(intvec *v, int x) {
     if (v->len == v->cap) {
         size_t cap = v->cap ? v->cap * 2 : 8;
@@ -25,4 +27,5 @@ int iv_remove_at(intvec *v, size_t i) {
     return 0;
 }
 
+/* Free the storage and reset v to empty. */
 void iv_free(intvec *v) { free(v->data); v->data = NULL; v->len = 0; v->cap = 0; }

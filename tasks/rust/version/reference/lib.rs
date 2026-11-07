@@ -1,6 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// A semantic version; ordering compares major, then minor, then patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
     pub major: u64,
@@ -11,6 +12,7 @@ pub struct Version {
 impl FromStr for Version {
     type Err = String;
 
+    /// Parse "MAJOR.MINOR.PATCH" with an optional leading 'v'.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let body = s.strip_prefix('v').unwrap_or(s);
         let parts: Vec<&str> = body.split('.').collect();
@@ -29,6 +31,7 @@ impl FromStr for Version {
 }
 
 impl fmt::Display for Version {
+    /// Format as "MAJOR.MINOR.PATCH".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }

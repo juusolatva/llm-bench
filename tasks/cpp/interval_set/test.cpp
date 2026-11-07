@@ -10,11 +10,13 @@
 using harness_vec = std::vector<std::pair<long, long>>;
 static int harness_fails;
 
+// Format intervals as "{ [lo,hi) ... }".
 static std::string harness_str(const harness_vec& v) {
     std::string s = "{";
     for (auto& p : v) s += " [" + std::to_string(p.first) + "," + std::to_string(p.second) + ")";
     return s + " }";
 }
+// Check s.intervals() against want after the operations described by `after`.
 static void harness_expect(const IntervalSet& s, const harness_vec& want, const char* after) {
     auto got = s.intervals();
     if (got != want) {
@@ -23,6 +25,7 @@ static void harness_expect(const IntervalSet& s, const harness_vec& want, const 
         harness_fails++;
     }
 }
+// Check s.contains(x) against want.
 static void harness_contains(const IntervalSet& s, long x, bool want, const char* after) {
     if (s.contains(x) != want) {
         std::fprintf(stderr, "after %s: contains(%ld) = %s, want %s (intervals() = %s)\n", after, x,

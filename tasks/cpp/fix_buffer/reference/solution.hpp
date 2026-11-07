@@ -3,6 +3,7 @@
 #include <cstring>
 #include <utility>
 
+// A fixed-size, zero-initialized byte buffer that owns its memory: copies are deep, moves transfer it.
 class Buffer {
 public:
     explicit Buffer(std::size_t size) : size_(size), data_(new char[size]) {
@@ -34,6 +35,7 @@ public:
     const char& operator[](std::size_t i) const { return data_[i]; }
     char* data() { return data_; }
 private:
+    // Exchange contents with other (used by copy assignment).
     void swap(Buffer& other) noexcept {
         std::swap(size_, other.size_);
         std::swap(data_, other.data_);

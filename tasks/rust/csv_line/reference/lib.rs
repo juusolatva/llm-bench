@@ -1,3 +1,4 @@
+/// Split one CSV line into fields (quoted fields may contain commas and "" escapes).
 pub fn parse_csv_line(line: &str) -> Result<Vec<String>, String> {
     let mut fields = Vec::new();
     let mut chars = line.chars().peekable();

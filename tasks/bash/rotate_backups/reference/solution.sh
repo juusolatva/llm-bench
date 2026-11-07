@@ -1,4 +1,6 @@
 #!/bin/bash
+# Delete all but the N most recently modified *.bak files directly in DIR, printing each deleted path.
+# Print the usage and exit 1.
 usage() { echo "usage: rotate.sh DIR N" >&2; exit 1; }
 [ "$#" -eq 2 ] || usage
 dir=$1 keep=$2
