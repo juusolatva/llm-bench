@@ -84,8 +84,13 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	// Calls that are never canceled give up after 2 s, so a missing cancellation fails the test quickly.
 	watchdog := make(chan struct{})
 	time.AfterFunc(2*time.Second, func() { close(watchdog) })
+	var failed atomic.Bool       // set just before input 10's call returns boom
+	var startedAfter atomic.Int64 // calls that started after that
 	start := time.Now()
 	got, err := ParallelMap(context.Background(), inputs, 4, func(ctx context.Context, x int) (int, error) {
+		if failed.Load() {
+			startedAfter.Add(1)
+		}
 		h.enter()
 		defer h.leave()
 		switch {
@@ -93,6 +98,7 @@ func TestErrorCancelsAndStops(t *testing.T) {
 			return x, nil
 		case x == 10:
 			time.Sleep(20 * time.Millisecond)
+			failed.Store(true)
 			return 0, boom
 		default:
 			select {
@@ -116,6 +122,9 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	if a := h.active.Load(); a != 0 {
 		t.Fatalf("returned while %d calls of f were still running", a)
 	}
+	if n := startedAfter.Load(); n > 0 {
+		t.Fatalf("%d calls of f started after input 10 returned an error; no new calls may start after an error", n)
+	}
 	// Inputs 0-13 can start before input 10 fails (inputs claim the 4 workers in order, and 11-13 run until
 	// canceled, so 14 can't get a worker before the error); none may start after it.
 	s := h.started.Load()
@@ -124,6 +133,21 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	}
 	if s > 11 && canceled == 0 {
 		t.Fatalf("no running call saw its context canceled")
+	}
+}
+
+func TestErrorWithOneWorker(t *testing.T) {
+	boom := errors.New("boom")
+	var calls atomic.Int64
+	got, err := ParallelMap(context.Background(), []int{0, 1, 2, 3, 4}, 1, func(ctx context.Context, x int) (int, error) {
+		calls.Add(1)
+		return 0, boom
+	})
+	if !errors.Is(err, boom) || got != nil {
+		t.Fatalf("one worker, first call fails: got %v, %v; want nil and boom", got, err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("one worker, first call fails: f was called %d times, want 1 (no calls may start after an error)", n)
 	}
 }
 
