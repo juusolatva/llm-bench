@@ -28,6 +28,9 @@ def go_cache():
     """Warm the Go build cache once, like a real run does, so Go tasks stay under the time limit."""
     with tempfile.TemporaryDirectory(prefix="llm-bench-test-go-") as d:
         llm_bench.prepare_go_cache(d)
+        if llm_bench.GO_CACHE is None:
+            pytest.fail("warming the Go build cache failed (see the warning above); without it Go tasks "
+                        "compile the standard library each time and hit the time limit")
         yield
         llm_bench.GO_CACHE = None
 

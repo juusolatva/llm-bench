@@ -113,10 +113,13 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	if a := h.active.Load(); a != 0 {
 		t.Fatalf("returned while %d calls of f were still running", a)
 	}
-	if s := h.started.Load(); s != 14 {
-		t.Fatalf("f was called %d times, want 14: inputs 0-13 start before input 10 fails (4 workers, in input order) and no new calls may start after the error", s)
+	// Inputs 0-13 can start before input 10 fails (inputs claim the 4 workers in order, and 11-13 run until
+	// canceled, so 14 can't get a worker before the error); none may start after it.
+	s := h.started.Load()
+	if s > 14 {
+		t.Fatalf("f was called %d times, want at most 14: inputs claim workers in order, so inputs 0-13 can start before input 10 fails, and no new calls may start after the error", s)
 	}
-	if canceled == 0 {
+	if s > 11 && canceled == 0 {
 		t.Fatalf("no running call saw its context canceled")
 	}
 }

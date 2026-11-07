@@ -11,6 +11,7 @@ toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils).
 Run with --help for usage.
 """
 import argparse
+import bisect
 import csv
 import hashlib
 import http.client
@@ -150,9 +151,13 @@ FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "pa
           "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-# A fenced block: an opening fence with an optional info string (its first word is the language tag) and a
-# closing fence, each on its own line (indentation allowed).
-CODE_RE = re.compile(r"^[ \t]*```[ \t]*([^\s`]*)[^\n`]*\n(.*?)^[ \t]*```", re.DOTALL | re.MULTILINE)
+# A fenced block: an opening fence with an optional info string (it starts with the language tag, as in
+# "python" or "python:solution.py") and a closing fence, each on its own line (indentation allowed).
+# Possessive quantifiers (*+, ++) and the lookbehind keep matching linear on degenerate replies (long runs of
+# backticks or spaces); with plain quantifiers those backtrack quadratically or worse.
+CODE_RE = re.compile(r"^[ \t]*+```[ \t]*+([\w+-]*+)[^\n`]*+\n(.*?)^[ \t]*```", re.DOTALL | re.MULTILINE)
+# Fallback when no block matches CODE_RE: fences anywhere, e.g. 4-backtick fences or a closing fence glued to code.
+LOOSE_CODE_RE = re.compile(r"(?<!`)```++[ \t]*+([\w+-]*+)[^\n]*+\n(.*?)```", re.DOTALL)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 
@@ -219,32 +224,55 @@ def parse_endpoint(spec):
     return safe_name(name), base
 
 
-def _in_code(text, pos):
-    return any(m.start() <= pos < m.end() for m in CODE_RE.finditer(text))
+def _outside_code(text, positions):
+    """The positions that aren't inside a fenced code block (one scan of text for all positions)."""
+    spans = [m.span() for m in CODE_RE.finditer(text)]
+    starts = [start for start, _ in spans]
+    keep = []
+    for pos in positions:
+        i = bisect.bisect_right(starts, pos) - 1
+        if i < 0 or pos >= spans[i][1]:
+            keep.append(pos)
+    return keep
 
 
 def strip_think(text):
-    """Remove reasoning: <think>...</think> blocks, everything before an unpaired </think> (servers that
-    drop the opening tag) and everything after an unclosed <think> (reasoning cut off by max_tokens).
-    Tags inside fenced code blocks are part of the code and kept."""
-    text = THINK_RE.sub(lambda m: m.group(0) if _in_code(text, m.start()) else "", text)
-    closes = [m.start() for m in re.finditer("</think>", text) if not _in_code(text, m.start())]
+    """Remove reasoning: <think>...</think> blocks, everything before an unpaired </think> (servers that drop
+    the opening tag; the first one, so a tag mentioned after the answer can't swallow it) and a reply that
+    starts with a <think> that never closes (reasoning cut off by max_tokens). Tags inside fenced code
+    blocks are part of the code, and an unpaired <think> later in the reply is ordinary text."""
+    # Search only up to the last </think>: an unclosed <think> after it would make each match attempt scan
+    # to the end of the reply (quadratic in replies full of <think>).
+    last_close = text.rfind("</think>")
+    pairs = list(THINK_RE.finditer(text, 0, last_close + len("</think>"))) if last_close >= 0 else []
+    outside = set(_outside_code(text, [m.start() for m in pairs]))
+    pieces, end = [], 0
+    for m in pairs:
+        if m.start() in outside:   # pairs inside code stay in place
+            pieces.append(text[end:m.start()])
+            end = m.end()
+    text = "".join(pieces) + text[end:]
+    closes = _outside_code(text, [m.start() for m in re.finditer("</think>", text)])
     if closes:
-        text = text[closes[-1] + len("</think>"):]
-    opens = [m.start() for m in re.finditer("<think>", text) if not _in_code(text, m.start())]
-    return text[:opens[0]] if opens else text
+        text = text[closes[0] + len("</think>"):]
+    return "" if text.lstrip().startswith("<think>") else text
 
 
 def extract_code(text, lang=None):
-    """The solution in a reply: the longest fenced block tagged with one of the language's tags (any block
-    if none is tagged so), the last one on ties. A reply without a fenced block is taken as code."""
+    """The solution in a reply. Candidates are the fenced blocks tagged with one of the language's tags (all
+    blocks if none is tagged so). The last candidate wins, which is the fixed version when a reply quotes the
+    original code first, unless it's less than half as long as the longest one: then it's a usage example or
+    a snippet after the full file, and the longest (the last of equally long ones) wins. A reply without a
+    fenced block is taken as code."""
     text = strip_think(text)
-    blocks = CODE_RE.findall(text)
+    blocks = CODE_RE.findall(text) or LOOSE_CODE_RE.findall(text)
     if not blocks:
         return text
     tags = LANGS[lang]["tags"] if lang else ()
     candidates = [code for tag, code in blocks if tag.lower() in tags] or [code for _, code in blocks]
-    return max(reversed(candidates), key=lambda code: len(code.strip()))
+    longest = max(reversed(candidates), key=lambda code: len(code.strip()))
+    last = candidates[-1]
+    return last if 2 * len(last.strip()) >= len(longest.strip()) else longest
 
 
 # This trusted launcher runs before bwrap, outside its hidden /sys. Verify that

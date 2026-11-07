@@ -2,12 +2,6 @@ pub struct Inventory {
     items: Vec<(String, u32)>,
 }
 
-impl Default for Inventory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Inventory {
     pub fn new() -> Self {
         Inventory { items: Vec::new() }
@@ -46,9 +40,5 @@ impl Inventory {
     /// Number of distinct items.
     pub fn len(&self) -> usize {
         self.items.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
     }
 }

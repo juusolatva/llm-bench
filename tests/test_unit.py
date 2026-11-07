@@ -1,4 +1,5 @@
 import sys
+import time
 from collections import Counter
 
 import pytest
@@ -45,8 +46,10 @@ def test_extract_code_strips_think():
 
 @pytest.mark.parametrize(("text", "want"), [
     ("reasoning\n```python\nbad\n```\n</think>\n```python\ngood\n```", "good\n"),   # unpaired </think>
-    ("```python\ngood\n```\n<think>```python\ncut off", "good\n"),            # unclosed <think>
-    ("<think>never finished ```python\nbad\n```", ""),
+    ("<think>never finished\n```python\nbad\n```", ""),                        # unclosed <think>
+    ("  \n<think>\n```python\nbad\n```\n", ""),
+    ("I removed the <think> tags.\n```python\ngood\n```", "good\n"),           # <think> in prose
+    ("plan\n</think>\n```python\ngood\n```\nIt drops </think> tags.", "good\n"),  # </think> in prose
 ])
 def test_extract_code_partial_think(text, want):
     assert llm_bench.extract_code(text, "python") == want
@@ -58,10 +61,30 @@ def test_extract_code_prefers_matching_language_tag():
     assert llm_bench.extract_code(text, "rust") == "pip install nothing here at all\n"   # no rust block: longest
 
 
-def test_extract_code_takes_longest_then_last():
-    text = "```go\nfunc Solution() {}\n```\n```go\nx()\n```"
-    assert llm_bench.extract_code(text, "go") == "func Solution() {}\n"
+def test_extract_code_takes_last_unless_much_shorter():
+    full = "func Solution() int {\n\treturn 42\n}\n"
+    # A short usage example after the solution loses to the solution.
+    assert llm_bench.extract_code(f"```go\n{full}```\n```go\nSolution()\n```", "go") == full
+    # Original first, then a slightly shorter fix: the fix (last) wins.
+    orig, fixed = "def f(rows, n=3, totals={}):\n    return totals\n", "def f(rows, n=3):\n    return {}\n"
+    assert llm_bench.extract_code(f"Original:\n```python\n{orig}```\nFixed:\n```python\n{fixed}```", "python") == fixed
+    # Equally long blocks: the last one; tags are case-insensitive.
     assert llm_bench.extract_code("```c\na\n```\n```C\nb\n```", "c") == "b\n"
+
+
+def test_extract_code_tag_with_suffix():
+    text = "```python:solution.py\ncode\n```\n```bash\npython3 solution.py --help\n```"
+    assert llm_bench.extract_code(text, "python") == "code\n"
+    assert llm_bench.extract_code("```c++ title=x\nint x;\n```", "cpp") == "int x;\n"
+
+
+@pytest.mark.parametrize(("text", "want"), [
+    ("````python\nprint(1)\n````", "print(1)\n"),          # 4-backtick fence
+    ("```python\nx = 1```", "x = 1"),                       # closing fence glued to code
+    ("Here: ```python\nx = 1\n```", "x = 1\n"),             # opening fence mid-line
+])
+def test_extract_code_loose_fallback(text, want):
+    assert llm_bench.extract_code(text, "python") == want
 
 
 def test_extract_code_fence_details():
@@ -79,6 +102,35 @@ def test_extract_code_without_fence_returns_text():
 def test_extract_code_keeps_think_tags_inside_code():
     text = "<think>plan</think>\n```python\ndef render():\n    return '</think>' + '<think>x</think>'\n```"
     assert llm_bench.extract_code(text, "python") == "def render():\n    return '</think>' + '<think>x</think>'\n"
+
+
+def test_strip_think_is_linear(monkeypatch):
+    """Many tags inside code must not rescan the reply once per tag."""
+    scans = []
+    real = llm_bench.CODE_RE
+    class Counting:
+        def finditer(self, text):
+            scans.append(1)
+            return real.finditer(text)
+    monkeypatch.setattr(llm_bench, "CODE_RE", Counting())
+    reply = "```python\n" + "s = '<think></think>'\n" * 20000 + "```\n"
+    assert llm_bench.strip_think(reply) == reply
+    assert len(scans) <= 2
+
+
+@pytest.mark.parametrize("reply", ["`" * 200000, "```" + " " * 200000, "```py\n" + "`" * 200000,
+                                   "x " * 100000 + "```" + "\t" * 100000 + "y", ("```py\na\n") * 50000])
+def test_extract_code_degenerate_replies_are_fast(reply):
+    start = time.monotonic()
+    llm_bench.extract_code(reply, "python")
+    assert time.monotonic() - start < 2
+
+
+def test_strip_think_many_unclosed_tags_is_fast():
+    start = time.monotonic()
+    assert llm_bench.strip_think("<think>x " * 100000) == ""
+    assert llm_bench.strip_think("<think>a</think>b " + "<think>x " * 100000).startswith("b ")
+    assert time.monotonic() - start < 2
 
 
 def test_strip_think():
