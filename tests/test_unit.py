@@ -102,6 +102,12 @@ def test_extract_code_fence_pairing(text, want):
     assert llm_bench.extract_code(text) == want
 
 
+def test_extract_code_crlf_reply():
+    text = "<think>\r\nplan\r\n</think>\r\nHere: ```bash\r\necho hi\r\n```\r\nDone.\r\n"
+    assert llm_bench.extract_code(text, "bash") == "echo hi\n"
+    assert llm_bench.extract_code("```python\r\nx = 1\r\n```\r\n", "python") == "x = 1\n"
+
+
 def test_extract_code_mixes_loose_and_strict_blocks():
     solution = "def solve():\n    return 42\n"
     text = f"````python\n{solution}````\nUsage:\n```python\nsolve()\n```"

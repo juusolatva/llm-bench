@@ -274,7 +274,9 @@ def strip_think(text):
       by a code block (if the reply has no code block, up to the first one; if code blocks exist but none
       follows a </think>, nothing, so a tag mentioned after the answer can't erase it);
     - a reply that starts with a <think> that never closes (reasoning cut off by max_tokens) becomes "".
-    Tags inside fenced code blocks are part of the code, and an unpaired <think> later in the reply is text."""
+    Tags inside fenced code blocks are part of the code, and an unpaired <think> later in the reply is text.
+    CRLF line endings become LF first (the fence patterns and the build tools, bash especially, expect LF)."""
+    text = text.replace("\r\n", "\n")
     # Search only up to the last </think>: an unclosed <think> after it would make each match attempt scan
     # to the end of the reply (quadratic in replies full of <think>).
     last_close = text.rfind("</think>")
