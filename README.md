@@ -107,8 +107,8 @@ If the sandbox is unavailable, the benchmark exits before contacting any server.
 ## Development
 
 ```sh
-uv run --group dev ruff check .
-uv run --group dev pytest -rs
+uv run --locked --group dev ruff check .
+uv run --locked --group dev pytest -rs
 ```
 
 The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They skip themselves where the sandbox isn't available (containers, CI).

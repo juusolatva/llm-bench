@@ -1,0 +1,50 @@
+name: OSV-Scanner
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    branches: [main]
+  schedule:
+    - cron: '40 15 * * 6'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan-scheduled:
+    permissions:
+      actions: read # Required for SARIF upload
+      contents: read # Read commit contents
+      security-events: write # Upload SARIF file to GitHub code scanning
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      # SARIF upload (Security > Code scanning) is disabled until the repository is public.
+      upload-sarif: false
+      scan-args: |-
+        --no-resolve
+        -r
+        ./
+
+  scan-pr:
+    permissions:
+      actions: read # Required for SARIF upload
+      contents: read # Read commit contents
+      security-events: write # Upload SARIF file to GitHub code scanning
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      # SARIF upload (Security > Code scanning) is disabled until the repository is public.
+      # When public, restore: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      upload-sarif: false
+      scan-args: |-
+        --no-resolve
+        -r
+        ./

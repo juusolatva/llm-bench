@@ -47,8 +47,8 @@ Repository layout:
 Run both before handing off a change:
 
 ```sh
-uv run --group dev ruff check .
-uv run --group dev pytest
+uv run --locked --group dev ruff check .
+uv run --locked --group dev pytest
 ```
 
 (Or run `ruff check .` and `pytest` directly if both are installed.)
