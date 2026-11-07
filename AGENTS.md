@@ -47,3 +47,9 @@ uv run --group dev pytest
 - `tests/test_e2e.py` (marker `sandbox`): full runs against the `MockServer` in `tests/conftest.py`, an OpenAI-compatible stdlib server that returns scripted replies, plus checks that the sandbox hides the home directory, the network and the environment. These tests skip themselves when bwrap + a systemd user session aren't available (e.g. in containers and on CI), so run them on a Linux host after touching the runner or the sandbox. Check the output for skips with `pytest -rs`.
 - Add tests for new CLI options and runner behaviour. Use `MockServer(replies=[...])` to script model answers.
 - `ruff format` isn't enforced. Don't reformat the whole file in an unrelated change.
+
+## Future plans
+
+Planned, not started. Discuss the design with the maintainer before implementing.
+
+- **Container version.** Ship the benchmark as a container image (Podman/Docker) with pinned toolchain versions, so it runs on hosts without bwrap, a systemd user session or locally installed toolchains, and results are comparable across machines. The current sandbox doesn't work inside an ordinary container (no systemd user manager, user namespaces usually blocked), so the likely design is to use the container runtime itself as the sandbox for each build/test: a fresh container per attempt with `--network=none`, memory/swap, PID and CPU limits, a read-only root, all capabilities dropped and `no-new-privileges`, and the same timeouts and output caps. It must keep the existing guarantees (no network, no host files beyond the task inputs, enforced resource limits) and fail closed when they can't be applied, just like the current cgroup check. The bwrap + systemd sandbox stays as the native option. A container-based sandbox would also let the end-to-end tests run on CI instead of being skipped.
