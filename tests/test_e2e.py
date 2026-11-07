@@ -1,10 +1,14 @@
 """End-to-end tests against a mock server. They run model "output" in the real sandbox."""
 import csv
+import signal
 import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
+from conftest import Reply
 
 import llm_bench
 
@@ -45,7 +49,7 @@ def test_feedback_loop_passes_on_second_attempt(monkeypatch, tmp_path, mock_serv
     assert len(s.requests) == 2
     feedback = s.requests[1]["messages"][-1]["content"]
     assert "got 0, want 5400" in feedback
-    attempt = tmp_path / "runs/mock/test_model/py_parse_duration"
+    attempt = tmp_path / "runs/mock_x/test_model/py_parse_duration"
     assert (attempt / "attempt_1/response.md").read_text() == BAD
     assert "[exit 0]" in (attempt / "attempt_2/log.txt").read_text()
 
@@ -73,7 +77,7 @@ def test_unreachable_endpoint_is_skipped(monkeypatch, tmp_path, mock_server):
 
 
 def test_sandbox_hides_home(tmp_path):
-    _, out = llm_bench.run_cmd(["/bin/bash", "-c", f"ls {Path.home()} || echo HIDDEN"], tmp_path)
+    out = llm_bench.run_cmd(["/bin/bash", "-c", f"ls {Path.home()} || echo HIDDEN"], tmp_path).out
     assert "HIDDEN" in out
 
 
@@ -82,23 +86,26 @@ def test_sandbox_has_no_network(tmp_path):
         srv.bind(("127.0.0.1", 0))
         srv.listen()
         port = srv.getsockname()[1]
-        _, out = llm_bench.run_cmd(
+        out = llm_bench.run_cmd(
             ["/bin/bash", "-c", f"(exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null && echo OPEN || echo CLOSED"],
-            tmp_path)
+            tmp_path).out
     assert "CLOSED" in out
 
 
 def test_sandbox_clears_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_BENCH_API_KEY", "secret")
-    _, out = llm_bench.run_cmd(["/bin/bash", "-c", "env"], tmp_path)
+    out = llm_bench.run_cmd(["/bin/bash", "-c", "env"], tmp_path).out
     env = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
     assert env["HOME"] == "/tmp" and "USER" not in env and "LLM_BENCH_API_KEY" not in env
 
 
 def test_sandbox_enforces_time_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_bench, "CMD_TIMEOUT_S", 2)
-    rc, _ = llm_bench.run_cmd(["/bin/sleep", "30"], tmp_path)
-    assert rc != 0
+    result = llm_bench.run_cmd(["/bin/sleep", "30"], tmp_path)
+    assert result.rc != 0 and result.timed_out
+    assert "[killed: exceeded the 2 s time limit" in result.out
+    fast = llm_bench.run_cmd(["/bin/false"], tmp_path)
+    assert fast.rc != 0 and not fast.timed_out and "killed" not in fast.out
 
 
 def test_private_tasks_dir(monkeypatch, tmp_path, mock_server):
@@ -134,3 +141,64 @@ def test_appended_harness_language(monkeypatch, tmp_path, mock_server):
     log = (tmp_path / "runs/m/test_model/rust_word_count/attempt_1/log.txt").read_text()
     assert row["passed"] == "1", log
     assert "4 passed" in log
+
+
+def test_feedback_names_failing_command(monkeypatch, tmp_path, mock_server):
+    s = mock_server(replies=[BAD, GOOD])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration")
+    assert "Output of `python3 test_solution.py`:" in s.requests[1]["messages"][-1]["content"]
+    (row,) = read_rows(tmp_path / "results_m.csv")
+    assert row["fail_stage"] == ""   # passed in the end
+
+
+C_TRIM_WRONG = "```c\nchar *trim(char *s) { return s; }\n```"
+C_TRIM_BROKEN = "```c\nchar *trim(char *s) { return s }\n```"
+
+
+@pytest.mark.parametrize(("reply", "stage", "cmd"), [
+    (C_TRIM_BROKEN, "build", "gcc -std=gnu17"),
+    (C_TRIM_WRONG, "test", "./t"),
+])
+def test_fail_stage_build_vs_test(monkeypatch, tmp_path, mock_server, reply, stage, cmd):
+    s = mock_server(replies=[reply, reply])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "c_trim", "--attempts", "2")
+    (row,) = read_rows(tmp_path / "results_m.csv")
+    assert row["fail_stage"] == stage
+    assert f"Output of `{cmd}" in s.requests[1]["messages"][-1]["content"]
+
+
+def test_time_limit_is_reported(monkeypatch, tmp_path, mock_server):
+    monkeypatch.setattr(llm_bench, "CMD_TIMEOUT_S", 3)
+    s = mock_server(replies=["```python\nwhile True:\n    pass\n```", BAD])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "--attempts", "2")
+    (row,) = read_rows(tmp_path / "results_m.csv")
+    assert row["fail_stage"] == "test"   # the last attempt failed normally
+    first = s.requests[1]["messages"][-1]["content"]
+    assert "exceeded the 3 s time limit" in first and "[killed:" in first
+    log = (tmp_path / "runs/m/test_model/py_parse_duration/attempt_1/log.txt").read_text()
+    assert "[killed: exceeded the 3 s time limit" in log
+
+
+def test_rerun_appends_and_tag_separates_transcripts(monkeypatch, tmp_path, mock_server):
+    s = mock_server(replies=[GOOD, GOOD, GOOD])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration")
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration")
+    assert len(read_rows(tmp_path / "results_m.csv")) == 2
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "-t", "x")
+    assert (tmp_path / "runs/m/test_model/py_parse_duration").is_dir()
+    assert (tmp_path / "runs/m_x/test_model/py_parse_duration").is_dir()
+
+
+def test_ctrl_c_stops_promptly(tmp_path, mock_server):
+    s = mock_server(replies=[Reply(text=GOOD, sleep=30)])
+    script = Path(llm_bench.__file__)
+    proc = subprocess.Popen([sys.executable, str(script), f"m={s.url}", "--task", "py_parse_duration",
+                             "-o", str(tmp_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 30
+    while not s.requests and time.monotonic() < deadline:   # wait until the request is in flight
+        time.sleep(0.1)
+    assert s.requests, "request never arrived"
+    proc.send_signal(signal.SIGINT)
+    out, err = proc.communicate(timeout=10)
+    assert proc.returncode == 130
+    assert "interrupted" in err and "no results" in out

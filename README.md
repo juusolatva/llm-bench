@@ -43,7 +43,7 @@ Tasks published on the internet can end up in model training data. To benchmark 
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
-- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++20), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils. You only need the toolchains for the tasks you select with `--task`.
+- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
 
@@ -89,11 +89,24 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 
 ## Output
 
-- `results_<endpoint>[_<tag>].csv`: one row per model × task, written as each task finishes, so an interrupted run keeps its results. Columns: `endpoint, model, task, lang, passed, passed_on, attempts, prompt_tokens, completion_tokens, seconds, finish_reason`.
-- `runs/<endpoint>/<model>/<task>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested.
-- A summary table on stdout, with pass@1 (passed on the first attempt), pass@N (passed within `--attempts`), per-language results, token counts and total time per model.
+- `results_<endpoint>[_<tag>].csv`: one row per model × task, written as each task finishes, so an interrupted run keeps its results. Rows are **appended**, so re-running a few models adds to an existing file instead of replacing it. Re-running the same model and task adds another row; the later row is the newer result. Columns: `endpoint, model, task, lang, passed, passed_on, attempts, prompt_tokens, completion_tokens, seconds, finish_reason, fail_stage`. The benchmark refuses to append to a file that has different columns (e.g. from an older version).
+- `runs/<endpoint>[_<tag>]/<model>/<task>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. Re-running a model and task replaces its transcripts for the same tag.
+- A summary table on stdout, with pass@1 (passed on the first attempt), pass@N (passed within `--attempts`), per-language results, token counts and total time per model. Ctrl-C stops the run promptly and still prints the summary of the tasks finished so far.
 
-`finish_reason` is the server's value (`stop`, `length`, …), or `timeout` if the request exceeded `--timeout`, or `oversized` if the reply exceeded 1 MiB.
+`finish_reason` is the server's value for the last reply (`stop`, `length`, …) or one of these:
+
+| Value | Meaning |
+|---|---|
+| `timeout` | No reply within `--timeout`. |
+| `http_<code>` | The server returned an HTTP error, e.g. the model failed to load or crashed, or the prompt didn't fit its context. |
+| `bad_response` | The reply wasn't a valid chat completion (invalid or truncated JSON, no `choices`, …). |
+| `disconnected` | The connection dropped while the server itself stayed reachable (typically a crashed model process). |
+| `oversized` | The reply text exceeded 1 MiB. |
+| `skipped` | Not attempted: the model had 3 request errors (`http_*`, `bad_response`, `disconnected`) in a row, so its remaining tasks were skipped. |
+
+If the server itself becomes unreachable, the benchmark retries the request after 10, 30 and 60 seconds, then stops that endpoint. Tasks it didn't get to have no rows.
+
+`fail_stage` says where the last attempt failed: `build` (compiling), `test` (the test harness failed), `time_limit` (building and testing exceeded the 60 s sandbox limit), `no_code` (the reply contained no code), or `request` (one of the request-level failures above). It's empty when the task passed.
 
 ## Sandbox
 

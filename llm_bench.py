@@ -12,12 +12,12 @@ Run with --help for usage.
 """
 import argparse
 import csv
+import http.client
 import json
 import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -28,21 +28,18 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import NamedTuple
 
 # --- CONFIGURATION ---
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
 DEFAULT_ATTEMPTS = 3           # 1 = no feedback; N = initial attempt + N-1 attempts with build/test feedback
-MAX_CONSECUTIVE_FAILURES = 3   # stop an endpoint after this many connection failures in a row
+MAX_MODEL_ERRORS = 3           # skip the rest of a model after this many request errors in a row
+SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server is unreachable, then give up
 FEEDBACK_CHARS = 6000          # max characters of failing build/test output sent back to the model
-FEEDBACK = (
-    "Your solution failed. Output of `{cmd}`:\n```\n{out}\n```\n"
-    "Fix the problem. Reply with exactly one fenced code block containing the complete corrected file."
-)
 CMD_TIMEOUT_S = 60
 SANDBOX_MEMORY_BYTES = 2 * 1024**3
 SANDBOX_TASKS = 128
@@ -69,7 +66,7 @@ LANGS = {
           "cmds": [["gcc", "-std=gnu17", "-O1", "-g", "-Wall", *SAN, "solution.c", "test.c", "-o", "t", "-lm"],
                    ["./t"]]},
     "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp",
-            "cmds": [["g++", "-std=c++20", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"],
+            "cmds": [["g++", "-std=c++17", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"],
                      ["./t"]]},
     "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "append": True,
              "cmds": [["rustc", "--edition", "2021", "--test", "-O", "-o", "t", "lib.rs"], ["./t"]]},
@@ -128,7 +125,7 @@ def load_tasks(roots):
 # --------------------------------------------------------------------------------------------
 
 FIELDS = ["endpoint", "model", "task", "lang", "passed", "passed_on", "attempts", "prompt_tokens",
-          "completion_tokens", "seconds", "finish_reason"]
+          "completion_tokens", "seconds", "finish_reason", "fail_stage"]
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 CODE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
@@ -156,14 +153,14 @@ def http_json(url, payload=None, timeout=60, api_key=None):
         # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
         body = r.read(MAX_RESPONSE_BYTES + 1)
     if len(body) > MAX_RESPONSE_BYTES:
-        raise OSError(f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes")
+        raise ValueError(f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes")
     return json.loads(body)
 
 
 def list_models(name, base, api_key):
     try:
         return [m["id"] for m in http_json(f"{base}/models", timeout=10, api_key=api_key)["data"]]
-    except (OSError, KeyError, TypeError, ValueError) as e:
+    except (OSError, http.client.HTTPException, KeyError, TypeError, ValueError) as e:
         log(f"{name}: skipping, cannot list models at {base}/models: {e}", err=True)
         return []
 
@@ -218,11 +215,30 @@ os.execv(sys.argv[3], sys.argv[3:])
 """
 
 
+class CmdResult(NamedTuple):
+    rc: int
+    out: str
+    timed_out: bool   # killed at the CMD_TIMEOUT_S time limit
+
+
+TIME_LIMIT_MARKER = "[killed: exceeded the {limit} s time limit for building and testing]"
+ACTIVE_UNITS = set()          # systemd units of running sandboxes, stopped on interrupt
+ACTIVE_UNITS_LOCK = threading.Lock()
+
+
+def stop_active_units():
+    with ACTIVE_UNITS_LOCK:
+        units = list(ACTIVE_UNITS)
+    for unit in units:
+        subprocess.run(["systemctl", "--user", "stop", unit], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+
+
 def run_cmd(cmd, cwd):
     """Run only inside a mandatory namespace sandbox and bounded systemd unit."""
     tools = {name: shutil.which(name) for name in ("bwrap", "systemd-run", "systemctl")}
     if not all(tools.values()):
-        return -1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution"
+        return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
     unit = f"llm-bench-{uuid.uuid4().hex}.service"
     sandbox = [tools["bwrap"], "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
                "--new-session", "--cap-drop", "ALL", "--clearenv"]
@@ -267,6 +283,9 @@ def run_cmd(cmd, cwd):
     # A regular file plus hard LimitFSIZE bounds output without an unbounded
     # communicate() buffer. Read only a bounded prefix back into the parent.
     with tempfile.TemporaryFile() as output:
+        with ACTIVE_UNITS_LOCK:
+            ACTIVE_UNITS.add(unit)
+        t0 = time.monotonic()
         try:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT)
@@ -281,27 +300,49 @@ def run_cmd(cmd, cwd):
                     if process.poll() is None:
                         process.kill()
                     process.wait(timeout=5)
+                    with ACTIVE_UNITS_LOCK:
+                        ACTIVE_UNITS.discard(unit)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return -1, f"sandbox failed: {exc}"
+            return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
+        # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
+        timed_out = rc != 0 and time.monotonic() - t0 >= CMD_TIMEOUT_S
         output.seek(0)
         data = output.read(MAX_OUTPUT_BYTES + 1)
     text = data[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     if len(data) > MAX_OUTPUT_BYTES:
-        return -1, text + "\n[output limit exceeded]"
-    return rc, text
+        return CmdResult(-1, text + "\n[output limit exceeded]", False)
+    if timed_out:
+        text += "\n" + TIME_LIMIT_MARKER.format(limit=CMD_TIMEOUT_S)
+    return CmdResult(rc, text, timed_out)
 
 
 def check_sandbox():
     """Fail before contacting endpoints if namespaces or resource limits do not work."""
     with tempfile.TemporaryDirectory(prefix="llm-sandbox-check-") as directory:
-        rc, out = run_cmd(["/usr/bin/true"], Path(directory))
+        rc, out, _ = run_cmd(["/usr/bin/true"], Path(directory))
     if rc != 0:
         sys.exit(f"sandbox unavailable; refusing to run generated code:\n{out}")
 
 
+def feedback(stage, cmd, out):
+    """The follow-up message sent to the model after a failed attempt."""
+    if stage == "no_code":
+        return ("Your reply did not contain any code. Reply with exactly one fenced code block containing the "
+                "complete file.")
+    if stage == "time_limit":
+        head = (f"Your solution was stopped because building and testing it exceeded the {CMD_TIMEOUT_S} s "
+                f"time limit. Output of `{cmd}` before it was stopped:")
+    else:
+        head = f"Your solution failed. Output of `{cmd}`:"
+    return (f"{head}\n```\n{clip(out)}\n```\n"
+            "Fix the problem. Reply with exactly one fenced code block containing the complete corrected file.")
+
+
 def run_task(task, code, workdir):
-    """Write solution + harness into workdir, build and test.
-    Returns (passed, log, failing command, failing command output)."""
+    """Write solution + harness into workdir, build and test in one sandbox.
+    Returns (passed, log, fail_stage, failing command, its output); the last three are None on success.
+    fail_stage is "build" (a command before the last failed), "test" (the last command failed) or
+    "time_limit" (the sandbox was killed at CMD_TIMEOUT_S)."""
     lang = LANGS[task["lang"]]
     if workdir.exists():
         shutil.rmtree(workdir)
@@ -313,17 +354,26 @@ def run_task(task, code, workdir):
         (workdir / lang["test"]).write_text(task["test"])
     for name, content in lang.get("extra", {}).items():
         (workdir / name).write_text(content)
-    commands = []
-    for cmd in lang["cmds"]:
-        rendered = shlex.join(cmd)
-        commands += ["printf '%s\\n' " + shlex.quote(f"$ {rendered}"), rendered]
+    rendered = [shlex.join(cmd) for cmd in lang["cmds"]]
+    script = []
+    for r in rendered:
+        script += ["printf '%s\\n' " + shlex.quote(f"$ {r}"), r]
     # Build and execute in one sandbox so private compiler outputs persist only
     # for this attempt. Parent-owned source/transcript files are read-only inputs.
-    rc, out = run_cmd(["/bin/bash", "-ec", "\n".join(commands)], workdir)
+    rc, out, timed_out = run_cmd(["/bin/bash", "-ec", "\n".join(script)], workdir)
     run_log = f"{out}\n[exit {rc}]"
-    if rc != 0:
-        return False, run_log, "build/test", out
-    return True, run_log, None, None
+    if rc == 0:
+        return True, run_log, None, None, None
+    # The failing command is the last one whose "$ cmd" marker appears in the output.
+    markers = {f"$ {r}": i for i, r in enumerate(rendered)}
+    index = max((markers[line] for line in out.splitlines() if line in markers), default=0)
+    if timed_out:
+        stage = "time_limit"
+    elif index == len(rendered) - 1:
+        stage = "test"
+    else:
+        stage = "build"
+    return False, run_log, stage, rendered[index], out
 
 
 def clip(text, limit=FEEDBACK_CHARS):
@@ -357,116 +407,174 @@ def check_toolchains(tasks):
         sys.exit(f"cannot resolve isolated Rust toolchain: {exc}")
 
 
-def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir):
-    """Run the tasks for the given models of one endpoint.
-    Appends each row to out_path as it completes; returns the rows."""
-    rows = []
-    failures = 0          # consecutive connection-level request failures
-    # Rows are written as they complete, so an aborted run keeps every finished model x task.
-    f = open(out_path, "w", newline="")  # noqa: SIM115 -- closed in the finally below
-    w = csv.DictWriter(f, fieldnames=FIELDS)
-    w.writeheader()
-    f.flush()
+class ServerDown(Exception):
+    """The endpoint stayed unreachable after all retries."""
+
+
+class Interrupted(Exception):
+    """The run was interrupted (Ctrl-C) while waiting."""
+
+
+def server_reachable(base, api_key):
     try:
-        for model in models:
-            if failures >= MAX_CONSECUTIVE_FAILURES:
-                break
-            for task in tasks:
-                if failures >= MAX_CONSECUTIVE_FAILURES:
-                    log(f"{name}: {failures} consecutive request failures, server unreachable; "
-                        f"stopping this endpoint", err=True)
-                    break
-                taskdir = runs_dir / name / UNSAFE_NAME_RE.sub("_", model) / task["name"]
-                if taskdir.exists():
-                    shutil.rmtree(taskdir)
-                messages = [
-                    {"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": task["prompt"]},
-                ]
-                pt = ct = 0
-                secs = 0.0
-                passed_on = attempts = 0
-                finish = None
-                skip = False
-                for attempt in range(1, opts.attempts + 1):
-                    payload = {
-                        "model": model,
-                        "max_tokens": opts.max_tokens,
-                        "messages": messages,
-                    }
-                    if opts.temperature is not None:
-                        payload["temperature"] = opts.temperature
-                    log(f"{name}/{model}/{task['name']}: attempt {attempt}/{opts.attempts}, "
-                        f"waiting for response...", err=True)
-                    t0 = time.time()
-                    try:
-                        resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout,
-                                         api_key=opts.api_key)
-                    except OSError as e:
-                        secs += time.time() - t0
-                        # A bare socket timeout is raised only while waiting for the reply, i.e. the model was
-                        # too slow. Connection-level errors (refused, unreachable, connect timeout) arrive wrapped
-                        # in URLError: the server is down, which says nothing about the model.
-                        if isinstance(e, socket.timeout) and not isinstance(e, urllib.error.URLError):
-                            log(f"{name}/{model}/{task['name']}: timed out after {time.time() - t0:.0f}s",
-                                err=True)
-                            failures = 0  # the server accepted the request, so it is reachable
-                            attempts = attempt
-                            finish = "timeout"
-                        else:
-                            log(f"{name}/{model}/{task['name']}: request failed: {e}", err=True)
-                            failures += 1
-                            skip = True
+        http_json(f"{base}/models", timeout=10, api_key=api_key)
+        return True
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def chat(label, base, payload, opts, stop):
+    """POST one chat completion. Returns (text, finish_reason, usage, error).
+    error is None for a usable reply; otherwise it is the row's finish_reason for a failure that is the
+    model's (or its loader's) problem rather than the server's: "timeout", "http_<code>", "bad_response"
+    or "disconnected". If the server itself is unreachable, wait and retry the same request; raise
+    ServerDown when it stays down, Interrupted if the run is interrupted while waiting."""
+    for delay in (*SERVER_RETRY_DELAYS_S, None):
+        try:
+            resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
+        except urllib.error.HTTPError as e:   # the server answered: model failed to load, crashed, prompt too long
+            try:
+                detail = e.read(500).decode("utf-8", errors="replace").strip()
+            except (OSError, http.client.HTTPException):
+                detail = ""
+            log(f"{label}: HTTP {e.code}: {detail or e.reason}", err=True)
+            return "", None, {}, f"http_{e.code}"
+        except TimeoutError:   # raised directly only while waiting for the reply: the model was too slow
+            log(f"{label}: no reply within {opts.timeout}s", err=True)
+            return "", None, {}, "timeout"
+        except (OSError, http.client.HTTPException) as e:
+            # Refused, reset or dropped connection. If the server still answers, the model process
+            # (not the server) died; otherwise wait for the server to come back.
+            if server_reachable(base, opts.api_key):
+                log(f"{label}: connection lost ({e}), server still reachable", err=True)
+                return "", None, {}, "disconnected"
+            if delay is None:
+                raise ServerDown(str(e)) from e
+            log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
+            if stop.wait(delay):
+                raise Interrupted from None
+            continue
+        except ValueError as e:   # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
+            log(f"{label}: bad response: {e}", err=True)
+            return "", None, {}, "bad_response"
+        try:
+            choice = resp["choices"][0]
+            text = choice["message"].get("content") or ""
+            if not isinstance(text, str):
+                raise TypeError(f"content is {type(text).__name__}")
+            usage = resp.get("usage") or {}
+            if not isinstance(usage, dict):
+                raise TypeError(f"usage is {type(usage).__name__}")
+        except (KeyError, IndexError, TypeError, AttributeError) as e:
+            log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
+            return "", None, {}, "bad_response"
+        return text, choice.get("finish_reason"), usage, None
+    raise AssertionError("unreachable")
+
+
+# Request-level failures that count towards MAX_MODEL_ERRORS.
+MODEL_ERRORS = ("bad_response", "disconnected")
+
+
+def is_model_error(finish):
+    return finish in MODEL_ERRORS or (finish or "").startswith("http_")
+
+
+def run_one_task(label, base, model, task, taskdir, opts, stop):
+    """Run all attempts of one task. Returns the result fields of its CSV row."""
+    if taskdir.exists():
+        shutil.rmtree(taskdir)
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": task["prompt"]},
+    ]
+    result = {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
+              "seconds": 0.0, "finish_reason": None, "fail_stage": None}
+    for attempt in range(1, opts.attempts + 1):
+        if stop.is_set():
+            raise Interrupted
+        payload = {"model": model, "max_tokens": opts.max_tokens, "messages": messages}
+        if opts.temperature is not None:
+            payload["temperature"] = opts.temperature
+        log(f"{label}: attempt {attempt}/{opts.attempts}, waiting for response...", err=True)
+        t0 = time.time()
+        try:
+            text, finish, usage, error = chat(label, base, payload, opts, stop)
+        finally:
+            result["seconds"] += time.time() - t0
+        result["attempts"] = attempt
+        if error:
+            result["finish_reason"], result["fail_stage"] = error, "request"
+            break
+        result["finish_reason"] = finish
+        result["prompt_tokens"] += usage.get("prompt_tokens") or 0
+        result["completion_tokens"] += usage.get("completion_tokens") or 0
+        if len(text) > MAX_CONTENT_CHARS:  # counted as failure, nothing written to disk
+            log(f"{label}: response exceeds {MAX_CONTENT_CHARS} chars", err=True)
+            result["finish_reason"], result["fail_stage"] = "oversized", "request"
+            break
+        adir = taskdir / f"attempt_{attempt}"
+        code = extract_code(text)
+        if code.strip():
+            passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
+        else:
+            adir.mkdir(parents=True)
+            passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
+        (adir / "response.md").write_text(text)
+        (adir / "log.txt").write_text(run_log)
+        result["fail_stage"] = stage
+        if passed:
+            result["passed"], result["passed_on"] = 1, attempt
+            break
+        if finish == "length":  # hit max tokens: counted as failure, no retry
+            break
+        messages = messages + [
+            {"role": "assistant", "content": THINK_RE.sub("", text).strip()},
+            {"role": "user", "content": feedback(stage, fail_cmd, fail_out)},
+        ]
+    result["seconds"] = round(result["seconds"], 2)
+    return result
+
+
+def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop):
+    """Run the tasks for the given models of one endpoint. Appends each row to out_path (and to rows)
+    as it completes."""
+    new_file = not out_path.exists() or out_path.stat().st_size == 0
+    # Rows are written as they complete, so an aborted run keeps every finished model x task.
+    with open(out_path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        if new_file:
+            w.writeheader()
+            f.flush()
+
+        def record(model, task, result):
+            row = {"endpoint": name, "model": model, "task": task["name"], "lang": task["lang"], **result}
+            rows.append(row)
+            w.writerow(row)
+            f.flush()
+            log(str(row))
+
+        try:
+            for model in models:
+                model_errors = 0   # consecutive tasks that ended in a request-level model error
+                for i, task in enumerate(tasks):
+                    if model_errors >= MAX_MODEL_ERRORS:
+                        log(f"{name}/{model}: {model_errors} request errors in a row; skipping its remaining "
+                            f"{len(tasks) - i} task(s)", err=True)
+                        for skipped in tasks[i:]:
+                            record(model, skipped, {"passed": 0, "passed_on": 0, "attempts": 0,
+                                                    "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0,
+                                                    "finish_reason": "skipped", "fail_stage": "request"})
                         break
-                    failures = 0
-                    secs += time.time() - t0
-                    attempts = attempt
-                    choice = resp["choices"][0]
-                    text = choice["message"].get("content") or ""
-                    finish = choice.get("finish_reason")
-                    usage = resp.get("usage") or {}
-                    pt += usage.get("prompt_tokens") or 0
-                    ct += usage.get("completion_tokens") or 0
-                    if len(text) > MAX_CONTENT_CHARS:  # counted as failure, nothing written to disk
-                        log(f"{name}/{model}/{task['name']}: response exceeds {MAX_CONTENT_CHARS} chars",
-                            err=True)
-                        finish = "oversized"
-                        break
-                    adir = taskdir / f"attempt_{attempt}"
-                    passed, run_log, fail_cmd, fail_out = run_task(task, extract_code(text), adir)
-                    (adir / "response.md").write_text(text)
-                    (adir / "log.txt").write_text(run_log)
-                    if passed:
-                        passed_on = attempt
-                        break
-                    if finish == "length":  # hit max tokens: counted as failure, no retry
-                        break
-                    messages = messages + [
-                        {"role": "assistant", "content": THINK_RE.sub("", text).strip()},
-                        {"role": "user", "content": FEEDBACK.format(cmd=fail_cmd, out=clip(fail_out))},
-                    ]
-                if skip:
-                    continue
-                row = {
-                    "endpoint": name,
-                    "model": model,
-                    "task": task["name"],
-                    "lang": task["lang"],
-                    "passed": int(passed_on > 0),
-                    "passed_on": passed_on,
-                    "attempts": attempts,
-                    "prompt_tokens": pt,
-                    "completion_tokens": ct,
-                    "seconds": round(secs, 2),
-                    "finish_reason": finish,
-                }
-                rows.append(row)
-                w.writerow(row)
-                f.flush()               # keep completed rows on disk if the run is aborted
-                log(str(row))
-    finally:
-        f.close()
-    return rows
+                    taskdir = runs_dir / UNSAFE_NAME_RE.sub("_", model) / task["name"]
+                    result = run_one_task(f"{name}/{model}/{task['name']}", base, model, task, taskdir, opts,
+                                          stop)
+                    model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
+                    record(model, task, result)
+        except ServerDown as e:
+            log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
+        except Interrupted:
+            pass
 
 
 def print_summary(rows, max_attempts):
@@ -564,6 +672,17 @@ def parse_args():
     return args
 
 
+def check_results_file(path):
+    """Results are appended; refuse to mix rows into a file written with different columns."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with open(path, newline="") as f:
+        header = next(csv.reader(f), [])
+    if header != FIELDS:
+        sys.exit(f"{path} has different columns (written by another version?); "
+                 f"move it away or use another --tag or --output-dir")
+
+
 def main():
     args = parse_args()
     try:
@@ -611,13 +730,30 @@ def main():
         sys.exit("no models selected")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    runs_dir = args.output_dir / "runs"
     suffix = f"_{args.tag}" if args.tag else ""
-    with ThreadPoolExecutor(max_workers=len(plan)) as ex:
-        futures = [ex.submit(run_endpoint, name, endpoints[name], models, tasks, args,
-                             args.output_dir / f"results_{name}{suffix}.csv", runs_dir)
-                   for name, models in plan.items()]
-        rows = [r for fut in futures for r in fut.result()]
+    outputs = {name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
+               for name in plan}
+    for csv_path, _ in outputs.values():
+        check_results_file(csv_path)
+
+    rows, stop, threads = [], threading.Event(), []
+    for name, models in plan.items():
+        csv_path, runs_dir = outputs[name]
+        # Daemon threads: on Ctrl-C the process exits without waiting for in-flight requests.
+        t = threading.Thread(target=run_endpoint, name=name, daemon=True,
+                             args=(name, endpoints[name], models, tasks, args, csv_path, runs_dir, rows, stop))
+        t.start()
+        threads.append(t)
+    try:
+        for t in threads:
+            while t.is_alive():
+                t.join(0.5)
+    except KeyboardInterrupt:
+        stop.set()
+        log("interrupted; results so far are in the CSV file(s)", err=True)
+        stop_active_units()
+        print_summary(list(rows), args.attempts)
+        sys.exit(130)
     print_summary(rows, args.attempts)
 
 

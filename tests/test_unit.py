@@ -139,7 +139,7 @@ def test_http_json_sends_api_key(mock_server):
 def test_http_json_enforces_size_cap(mock_server, monkeypatch):
     s = mock_server(models=["x" * 1000])
     monkeypatch.setattr(llm_bench, "MAX_RESPONSE_BYTES", 100)
-    with pytest.raises(OSError, match="exceeds"):
+    with pytest.raises(ValueError, match="exceeds"):
         llm_bench.http_json(f"{s.url}/models")
 
 

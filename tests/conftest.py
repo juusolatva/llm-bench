@@ -1,6 +1,8 @@
 import json
 import tempfile
 import threading
+import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -9,8 +11,19 @@ import pytest
 import llm_bench
 
 
+@dataclass
+class Reply:
+    """A scripted chat reply other than a plain successful completion."""
+    text: str = ""            # normal completion text (after an optional sleep)
+    status: int = 200         # with body: raw HTTP status
+    body: bytes | None = None  # raw response body instead of a completion
+    length: int | None = None  # Content-Length to announce (larger than body = truncated reply)
+    close: bool = False       # drop the connection without a response
+    sleep: float = 0          # delay before answering
+
+
 class MockServer:
-    """Minimal OpenAI-compatible server. `replies` is consumed one per chat request."""
+    """Minimal OpenAI-compatible server. `replies` (str or Reply) is consumed one per chat request."""
 
     def __init__(self, models=("test/model",), replies=(), api_key=None):
         self.models = list(models)
@@ -50,8 +63,21 @@ class MockServer:
                     return
                 req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 server.requests.append(req)
-                text = server.replies.pop(0) if server.replies else ""
-                self._send(200, {"choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                reply = server.replies.pop(0) if server.replies else ""
+                if isinstance(reply, Reply):
+                    if reply.sleep:
+                        time.sleep(reply.sleep)
+                    if reply.close:   # drop the connection without answering
+                        self.close_connection = True
+                        return
+                    if reply.body is not None:
+                        self.send_response(reply.status)
+                        self.send_header("Content-Length", str(reply.length or len(reply.body)))
+                        self.end_headers()
+                        self.wfile.write(reply.body)
+                        return
+                    reply = reply.text
+                self._send(200, {"choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
                                  "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -83,8 +109,7 @@ def mock_server():
 
 def _sandbox_available():
     with tempfile.TemporaryDirectory() as d:
-        rc, _ = llm_bench.run_cmd(["/usr/bin/true"], Path(d))
-    return rc == 0
+        return llm_bench.run_cmd(["/usr/bin/true"], Path(d)).rc == 0
 
 
 SANDBOX_OK = _sandbox_available()
