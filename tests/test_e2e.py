@@ -60,7 +60,8 @@ def test_attempts_one_disables_feedback(monkeypatch, tmp_path, mock_server):
         "--temperature", "0")
     (row,) = read_rows(tmp_path / "results_m.csv")
     assert (row["passed"], row["attempts"]) == ("0", "1")
-    assert len(s.requests) == 1 and s.requests[0]["temperature"] == 0
+    assert len(s.requests) == 1
+    assert s.requests[0]["temperature"] == 0
 
 
 def test_model_filter(monkeypatch, tmp_path, mock_server):
@@ -96,16 +97,21 @@ def test_sandbox_clears_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_BENCH_API_KEY", "secret")
     out = llm_bench.run_cmd(["/bin/bash", "-c", "env"], tmp_path).out
     env = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
-    assert env["HOME"] == "/tmp" and "USER" not in env and "LLM_BENCH_API_KEY" not in env
+    assert env["HOME"] == "/tmp"
+    assert "USER" not in env
+    assert "LLM_BENCH_API_KEY" not in env
 
 
 def test_sandbox_enforces_time_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_bench, "CMD_TIMEOUT_S", 2)
     result = llm_bench.run_cmd(["/bin/sleep", "30"], tmp_path)
-    assert result.rc != 0 and result.timed_out
+    assert result.rc != 0
+    assert result.timed_out
     assert "[killed: exceeded the 2 s time limit" in result.out
     fast = llm_bench.run_cmd(["/bin/false"], tmp_path)
-    assert fast.rc != 0 and not fast.timed_out and "killed" not in fast.out
+    assert fast.rc != 0
+    assert not fast.timed_out
+    assert "killed" not in fast.out
 
 
 def test_private_tasks_dir(monkeypatch, tmp_path, mock_server):
@@ -174,7 +180,8 @@ def test_time_limit_is_reported(monkeypatch, tmp_path, mock_server):
     (row,) = read_rows(tmp_path / "results_m.csv")
     assert row["fail_stage"] == "test"   # the last attempt failed normally
     first = s.requests[1]["messages"][-1]["content"]
-    assert "exceeded the 3 s time limit" in first and "[killed:" in first
+    assert "exceeded the 3 s time limit" in first
+    assert "[killed:" in first
     log = (tmp_path / "runs/m/test_model/py_parse_duration/repeat_1/attempt_1/log.txt").read_text()
     assert "[killed: exceeded the 3 s time limit" in log
 
@@ -202,7 +209,8 @@ def test_ctrl_c_stops_promptly(tmp_path, mock_server):
     proc.send_signal(signal.SIGINT)
     out, err = proc.communicate(timeout=10)
     assert proc.returncode == 130
-    assert "interrupted" in err and "no results" in out
+    assert "interrupted" in err
+    assert "no results" in out
 
 
 def test_go_cache_overlay_is_private(tmp_path, monkeypatch):
@@ -217,4 +225,5 @@ def test_go_cache_overlay_is_private(tmp_path, monkeypatch):
     result = llm_bench.run_cmd(["/bin/bash", "-ec", script], work)
     assert result.rc == 0, result.out
     assert result.out.split()[:2] == ["cached", "/opt/go-cache"]
-    assert (cache / "entry").read_text() == "cached\n" and not (cache / "new").exists()
+    assert (cache / "entry").read_text() == "cached\n"
+    assert not (cache / "new").exists()

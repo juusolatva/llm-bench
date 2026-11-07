@@ -42,7 +42,9 @@ def test_extract_code_without_fence_returns_text():
 def test_clip_keeps_head_and_tail():
     text = "H" * 100 + "T" * 100
     out = llm_bench.clip(text, limit=30)
-    assert out.startswith("H" * 20) and out.endswith("T" * 10) and "truncated" in out
+    assert out.startswith("H" * 20)
+    assert out.endswith("T" * 10)
+    assert "truncated" in out
     assert llm_bench.clip("short", limit=30) == "short"
 
 
@@ -66,7 +68,8 @@ def test_builtin_tasks_are_consistent():
     assert len(names) == len(set(names))
     for t in BUILTIN_TASKS:
         assert t["name"].startswith(llm_bench.LANGS[t["lang"]]["prefix"] + "_")
-        assert t["prompt"] and t["test"].strip()
+        assert t["prompt"]
+        assert t["test"].strip()
     per_lang = Counter(t["lang"] for t in BUILTIN_TASKS)
     assert set(per_lang) == set(llm_bench.LANGS)
     assert all(n == 4 for n in per_lang.values())
@@ -157,7 +160,8 @@ def test_print_summary(capsys):
     ]
     llm_bench.print_summary(rows)
     out = capsys.readouterr().out
-    assert "pass@1" in out and "passed" in out and "python" in out and "go" in out
+    for column in ("pass@1", "passed", "python", "go"):
+        assert column in out
     assert "c" not in out.splitlines()[1].split()   # only languages that were run get a column
     assert "a-long-endpoint-name m1" in out
 
@@ -178,7 +182,8 @@ def test_cli_requires_endpoint(monkeypatch, capsys):
 def test_cli_list_tasks(monkeypatch, capsys):
     run_main(monkeypatch, "--list-tasks", "--task", "rust_*")
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 4 and all(line.startswith("rust_") for line in lines)
+    assert len(lines) == 4
+    assert all(line.startswith("rust_") for line in lines)
 
 
 def test_cli_tasks_dir(monkeypatch, capsys, tmp_path):

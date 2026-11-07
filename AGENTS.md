@@ -48,8 +48,8 @@ Repository layout:
 Run both before handing off a change:
 
 ```sh
-uv run --locked --group dev ruff check .
-uv run --locked --group dev pytest
+uv run --locked --no-build --group dev ruff check .
+uv run --locked --no-build --group dev pytest
 ```
 
 (Or run `ruff check .` and `pytest` directly if both are installed.)
@@ -69,4 +69,5 @@ Planned, not started. Discuss the design with the maintainer before implementing
 - **More tasks, mainly new languages.** Candidates: TypeScript/JavaScript (Node), Java or Kotlin, C#, SQL (SQLite), Zig, and possibly Haskell or OCaml. Keep the same structure (3 "write this" tasks of increasing difficulty + 1 "fix this code" task per language) and the task conventions above. Constraints for a new language: the toolchain must build and test fully offline inside the sandbox (no package downloads, so no test frameworks outside the standard distribution unless they're preinstalled system-wide under `/usr`); it must work within the sandbox limits (2 GiB memory, 128 tasks, 60 s per build+test), which can be tight for JVM/.NET startup and thread counts; and toolchains installed outside `/usr` need an explicit read-only mount like the Rust sysroot. Adding a language also means a `LANGS` entry (with a unique task name prefix), a `tasks/<lang>/` directory, the toolchain check, the README task table and requirements, and the task consistency test in `tests/test_unit.py`.
 - **Reference solutions.** A known-correct solution for every task, stored next to it (e.g. `tasks/<lang>/<task>/reference/<solution file>`), plus a test that runs each through the real sandbox and expects it to pass. This catches broken or over-strict harnesses, which otherwise only show up as models failing. New tasks would require one.
 - **Summary export.** `--summary` prints a terminal table; add Markdown (for READMEs and issues) and CSV output of the same aggregated numbers, and optionally a per-task breakdown showing which tasks separate the models.
+- **Reduce cognitive complexity.** SonarQube Cloud flags 8 functions above its cognitive-complexity limit of 15 (as of 0.3.0): `load_tasks` (39), `main` (32), `run_endpoint` (32), `chat` (30), `print_summary` (23), `read_results` (20), `run_cmd` (18), `run_one_task` (17). Split the worst ones into focused helpers (e.g. task-directory validation, results-file setup, per-model loop, CLI-mode dispatch, summary formatting) without changing behaviour; the existing tests cover them. Splitting code that reads well top to bottom just to get under 15 isn't the goal.
 - **Speed metrics.** Report tokens per second per model (completion tokens / request time, from data already collected), and reasoning tokens separately where the server returns them (`usage.completion_tokens_details.reasoning_tokens`).

@@ -63,6 +63,9 @@ MAX_RESPONSE_BYTES = 8 * 1024**2  # API reply body cap, enforced before JSON par
 MAX_CONTENT_CHARS = 1024**2        # completion text cap, enforced before anything is written under runs/
 # Only the resolved Rust toolchain is exposed, never ~/.cargo or all of ~/.rustup.
 RUST_SYSROOT = None
+BASH = "/bin/bash"
+LD_SO_CACHE = "/etc/ld.so.cache"
+GO_CACHE_MOUNT = "/opt/go-cache"   # where sandboxes see the Go build cache
 # Host directory with a pre-built Go build cache (race-instrumented standard library), shown to each sandbox
 # through a throwaway overlay so attempts can't change it for each other. None: every sandbox starts empty.
 GO_CACHE = None
@@ -269,8 +272,8 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives"):
         if Path(path).exists():
             sandbox += ["--ro-bind", path, path]
-    if Path("/etc/ld.so.cache").is_file():
-        sandbox += ["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"]
+    if Path(LD_SO_CACHE).is_file():
+        sandbox += ["--ro-bind", LD_SO_CACHE, LD_SO_CACHE]
     if RUST_SYSROOT is not None:
         sandbox += ["--ro-bind", str(RUST_SYSROOT), "/opt/rust"]
     sandbox += ["--proc", "/proc", "--dev", "/dev",
@@ -278,9 +281,9 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/work",
                 "--ro-bind", str(Path(cwd).resolve()), "/input", "--chdir", "/work"]
     if go_cache_rw is not None:
-        sandbox += ["--bind", str(go_cache_rw), "/opt/go-cache"]
+        sandbox += ["--bind", str(go_cache_rw), GO_CACHE_MOUNT]
     elif GO_CACHE is not None:
-        sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", "/opt/go-cache"]
+        sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", GO_CACHE_MOUNT]
     # Preserve system installations such as /usr/local/go/bin, while excluding
     # home/project/relative PATH entries that are not exposed inside the sandbox.
     system_path = [path for path in os.get_exec_path()
@@ -288,14 +291,14 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     sandbox_path = ":".join(["/opt/rust/bin", *system_path, "/usr/bin", "/bin"])
     for key, value in {
         "PATH": sandbox_path, "HOME": "/tmp", "TMPDIR": "/tmp", "LC_ALL": "C",
-        "GOCACHE": "/opt/go-cache" if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
+        "GOCACHE": GO_CACHE_MOUNT if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
         "GOPATH": "/tmp/go", "GOPROXY": "off",
         "GOSUMDB": "off", "GOTOOLCHAIN": "local", "GOMAXPROCS": "2",
     }.items():
         sandbox += ["--setenv", key, value]
     # Copy inputs into private tmpfs. Generated files never reach parent reports,
     # including symlinks named response.md/log.txt or compiler-created artifacts.
-    sandbox += ["--", "/bin/bash", "-ec",
+    sandbox += ["--", BASH, "-ec",
                 'cp -a /input/. /work/\nexec "$@"', "sandbox", *cmd]
     command = [
         tools["systemd-run"], "--user", "--quiet", "--wait", "--pipe", "--collect",
@@ -377,14 +380,14 @@ def prepare_go_cache(directory):
     (work / "solution_test.go").write_text(GO_WARM_TEST)
     log("go: warming the build cache (race-instrumented standard library), this takes a minute...", err=True)
     t0 = time.monotonic()
-    warm = run_cmd(["/bin/bash", "-ec", "go build -race std\n" + shlex.join(LANGS["go"]["cmds"][-1])], work,
+    warm = run_cmd([BASH, "-ec", "go build -race std\n" + shlex.join(LANGS["go"]["cmds"][-1])], work,
                    timeout=GO_CACHE_WARM_TIMEOUT_S, go_cache_rw=cache)
     if warm.rc != 0:
         log(f"go: warning: warming the build cache failed; each Go attempt compiles the standard library "
             f"from scratch and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(warm.out)}", err=True)
         return
     GO_CACHE = cache
-    probe = run_cmd(["/bin/bash", "-ec", "touch /opt/go-cache/llm-bench-probe\n"
+    probe = run_cmd([BASH, "-ec", f"touch {GO_CACHE_MOUNT}/llm-bench-probe\n"
                      + shlex.join(LANGS["go"]["cmds"][-1])], work)
     if probe.rc != 0 or (cache / "llm-bench-probe").exists():
         GO_CACHE = None
@@ -431,7 +434,7 @@ def run_task(task, code, workdir):
         script += ["printf '%s\\n' " + shlex.quote(f"$ {r}"), r]
     # Build and execute in one sandbox so private compiler outputs persist only
     # for this attempt. Parent-owned source/transcript files are read-only inputs.
-    rc, out, timed_out = run_cmd(["/bin/bash", "-ec", "\n".join(script)], workdir)
+    rc, out, timed_out = run_cmd([BASH, "-ec", "\n".join(script)], workdir)
     run_log = f"{out}\n[exit {rc}]"
     if rc == 0:
         return True, run_log, None, None, None
@@ -1011,7 +1014,7 @@ def check_results_file(path):
                  f"move it away or use another --tag or --output-dir")
     try:
         read_results(path)
-    except (UnicodeDecodeError, ValueError, csv.Error) as e:
+    except (ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot read {path}: {e}")
 
 
@@ -1020,13 +1023,13 @@ def main():
     if args.summary:
         try:
             rows = [r for path in args.summary for r in read_results(path)]
-        except (OSError, UnicodeDecodeError, ValueError, csv.Error) as e:
+        except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
             sys.exit(f"cannot read results: {e}")
         print_summary(rows)
         return
     try:
         all_tasks = load_tasks(args.tasks_dir or [DEFAULT_TASKS_DIR])
-    except (OSError, UnicodeDecodeError, ValueError) as e:
+    except (OSError, ValueError) as e:   # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot load tasks: {e}")
     tasks = [t for t in all_tasks if not args.task or any(fnmatchcase(t["name"], p) for p in args.task)]
     if args.list_tasks:

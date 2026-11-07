@@ -57,9 +57,9 @@ def free_port():
 
 def test_chat_server_down_retries_then_gives_up(monkeypatch, capsys):
     monkeypatch.setattr(llm_bench, "SERVER_RETRY_DELAYS_S", (0, 0))
-    url = f"http://127.0.0.1:{free_port()}/v1"
+    url, options, stop = f"http://127.0.0.1:{free_port()}/v1", opts(), threading.Event()
     with pytest.raises(llm_bench.ServerDown):
-        llm_bench.chat("label", url, {}, opts(), threading.Event())
+        llm_bench.chat("label", url, {}, options, stop)
     assert capsys.readouterr().err.count("retrying in 0s") == 2
 
 
@@ -67,8 +67,9 @@ def test_chat_server_down_interrupted(monkeypatch):
     monkeypatch.setattr(llm_bench, "SERVER_RETRY_DELAYS_S", (60,))
     stop = threading.Event()
     stop.set()
+    url, options = f"http://127.0.0.1:{free_port()}/v1", opts()
     with pytest.raises(llm_bench.Interrupted):
-        llm_bench.chat("label", f"http://127.0.0.1:{free_port()}/v1", {}, opts(), stop)
+        llm_bench.chat("label", url, {}, options, stop)
 
 
 TASKS = [{"name": f"py_t{i}", "lang": "python", "prompt": f"task {i}", "test": "", "config": "cfg"}
@@ -119,7 +120,8 @@ def test_results_are_appended(mock_server, tmp_path):
     run_endpoint(s, tmp_path, tasks=TASKS[1:2])
     lines = (tmp_path / "results.csv").read_text().splitlines()
     assert lines[0] == ",".join(llm_bench.FIELDS)
-    assert len(lines) == 3 and [r["task"] for r in read_csv(tmp_path / "results.csv")] == ["py_t0", "py_t1"]
+    assert len(lines) == 3
+    assert [r["task"] for r in read_csv(tmp_path / "results.csv")] == ["py_t0", "py_t1"]
 
 
 def test_check_results_file(tmp_path):
@@ -161,7 +163,8 @@ def test_context_check(mock_server, tmp_path, server, options, context):
 def test_context_check_disabled(mock_server, tmp_path):
     s = mock_server(replies=[""], context=500)
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], context_check=False)
-    assert row["context"] == "unchecked" and len(s.probes) == 1
+    assert row["context"] == "unchecked"
+    assert len(s.probes) == 1
 
 
 def test_load_failure_skips_model(mock_server, tmp_path):
@@ -175,13 +178,15 @@ def test_load_failure_skips_model(mock_server, tmp_path):
 def test_load_time_is_separate_from_task_time(mock_server, tmp_path):
     s = mock_server(replies=[""], probe_reply=Reply(text="OK", sleep=1))
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
-    assert row["load_seconds"] >= 1 and row["seconds"] < 1
+    assert row["load_seconds"] >= 1
+    assert row["seconds"] < 1
 
 
 def test_params_metadata_and_config_in_rows(mock_server, tmp_path):
     s = mock_server(replies=[""])
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], params={"top_p": 0.5, "seed": 1})
-    assert s.requests[0]["top_p"] == 0.5 and s.probes[0]["seed"] == 1
+    assert s.requests[0]["top_p"] == 0.5
+    assert s.probes[0]["seed"] == 1
     assert (row["params"], row["run_id"], row["config"]) == ('{"seed":1,"top_p":0.5}', "test-run", "cfg")
     (csv_row,) = read_csv(tmp_path / "results.csv")
     assert list(csv_row) == llm_bench.FIELDS
@@ -192,7 +197,8 @@ def test_config_hash():
     base = {"timeout": 1800, "max_tokens": 100, "attempts": 3}
     settings = llm_bench.settings_fingerprint(opts(**base))
     h = llm_bench.config_hash(settings, task)
-    assert len(h) == 12 and h == llm_bench.config_hash(settings, dict(task))
+    assert len(h) == 12
+    assert h == llm_bench.config_hash(settings, dict(task))
     assert h != llm_bench.config_hash(settings, {**task, "prompt": "p2"})
     assert h != llm_bench.config_hash(settings, {**task, "test": "t2"})
     for change in ({"max_tokens": 101}, {"attempts": 2}, {"params": {"seed": 1}}):
@@ -222,7 +228,8 @@ def test_resume_skips_finished_and_retries_request_errors(mock_server, tmp_path)
     rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], resume=True)
     assert [(r["task"], r["repeat"], r["finish_reason"]) for r in rows] == [("py_t1", 2, "stop")]
     rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], resume=True)
-    assert rows == [] and len(s.requests) == 3           # nothing left: not even a warm-up
+    assert rows == []
+    assert len(s.requests) == 3           # nothing left: not even a warm-up
 
 
 def test_resume_with_repeat_tops_up(mock_server, tmp_path):
@@ -272,7 +279,9 @@ def test_summarize_keeps_newest_task_version_and_splits_settings():
 def test_print_summary_with_repeats(capsys):
     llm_bench.print_summary([row("py_a", 1), row("py_a", 0), row("py_b", 1), row("py_b", 1)])
     out = capsys.readouterr().out
-    assert "1.5±0.7/2" in out and "runs" in out and "mean passes per run" in out
+    assert "1.5±0.7/2" in out
+    assert "runs" in out
+    assert "mean passes per run" in out
 
 
 def test_read_results_accepts_old_files(tmp_path):
