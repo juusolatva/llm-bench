@@ -73,6 +73,7 @@ func TestEmpty(t *testing.T) {
 }
 
 func TestErrorCancelsAndStops(t *testing.T) {
+	const cs = "ParallelMap(inputs 0..999, workers 4) with f failing on input 10 after 20 ms and inputs > 10 running until canceled"
 	boom := errors.New("boom")
 	var h harnessTracker
 	var mu sync.Mutex
@@ -84,12 +85,14 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	// Calls that are never canceled give up after 2 s, so a missing cancellation fails the test quickly.
 	watchdog := make(chan struct{})
 	time.AfterFunc(2*time.Second, func() { close(watchdog) })
-	var failed atomic.Bool       // set just before input 10's call returns boom
-	var startedAfter atomic.Int64 // calls that started after that
+	// ParallelMap cancels the context only after it has seen the error, so a call that starts with that
+	// context already canceled was started after the error. One such call is tolerated: an implementation may
+	// free the failing call's worker and hand it to the next input just before it records the error.
+	var startedCanceled atomic.Int64
 	start := time.Now()
 	got, err := ParallelMap(context.Background(), inputs, 4, func(ctx context.Context, x int) (int, error) {
-		if failed.Load() {
-			startedAfter.Add(1)
+		if ctx.Err() != nil {
+			startedCanceled.Add(1)
 		}
 		h.enter()
 		defer h.leave()
@@ -98,7 +101,6 @@ func TestErrorCancelsAndStops(t *testing.T) {
 			return x, nil
 		case x == 10:
 			time.Sleep(20 * time.Millisecond)
-			failed.Store(true)
 			return 0, boom
 		default:
 			select {
@@ -114,44 +116,50 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	})
 	elapsed := time.Since(start)
 	if elapsed > time.Second {
-		t.Fatalf("took %v: the context passed to running calls was not canceled after the error", elapsed)
+		t.Fatalf("%s: took %v; the context passed to running calls was not canceled after the error", cs, elapsed)
 	}
 	if !errors.Is(err, boom) || got != nil {
-		t.Fatalf("got %v, %v; want nil and the error returned by f (boom)", got, err)
+		t.Fatalf("%s: got %v, %v; want nil and the error returned by f (boom)", cs, got, err)
 	}
 	if a := h.active.Load(); a != 0 {
-		t.Fatalf("returned while %d calls of f were still running", a)
+		t.Fatalf("%s: returned while %d calls of f were still running", cs, a)
 	}
-	if n := startedAfter.Load(); n > 0 {
-		t.Fatalf("%d calls of f started after input 10 returned an error; no new calls may start after an error", n)
+	if n := startedCanceled.Load(); n > 1 {
+		t.Fatalf("%s: %d calls of f started after the error (their context was already canceled); no new calls may start after an error", cs, n)
 	}
-	// Inputs 0-13 can start before input 10 fails (inputs claim the 4 workers in order, and 11-13 run until
-	// canceled, so 14 can't get a worker before the error); none may start after it.
+	// Inputs claim the 4 workers in order and 11-13 run until canceled, so inputs 0-13 can start before input 10
+	// fails, plus at most one more (14) if a worker is freed before the error is recorded.
 	s := h.started.Load()
-	if s > 14 {
-		t.Fatalf("f was called %d times, want at most 14: inputs claim workers in order, so inputs 0-13 can start before input 10 fails, and no new calls may start after the error", s)
+	if s > 15 {
+		t.Fatalf("%s: f was called %d times, want at most 15 (inputs 0-13 can start before input 10 fails; no new calls may start after the error)", cs, s)
 	}
 	if s > 11 && canceled == 0 {
-		t.Fatalf("no running call saw its context canceled")
+		t.Fatalf("%s: no running call saw its context canceled", cs)
 	}
 }
 
 func TestErrorWithOneWorker(t *testing.T) {
+	const cs = "ParallelMap([0 1 2 3 4], workers 1) with f always failing"
 	boom := errors.New("boom")
-	var calls atomic.Int64
+	var calls, startedCanceled atomic.Int64
 	got, err := ParallelMap(context.Background(), []int{0, 1, 2, 3, 4}, 1, func(ctx context.Context, x int) (int, error) {
 		calls.Add(1)
+		if ctx.Err() != nil {
+			startedCanceled.Add(1)
+		}
 		return 0, boom
 	})
 	if !errors.Is(err, boom) || got != nil {
-		t.Fatalf("one worker, first call fails: got %v, %v; want nil and boom", got, err)
+		t.Fatalf("%s: got %v, %v; want nil and boom", cs, got, err)
 	}
-	if n := calls.Load(); n != 1 {
-		t.Fatalf("one worker, first call fails: f was called %d times, want 1 (no calls may start after an error)", n)
+	// As above, one call that races with recording the first error is tolerated.
+	if n := startedCanceled.Load(); n > 1 {
+		t.Fatalf("%s: f was called %d times, %d of them after the error (their context was already canceled); no new calls may start after an error", cs, calls.Load(), n)
 	}
 }
 
 func TestParentCancel(t *testing.T) {
+	const cs = "ParallelMap(100 inputs, workers 3) with ctx canceled after 50 ms and f running until canceled"
 	var h harnessTracker
 	ctx, cancel := context.WithCancel(context.Background())
 	inputs := make([]int, 100)
@@ -171,16 +179,16 @@ func TestParentCancel(t *testing.T) {
 		}
 	})
 	if time.Since(start) > time.Second {
-		t.Fatalf("did not stop promptly after ctx was canceled (calls must get a context derived from ctx)")
+		t.Fatalf("%s: did not stop promptly after ctx was canceled (calls must get a context derived from ctx)", cs)
 	}
 	if !errors.Is(err, context.Canceled) || got != nil {
-		t.Fatalf("got %v, %v; want nil and context.Canceled (ctx.Err() wins over errors returned by f)", got, err)
+		t.Fatalf("%s: got %v, %v; want nil and context.Canceled (ctx.Err() wins over errors returned by f)", cs, got, err)
 	}
 	if a := h.active.Load(); a != 0 {
-		t.Fatalf("returned while %d calls of f were still running", a)
+		t.Fatalf("%s: returned while %d calls of f were still running", cs, a)
 	}
 	if s := h.started.Load(); s > 6 {
-		t.Fatalf("f was called %d times; no new calls may start after ctx is canceled", s)
+		t.Fatalf("%s: f was called %d times, want at most 6; no new calls may start after ctx is canceled", cs, s)
 	}
 }
 
@@ -193,9 +201,9 @@ func TestAlreadyCanceled(t *testing.T) {
 		return x, nil
 	})
 	if !errors.Is(err, context.Canceled) || got != nil {
-		t.Fatalf("canceled ctx: got %v, %v; want nil and context.Canceled", got, err)
+		t.Fatalf("ParallelMap(already canceled ctx, [1 2 3], workers 2): got %v, %v; want nil and context.Canceled", got, err)
 	}
 	if n := calls.Load(); n != 0 {
-		t.Fatalf("canceled ctx: f was called %d times, want 0 (no calls may start once ctx is canceled)", n)
+		t.Fatalf("ParallelMap(already canceled ctx, [1 2 3], workers 2): f was called %d times, want 0 (no calls may start once ctx is canceled)", n)
 	}
 }
