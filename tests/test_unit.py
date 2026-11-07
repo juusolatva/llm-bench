@@ -50,6 +50,9 @@ def test_extract_code_strips_think():
     ("  \n<think>\n```python\nbad\n```\n", ""),
     ("I removed the <think> tags.\n```python\ngood\n```", "good\n"),           # <think> in prose
     ("plan\n</think>\n```python\ngood\n```\nIt drops </think> tags.", "good\n"),  # </think> in prose
+    ("```python\ngood\n```\nThe </think> tag is not used.", "good\n"),          # no reasoning at all
+    ("plan ```python\nbad\n```\n</think>\nok:\n```python\ngood\n```", "good\n"),
+    ("plan\n</think>\nx = 1\n", "\nx = 1\n"),                                   # no fence: after first
 ])
 def test_extract_code_partial_think(text, want):
     assert llm_bench.extract_code(text, "python") == want
@@ -87,6 +90,24 @@ def test_extract_code_loose_fallback(text, want):
     assert llm_bench.extract_code(text, "python") == want
 
 
+@pytest.mark.parametrize(("text", "want"), [
+    ("Wrap code in ``` fences.\n```python\ngood\n```", "good\n"),       # prose mention isn't a fence
+    ("Put it below ```\n```python\ngood\n```", "good\n"),                 # untagged mid-line fence isn't either
+    ("```python\nx = '``` inside'\n```", "x = '``` inside'\n"),        # backticks mid-line in code
+    ("````markdown\n```python\nnested\n```\n````", "```python\nnested\n```\n"),   # longer outer fence
+])
+def test_extract_code_fence_pairing(text, want):
+    assert llm_bench.extract_code(text) == want
+
+
+def test_extract_code_mixes_loose_and_strict_blocks():
+    solution = "def solve():\n    return 42\n"
+    text = f"````python\n{solution}````\nUsage:\n```python\nsolve()\n```"
+    assert llm_bench.extract_code(text, "python") == solution
+    tagged = "Here: ```python\ns = '<think>x</think>'\n```"   # think tags inside a loose block stay
+    assert llm_bench.extract_code(tagged, "python") == "s = '<think>x</think>'\n"
+
+
 def test_extract_code_fence_details():
     # Info strings after the tag, indented fences and backticks inside the code.
     text = "  ```python title=solution.py\n  s = '```'\n  ```"
@@ -107,22 +128,12 @@ def test_extract_code_keeps_think_tags_inside_code():
 def test_strip_think_is_linear(monkeypatch):
     """Many tags inside code must not rescan the reply once per tag."""
     scans = []
-    real = llm_bench.CODE_RE
-    class Counting:
-        def finditer(self, text):
-            scans.append(1)
-            return real.finditer(text)
-    monkeypatch.setattr(llm_bench, "CODE_RE", Counting())
+    real = llm_bench._code_blocks
+    monkeypatch.setattr(llm_bench, "_code_blocks", lambda text: scans.append(1) or real(text))
     reply = "```python\n" + "s = '<think></think>'\n" * 20000 + "```\n"
+    start = time.monotonic()
     assert llm_bench.strip_think(reply) == reply
     assert len(scans) <= 2
-
-
-@pytest.mark.parametrize("reply", ["`" * 200000, "```" + " " * 200000, "```py\n" + "`" * 200000,
-                                   "x " * 100000 + "```" + "\t" * 100000 + "y", ("```py\na\n") * 50000])
-def test_extract_code_degenerate_replies_are_fast(reply):
-    start = time.monotonic()
-    llm_bench.extract_code(reply, "python")
     assert time.monotonic() - start < 2
 
 

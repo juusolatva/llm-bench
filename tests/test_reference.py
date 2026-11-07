@@ -38,11 +38,11 @@ def go_cache():
 @pytest.mark.sandbox
 @pytest.mark.parametrize("task", TASKS, ids=[t["name"] for t in TASKS])
 def test_reference_passes(task, tmp_path, request):
-    if task["lang"] == "go":
-        request.getfixturevalue("go_cache")
     try:
         llm_bench.check_toolchains([task])
     except SystemExit as exc:
         pytest.skip(str(exc))
+    if task["lang"] == "go":
+        request.getfixturevalue("go_cache")
     passed, _, stage, cmd, out = llm_bench.run_task(task, reference_file(task).read_text(), tmp_path / "work")
     assert passed, f"{task['name']}: reference failed at {stage} ({cmd}):\n{out}"

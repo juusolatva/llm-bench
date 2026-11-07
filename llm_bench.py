@@ -13,6 +13,7 @@ Run with --help for usage.
 import argparse
 import bisect
 import csv
+import functools
 import hashlib
 import http.client
 import json
@@ -151,13 +152,13 @@ FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "pa
           "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-# A fenced block: an opening fence with an optional info string (it starts with the language tag, as in
-# "python" or "python:solution.py") and a closing fence, each on its own line (indentation allowed).
-# Possessive quantifiers (*+, ++) and the lookbehind keep matching linear on degenerate replies (long runs of
-# backticks or spaces); with plain quantifiers those backtrack quadratically or worse.
-CODE_RE = re.compile(r"^[ \t]*+```[ \t]*+([\w+-]*+)[^\n`]*+\n(.*?)^[ \t]*```", re.DOTALL | re.MULTILINE)
-# Fallback when no block matches CODE_RE: fences anywhere, e.g. 4-backtick fences or a closing fence glued to code.
-LOOSE_CODE_RE = re.compile(r"(?<!`)```++[ \t]*+([\w+-]*+)[^\n]*+\n(.*?)```", re.DOTALL)
+# Fenced code blocks are found by a left-to-right scan (_code_blocks), so a fence is never used twice. An
+# opening fence is a run of 3+ backticks either at the start of a line with an optional info string (it
+# starts with the language tag: "python", "python:solution.py", "c++ title=x") or mid-line directly followed
+# by a (required) tag and the end of the line ("Here: ```python"). Possessive quantifiers (*+, ++) and the lookbehind
+# keep matching linear on degenerate replies such as long runs of backticks or spaces.
+FENCE_OPEN_RE = re.compile(r"^[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n",
+                           re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 
@@ -224,36 +225,69 @@ def parse_endpoint(spec):
     return safe_name(name), base
 
 
-def _outside_code(text, positions):
-    """The positions that aren't inside a fenced code block (one scan of text for all positions)."""
-    spans = [m.span() for m in CODE_RE.finditer(text)]
-    starts = [start for start, _ in spans]
+@functools.cache
+def _fence_close_re(length):
+    """A closing fence for an opening fence of `length` backticks: a line starting with at least as many."""
+    return re.compile(rf"^[ \t]*+`{{{length},}}", re.MULTILINE)
+
+
+def _code_blocks(text):
+    """Fenced blocks as (start, end, tag, code), in reply order. A block ends at the next line that starts
+    with at least as many backticks as its opening fence or, failing that, at the next such run of backticks
+    anywhere (a closing fence glued to the code). Scanning stops at an unclosed block."""
+    blocks, pos = [], 0
+    while (opening := FENCE_OPEN_RE.search(text, pos)):
+        fence, tag = (opening.group(1), opening.group(2)) if opening.group(1) else (opening.group(3), opening.group(4))
+        body = opening.end()
+        closing = _fence_close_re(len(fence)).search(text, body)
+        if closing:
+            code_end, end = closing.start(), closing.end()
+        else:
+            code_end = text.find(fence, body)
+            if code_end < 0:
+                break
+            end = code_end + len(fence)
+        blocks.append((opening.start(), end, tag, text[body:code_end]))
+        pos = end
+    return blocks
+
+
+def _outside_code(blocks, positions):
+    """The positions that aren't inside one of the blocks (from _code_blocks)."""
+    starts = [b[0] for b in blocks]
     keep = []
     for pos in positions:
         i = bisect.bisect_right(starts, pos) - 1
-        if i < 0 or pos >= spans[i][1]:
+        if i < 0 or pos >= blocks[i][1]:
             keep.append(pos)
     return keep
 
 
 def strip_think(text):
-    """Remove reasoning: <think>...</think> blocks, everything before an unpaired </think> (servers that drop
-    the opening tag; the first one, so a tag mentioned after the answer can't swallow it) and a reply that
-    starts with a <think> that never closes (reasoning cut off by max_tokens). Tags inside fenced code
-    blocks are part of the code, and an unpaired <think> later in the reply is ordinary text."""
+    """Remove reasoning and return the rest of the reply:
+    - <think>...</think> blocks;
+    - for servers that drop the opening tag, everything up to the last unpaired </think> that is followed
+      by a code block (if the reply has no code block, up to the first one; if code blocks exist but none
+      follows a </think>, nothing, so a tag mentioned after the answer can't erase it);
+    - a reply that starts with a <think> that never closes (reasoning cut off by max_tokens) becomes "".
+    Tags inside fenced code blocks are part of the code, and an unpaired <think> later in the reply is text."""
     # Search only up to the last </think>: an unclosed <think> after it would make each match attempt scan
     # to the end of the reply (quadratic in replies full of <think>).
     last_close = text.rfind("</think>")
     pairs = list(THINK_RE.finditer(text, 0, last_close + len("</think>"))) if last_close >= 0 else []
-    outside = set(_outside_code(text, [m.start() for m in pairs]))
+    outside = set(_outside_code(_code_blocks(text), [m.start() for m in pairs]))
     pieces, end = [], 0
     for m in pairs:
         if m.start() in outside:   # pairs inside code stay in place
             pieces.append(text[end:m.start()])
             end = m.end()
     text = "".join(pieces) + text[end:]
-    closes = _outside_code(text, [m.start() for m in re.finditer("</think>", text)])
-    if closes:
+    blocks = _code_blocks(text)
+    closes = _outside_code(blocks, [m.start() for m in re.finditer("</think>", text)])
+    followed = [c for c in closes if blocks and blocks[-1][0] > c]
+    if followed:
+        text = text[followed[-1] + len("</think>"):]
+    elif closes and not blocks:
         text = text[closes[0] + len("</think>"):]
     return "" if text.lstrip().startswith("<think>") else text
 
@@ -265,11 +299,12 @@ def extract_code(text, lang=None):
     a snippet after the full file, and the longest (the last of equally long ones) wins. A reply without a
     fenced block is taken as code."""
     text = strip_think(text)
-    blocks = CODE_RE.findall(text) or LOOSE_CODE_RE.findall(text)
+    blocks = _code_blocks(text)
     if not blocks:
         return text
     tags = LANGS[lang]["tags"] if lang else ()
-    candidates = [code for tag, code in blocks if tag.lower() in tags] or [code for _, code in blocks]
+    candidates = ([code for _, _, tag, code in blocks if tag.lower() in tags]
+                  or [code for _, _, _, code in blocks])
     longest = max(reversed(candidates), key=lambda code: len(code.strip()))
     last = candidates[-1]
     return last if 2 * len(last.strip()) >= len(longest.strip()) else longest
