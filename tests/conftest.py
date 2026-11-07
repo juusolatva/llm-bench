@@ -1,0 +1,99 @@
+import json
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+import llm_bench
+
+
+class MockServer:
+    """Minimal OpenAI-compatible server. `replies` is consumed one per chat request."""
+
+    def __init__(self, models=("test/model",), replies=(), api_key=None):
+        self.models = list(models)
+        self.replies = list(replies)
+        self.api_key = api_key
+        self.requests = []
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002 -- keep the base signature
+                pass
+
+            def _send(self, status, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _authorized(self):
+                if server.api_key and self.headers.get("Authorization") != f"Bearer {server.api_key}":
+                    self._send(401, {"error": "unauthorized"})
+                    return False
+                return True
+
+            def do_GET(self):
+                if not self._authorized():
+                    return
+                if self.path == "/v1/models":
+                    self._send(200, {"data": [{"id": m} for m in server.models]})
+                else:
+                    self._send(404, {})
+
+            def do_POST(self):
+                if not self._authorized():
+                    return
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                server.requests.append(req)
+                text = server.replies.pop(0) if server.replies else ""
+                self._send(200, {"choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def mock_server():
+    servers = []
+
+    def start(**kwargs):
+        s = MockServer(**kwargs).__enter__()
+        servers.append(s)
+        return s
+
+    yield start
+    for s in servers:
+        s.__exit__(None, None, None)
+
+
+def _sandbox_available():
+    with tempfile.TemporaryDirectory() as d:
+        rc, _ = llm_bench.run_cmd(["/usr/bin/true"], Path(d))
+    return rc == 0
+
+
+SANDBOX_OK = _sandbox_available()
+
+
+def pytest_collection_modifyitems(config, items):
+    if SANDBOX_OK:
+        return
+    skip = pytest.mark.skip(reason="bwrap + systemd user sandbox not available")
+    for item in items:
+        if "sandbox" in item.keywords:
+            item.add_marker(skip)

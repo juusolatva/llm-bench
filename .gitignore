@@ -1,0 +1,14 @@
+# Benchmark output
+results_*.csv
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
