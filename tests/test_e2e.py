@@ -49,7 +49,7 @@ def test_feedback_loop_passes_on_second_attempt(monkeypatch, tmp_path, mock_serv
     assert len(s.requests) == 2
     feedback = s.requests[1]["messages"][-1]["content"]
     assert "got 0, want 5400" in feedback
-    attempt = tmp_path / "runs/mock_x/test_model/py_parse_duration"
+    attempt = tmp_path / "runs/mock_x/test_model/py_parse_duration/repeat_1"
     assert (attempt / "attempt_1/response.md").read_text() == BAD
     assert "[exit 0]" in (attempt / "attempt_2/log.txt").read_text()
 
@@ -138,7 +138,7 @@ def test_appended_harness_language(monkeypatch, tmp_path, mock_server):
     s = mock_server(replies=[RUST_WORD_COUNT])
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "rust_word_count", "--attempts", "1")
     (row,) = read_rows(tmp_path / "results_m.csv")
-    log = (tmp_path / "runs/m/test_model/rust_word_count/attempt_1/log.txt").read_text()
+    log = (tmp_path / "runs/m/test_model/rust_word_count/repeat_1/attempt_1/log.txt").read_text()
     assert row["passed"] == "1", log
     assert "4 passed" in log
 
@@ -175,7 +175,7 @@ def test_time_limit_is_reported(monkeypatch, tmp_path, mock_server):
     assert row["fail_stage"] == "test"   # the last attempt failed normally
     first = s.requests[1]["messages"][-1]["content"]
     assert "exceeded the 3 s time limit" in first and "[killed:" in first
-    log = (tmp_path / "runs/m/test_model/py_parse_duration/attempt_1/log.txt").read_text()
+    log = (tmp_path / "runs/m/test_model/py_parse_duration/repeat_1/attempt_1/log.txt").read_text()
     assert "[killed: exceeded the 3 s time limit" in log
 
 
@@ -185,8 +185,9 @@ def test_rerun_appends_and_tag_separates_transcripts(monkeypatch, tmp_path, mock
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration")
     assert len(read_rows(tmp_path / "results_m.csv")) == 2
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "-t", "x")
-    assert (tmp_path / "runs/m/test_model/py_parse_duration").is_dir()
-    assert (tmp_path / "runs/m_x/test_model/py_parse_duration").is_dir()
+    assert (tmp_path / "runs/m/test_model/py_parse_duration/repeat_1").is_dir()
+    assert (tmp_path / "runs/m/test_model/py_parse_duration/repeat_2").is_dir()   # re-run: next repeat number
+    assert (tmp_path / "runs/m_x/test_model/py_parse_duration/repeat_1").is_dir()
 
 
 def test_ctrl_c_stops_promptly(tmp_path, mock_server):

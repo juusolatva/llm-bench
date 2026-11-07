@@ -1,5 +1,6 @@
 """Request handling and the per-endpoint loop. No sandbox needed: no reply here contains code to run."""
 import csv
+import json
 import socket
 import threading
 from types import SimpleNamespace
@@ -12,7 +13,8 @@ import llm_bench
 
 def opts(**kwargs):
     defaults = {"timeout": 30, "api_key": None, "attempts": 1, "max_tokens": 100, "params": {},
-                "context_check": True, "run_id": "test-run"}
+                "context_check": True, "run_id": "test-run", "settings_hash": "set", "repeat": 1, "resume": False,
+                "max_length_finishes": None}
     return SimpleNamespace(**{**defaults, **kwargs})
 
 
@@ -108,7 +110,7 @@ def test_no_code_reply(mock_server, tmp_path):
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
     assert (row["passed"], row["attempts"], row["fail_stage"]) == (0, 2, "no_code")
     assert "did not contain any code" in s.requests[1]["messages"][-1]["content"]
-    assert (tmp_path / "runs/test_model/py_t0/attempt_1/log.txt").read_text() == "[no code in reply]"
+    assert (tmp_path / "runs/test_model/py_t0/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
 
 
 def test_results_are_appended(mock_server, tmp_path):
@@ -196,3 +198,93 @@ def test_config_hash():
     for change in ({"max_tokens": 101}, {"attempts": 2}, {"params": {"seed": 1}}):
         other = llm_bench.settings_fingerprint(opts(**{**base, **change}))
         assert h != llm_bench.config_hash(other, task)
+
+
+def test_repeat_runs_each_task_k_times_repeat_major(mock_server, tmp_path):
+    s = mock_server(replies=[""] * 4)
+    rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], repeat=2)
+    assert [(r["task"], r["repeat"]) for r in rows] == [("py_t0", 1), ("py_t1", 1), ("py_t0", 2), ("py_t1", 2)]
+    assert (tmp_path / "runs/test_model/py_t0/repeat_2/attempt_1").is_dir()
+    assert len(s.probes) == 3   # one warm-up and context check per model, not per repeat
+
+
+def test_repeat_numbers_continue_across_runs(mock_server, tmp_path):
+    s = mock_server(replies=[""] * 2)
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert [r["repeat"] for r in llm_bench.read_results(tmp_path / "results.csv")] == [1, 2]
+
+
+def test_resume_skips_finished_and_retries_request_errors(mock_server, tmp_path):
+    err = Reply(status=500, body=b"{}")
+    s = mock_server(replies=["", err, ""])
+    run_endpoint(s, tmp_path, tasks=TASKS[:2])          # t0 finishes, t1 gets http_500
+    rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], resume=True)
+    assert [(r["task"], r["repeat"], r["finish_reason"]) for r in rows] == [("py_t1", 2, "stop")]
+    rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], resume=True)
+    assert rows == [] and len(s.requests) == 3           # nothing left: not even a warm-up
+
+
+def test_resume_with_repeat_tops_up(mock_server, tmp_path):
+    s = mock_server(replies=[""] * 3)
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    rows = run_endpoint(s, tmp_path, tasks=TASKS[:1], repeat=3, resume=True)
+    assert [r["repeat"] for r in rows] == [2, 3]
+
+
+def test_resume_ignores_rows_with_other_config(mock_server, tmp_path):
+    s = mock_server(replies=[""] * 2)
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    changed = [{**TASKS[0], "config": "other"}]          # e.g. the prompt changed
+    assert len(run_endpoint(s, tmp_path, tasks=changed, resume=True)) == 1
+
+
+def test_length_budget_skips_rest_of_model(mock_server, tmp_path):
+    long = Reply(body=json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}).encode())
+    s = mock_server(models=["a", "b"], replies=[long, long, long, long])
+    rows = run_endpoint(s, tmp_path, models=["a", "b"], tasks=TASKS[:3], max_length_finishes=2)
+    assert [(r["model"], r["finish_reason"], r["fail_stage"]) for r in rows] == [
+        ("a", "length", "no_code"), ("a", "length", "no_code"), ("a", "skipped", "budget"),
+        ("b", "length", "no_code"), ("b", "length", "no_code"), ("b", "skipped", "budget")]
+
+
+def row(task, passed_on, **extra):
+    return {"endpoint": "e", "model": "m", "task": task, "lang": "python", "passed": int(passed_on > 0),
+            "passed_on": passed_on, "prompt_tokens": 10, "completion_tokens": 5, "seconds": 1.0,
+            "load_seconds": 2.0, "settings": "s1", "config": "c1", "context": "ok", **extra}
+
+
+def test_summarize_repeats():
+    rows = [row("py_a", 1), row("py_a", 2), row("py_b", 0), row("py_b", 0)]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert (g["n"], g["p1"], g["pass"], g["runs"]) == (2, 0.5, 1.0, [2, 2])   # py_a passed twice, once at attempt 1
+    assert g["var1"] == pytest.approx(0.5)   # p=0.5 over 2 runs: 0.25 * 2/1
+    assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)   # means per run, summed over tasks
+
+
+def test_summarize_keeps_newest_task_version_and_splits_settings():
+    rows = [row("py_a", 0, config="old"), row("py_a", 1, config="new"), row("py_a", 1, settings="s2")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert dropped == 1
+    assert sorted((g["settings"], g["pass"]) for g in groups) == [("s1", 1.0), ("s2", 1.0)]
+
+
+def test_print_summary_with_repeats(capsys):
+    llm_bench.print_summary([row("py_a", 1), row("py_a", 0), row("py_b", 1), row("py_b", 1)])
+    out = capsys.readouterr().out
+    assert "1.5±0.7/2" in out and "runs" in out and "mean passes per run" in out
+
+
+def test_read_results_accepts_old_files(tmp_path):
+    path = tmp_path / "old.csv"
+    path.write_text("backend,model,task,lang,passed,passed_on,attempts,prompt_tokens,completion_tokens,seconds,"
+                    "finish_reason\nollama,m,py_a,python,1,2,2,10,5,1.5,stop\n")
+    (r,) = llm_bench.read_results(path)
+    assert (r["endpoint"], r["repeat"], r["passed_on"], r["seconds"], r["config"]) == ("ollama", 1, 2, 1.5, "")
+
+
+def test_read_results_rejects_other_csv(tmp_path):
+    path = tmp_path / "x.csv"
+    path.write_text("a,b\n1,2\n")
+    with pytest.raises(ValueError, match="not a results file"):
+        llm_bench.read_results(path)

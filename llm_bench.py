@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -39,7 +39,7 @@ from typing import NamedTuple
 # --- CONFIGURATION ---
 # Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
 # code extraction, build/test handling), so rows from different versions are never mixed.
-BENCH_VERSION = "0.2.0"
+BENCH_VERSION = "0.3.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
@@ -141,9 +141,9 @@ def load_tasks(roots):
 # Runner
 # --------------------------------------------------------------------------------------------
 
-FIELDS = ["run_id", "endpoint", "model", "task", "lang", "passed", "passed_on", "attempts", "prompt_tokens",
-          "completion_tokens", "seconds", "load_seconds", "finish_reason", "fail_stage", "context", "params",
-          "config"]
+FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "passed_on", "attempts",
+          "prompt_tokens", "completion_tokens", "seconds", "load_seconds", "finish_reason", "fail_stage", "context",
+          "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 CODE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -686,6 +686,11 @@ def settings_fingerprint(opts):
                                                          SANDBOX_FILE_BYTES]}
 
 
+def settings_hash(settings):
+    """Short hash of the settings alone: rows of one model with equal hashes can be summarized together."""
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:12]
+
+
 def config_hash(settings, task):
     """Short hash of the settings plus this task's prompt, harness and language spec: rows with equal hashes
     were produced under the same conditions."""
@@ -699,10 +704,50 @@ def skipped_result(finish_reason, fail_stage):
             "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
 
 
+INT_FIELDS = ("repeat", "passed", "passed_on", "attempts", "prompt_tokens", "completion_tokens")
+FLOAT_FIELDS = ("seconds", "load_seconds")
+# Rows with these finish reasons failed for reasons outside the model's answer; --resume runs them again.
+RETRY_FINISHES = ("bad_response", "disconnected", "skipped")
+
+
+def read_results(path):
+    """Rows of a results CSV, numeric fields converted. Files from older versions are accepted: missing
+    columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint"."""
+    rows = []
+    with open(path, newline="") as f:
+        for raw in csv.DictReader(f):
+            row = {k: v for k, v in raw.items() if k is not None}
+            if "endpoint" not in row and "backend" in row:
+                row["endpoint"] = row.pop("backend")
+            missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
+            if missing:
+                raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
+            for k in INT_FIELDS:
+                row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
+            for k in FLOAT_FIELDS:
+                row[k] = float(row.get(k) or 0)
+            for k in FIELDS:
+                if row.get(k) is None:
+                    row[k] = ""
+            rows.append(row)
+    return rows
+
+
+def is_finished(row):
+    finish = row.get("finish_reason") or ""
+    return not (finish in RETRY_FINISHES or finish.startswith("http_"))
+
+
 def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop):
-    """Run the tasks for the given models of one endpoint. Appends each row to out_path (and to rows)
-    as it completes."""
-    new_file = not out_path.exists() or out_path.stat().st_size == 0
+    """Run every task opts.repeat times for each model of one endpoint (with opts.resume, only the runs not
+    yet finished in out_path). Appends each row to out_path (and to rows) as it completes."""
+    existing = []
+    if out_path.exists() and out_path.stat().st_size > 0:
+        existing = [r for r in read_results(out_path) if r["endpoint"] == name]
+    # Repeat numbers continue after the rows already in the file, so transcripts are never overwritten.
+    numbered = Counter((r["model"], r["task"], r["config"]) for r in existing)
+    finished = Counter((r["model"], r["task"], r["config"]) for r in existing if is_finished(r))
+    new_file = not existing and (not out_path.exists() or out_path.stat().st_size == 0)
     # Rows are written as they complete, so an aborted run keeps every finished model x task.
     with open(out_path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -713,34 +758,54 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
         params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
 
         def record(model, task, result, model_info):
+            key = (model, task["name"], task["config"])
+            numbered[key] += 1
             row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
-                   "lang": task["lang"], **result, **model_info, "params": params, "config": task["config"]}
+                   "lang": task["lang"], "repeat": numbered[key], **result, **model_info, "params": params,
+                   "settings": opts.settings_hash, "config": task["config"]}
             rows.append(row)
             w.writerow(row)
             f.flush()
             log(str(row))
 
+        def skip_rest(model, todo, why, finish_reason, fail_stage, model_info):
+            log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} run(s)", err=True)
+            for task in todo:
+                record(model, task, skipped_result(finish_reason, fail_stage), model_info)
+
         try:
             for model in models:
+                # Repeat-major order: one full pass over the tasks finishes before the second one starts.
+                todo = [task for rep in range(opts.repeat) for task in tasks
+                        if not opts.resume or finished[(model, task["name"], task["config"])] <= rep]
+                total = opts.repeat * len(tasks)
+                if not todo:
+                    log(f"{name}/{model}: all {total} run(s) already in {out_path}; skipping", err=True)
+                    continue
+                if len(todo) < total:
+                    log(f"{name}/{model}: resuming, {len(todo)} of {total} run(s) to go", err=True)
                 load_seconds, context, error = prepare_model(f"{name}/{model}", base, model, opts, stop)
                 model_info = {"load_seconds": load_seconds, "context": context}
                 if error:
-                    log(f"{name}/{model}: loading failed ({error}); skipping its {len(tasks)} task(s)", err=True)
-                    for task in tasks:
-                        record(model, task, skipped_result(error, "load"), model_info)
+                    skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
                     continue
-                model_errors = 0   # consecutive tasks that ended in a request-level model error
-                for i, task in enumerate(tasks):
+                model_errors = 0     # consecutive runs that ended in a request-level model error
+                length_finishes = 0  # runs whose last reply hit --max-tokens
+                for i, task in enumerate(todo):
                     if model_errors >= MAX_MODEL_ERRORS:
-                        log(f"{name}/{model}: {model_errors} request errors in a row; skipping its remaining "
-                            f"{len(tasks) - i} task(s)", err=True)
-                        for skipped in tasks[i:]:
-                            record(model, skipped, skipped_result("skipped", "request"), model_info)
+                        skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
+                                  model_info)
                         break
-                    taskdir = runs_dir / UNSAFE_NAME_RE.sub("_", model) / task["name"]
-                    result = run_one_task(f"{name}/{model}/{task['name']}", base, model, task, taskdir, opts,
-                                          stop)
+                    if opts.max_length_finishes and length_finishes >= opts.max_length_finishes:
+                        skip_rest(model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped",
+                                  "budget", model_info)
+                        break
+                    repeat = numbered[(model, task["name"], task["config"])] + 1
+                    label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
+                    taskdir = runs_dir / UNSAFE_NAME_RE.sub("_", model) / task["name"] / f"repeat_{repeat}"
+                    result = run_one_task(label, base, model, task, taskdir, opts, stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
+                    length_finishes += result["finish_reason"] == "length"
                     record(model, task, result, model_info)
         except ServerDown as e:
             log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
@@ -748,38 +813,89 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             pass
 
 
-def print_summary(rows, max_attempts):
+def summarize(rows):
+    """Aggregate rows per (endpoint, model, settings). For each task only the rows with its newest config
+    (the last one seen) count; several rows of a task are repeats. Returns (groups, dropped row count)."""
+    tasks_by_group = {}
+    dropped = 0
+    for r in rows:
+        group = tasks_by_group.setdefault((r["endpoint"], r["model"], r.get("settings") or ""), {})
+        config, task_rows = group.get(r["task"], (None, []))
+        if config is not None and config != r.get("config"):
+            dropped += len(task_rows)
+            task_rows = []
+        group[r["task"]] = (r.get("config"), [*task_rows, r])
+    groups = []
+    for (endpoint, model, settings), tasks in tasks_by_group.items():
+        g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
+             "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
+             "runs": [], "context": "unchecked"}
+        for task_rows in (task_rows for _, task_rows in tasks.values()):
+            n = len(task_rows)
+            p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
+            p = sum(r["passed"] for r in task_rows) / n
+            g["p1"] += p1
+            g["pass"] += p
+            # Variance of one run's score: a sum of per-task Bernoulli variables (unbiased estimate).
+            correction = n / (n - 1) if n > 1 else 0.0
+            g["var1"] += p1 * (1 - p1) * correction
+            g["var"] += p * (1 - p) * correction
+            g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
+            g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
+            g["s"] += sum(r["seconds"] for r in task_rows) / n
+            g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
+            lang = g["langs"][task_rows[0]["lang"]]
+            lang[0] += p
+            lang[1] += 1
+            g["runs"].append(n)
+            if task_rows[-1].get("context"):
+                g["context"] = task_rows[-1]["context"]
+        groups.append(g)
+    return groups, dropped
+
+
+def print_summary(rows):
     if not rows:
         print("\nno results")
         return
-    langs = sorted({r["lang"] for r in rows}, key=list(LANGS).index)
-    agg = defaultdict(lambda: {"pass": 0, "p1": 0, "n": 0, "pt": 0, "ct": 0, "s": 0.0, "load": 0.0,
-                               **{lang: [0, 0] for lang in langs}})
-    contexts = {}
-    for r in rows:
-        a = agg[(r["endpoint"], r["model"])]
-        a["pass"] += r["passed"]
-        a["p1"] += int(r["passed_on"] == 1)
-        a["n"] += 1
-        a["pt"] += r["prompt_tokens"]
-        a["ct"] += r["completion_tokens"]
-        a["s"] += r["seconds"]
-        a["load"] = max(a["load"], r.get("load_seconds") or 0.0)
-        contexts[(r["endpoint"], r["model"])] = r.get("context") or "unchecked"
-        a[r["lang"]][0] += r["passed"]
-        a[r["lang"]][1] += 1
+    groups, dropped = summarize(rows)
+    repeated = any(n > 1 for g in groups for n in g["runs"])
+    show_settings = len({g["settings"] for g in groups}) > 1
+    langs = sorted({lang for g in groups for lang in g["langs"]}, key=lambda x: list(LANGS).index(x)
+                   if x in LANGS else len(LANGS))
 
-    ew = max(8, *(len(e) for e, _ in agg))
-    head = (f"\n{'endpoint':{ew}} {'model':40} {'pass@1':>6} {'pass@' + str(max_attempts):>6} "
-            + " ".join(f"{lang:>6}" for lang in langs))
-    print(head + f" {'prompt_tok':>10} {'compl_tok':>10} {'sec':>8} {'load':>6}")
-    for (e, m), a in sorted(agg.items(), key=lambda kv: (-kv[1]["pass"], kv[1]["ct"])):
-        per = " ".join(f"{a[lang][0]:>4}/{a[lang][1]}" for lang in langs)
-        print(f"{e:{ew}} {m[:40]:40} {a['p1']:>3}/{a['n']:<2} {a['pass']:>3}/{a['n']:<2} {per} "
-              f"{a['pt']:>10} {a['ct']:>10} {a['s']:>8.1f} {a['load']:>6.1f}")
-    failed = [f"{e}/{m} ({c})" for (e, m), c in contexts.items() if c not in ("ok", "unchecked")]
+    def score(value, var, n):
+        return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
+
+    def lang_cell(value, n):
+        return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
+
+    ew = max(8, *(len(g["endpoint"]) for g in groups))
+    sw = 12 if repeated else 6
+    head = f"\n{'endpoint':{ew}} {'model':40} " + (f"{'settings':12} " if show_settings else "")
+    head += (f"{'runs':>5} " if repeated else "") + f"{'pass@1':>{sw}} {'passed':>{sw}} "
+    print(head + " ".join(f"{lang:>7}" for lang in langs)
+          + f" {'prompt_tok':>10} {'compl_tok':>10} {'sec':>8} {'load':>6}")
+    for g in sorted(groups, key=lambda g: (-g["pass"], -g["p1"], g["ct"])):
+        line = f"{g['endpoint']:{ew}} {g['model'][:40]:40} " + (f"{g['settings']:12} " if show_settings else "")
+        if repeated:
+            lo, hi = min(g["runs"]), max(g["runs"])
+            line += f"{lo if lo == hi else f'{lo}-{hi}':>5} "
+        line += f"{score(g['p1'], g['var1'], g['n']):>{sw}} {score(g['pass'], g['var'], g['n']):>{sw}} "
+        line += " ".join(f"{lang_cell(*g['langs'][lang]) if lang in g['langs'] else '-':>7}" for lang in langs)
+        print(line + f" {g['pt']:>10.0f} {g['ct']:>10.0f} {g['s']:>8.1f} {g['load']:>6.1f}")
+    notes = []
+    if repeated:
+        notes.append("with repeats: mean passes per run ± the standard deviation of one run's score; tokens and "
+                     "seconds are means per run")
+    if dropped:
+        notes.append(f"{dropped} row(s) from older versions of a task or of the benchmark were left out")
+    failed = [f"{g['endpoint']}/{g['model']} ({g['context']})" for g in groups
+              if g["context"] not in ("ok", "unchecked")]
     if failed:
-        print(f"\nwarning: context check failed, results may be cut off: {', '.join(failed)}")
+        notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")
+    for note in notes:
+        print(f"\n{note}")
 
 
 def parse_param(spec):
@@ -847,6 +963,16 @@ def parse_args():
     ap.add_argument("--param", action="append", type=parse_param, default=[], metavar="KEY=VALUE",
                     help="extra request parameter, e.g. top_p=0.9 or seed=1 (VALUE is parsed as JSON when "
                          "possible). Repeatable. Recorded in the results")
+    ap.add_argument("--repeat", type=positive_int, default=1, metavar="K",
+                    help="run every task K times per model, to measure how much results vary (default: 1)")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip runs that already have a finished row with the same settings and task version in "
+                         "the results file; rows that failed on request errors are run again")
+    ap.add_argument("--max-length-finishes", type=positive_int, metavar="K",
+                    help="skip a model's remaining runs after K of its runs ended with a reply cut off at "
+                         "--max-tokens (default: never)")
+    ap.add_argument("--summary", nargs="+", type=Path, metavar="CSV",
+                    help="print the summary table of existing results files and exit (no endpoint needed)")
     ap.add_argument("--no-context-check", dest="context_check", action="store_false",
                     help="skip checking that each model's context holds a worst-case run (saves one long "
                          "prompt per model)")
@@ -857,7 +983,7 @@ def parse_args():
     args = ap.parse_args()
     if not args.endpoints:
         args.endpoints = os.environ.get("LLM_BENCH_ENDPOINTS", "").split()
-    if not args.endpoints and not args.list_tasks:
+    if not args.endpoints and not args.list_tasks and not args.summary:
         ap.error("no endpoint given (e.g. http://localhost:11434/v1 for Ollama, "
                  "http://localhost:1234/v1 for LM Studio)")
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -883,10 +1009,21 @@ def check_results_file(path):
     if header != FIELDS:
         sys.exit(f"{path} has different columns (written by another version?); "
                  f"move it away or use another --tag or --output-dir")
+    try:
+        read_results(path)
+    except (UnicodeDecodeError, ValueError, csv.Error) as e:
+        sys.exit(f"cannot read {path}: {e}")
 
 
 def main():
     args = parse_args()
+    if args.summary:
+        try:
+            rows = [r for path in args.summary for r in read_results(path)]
+        except (OSError, UnicodeDecodeError, ValueError, csv.Error) as e:
+            sys.exit(f"cannot read results: {e}")
+        print_summary(rows)
+        return
     try:
         all_tasks = load_tasks(args.tasks_dir or [DEFAULT_TASKS_DIR])
     except (OSError, UnicodeDecodeError, ValueError) as e:
@@ -916,6 +1053,7 @@ def main():
     check_sandbox()
     args.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     settings = settings_fingerprint(args)
+    args.settings_hash = settings_hash(settings)
     tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
 
     plan = {}
@@ -969,9 +1107,12 @@ def run_all(args, plan, endpoints, tasks, outputs):
         stop.set()
         log("interrupted; results so far are in the CSV file(s)", err=True)
         stop_active_units()
-        print_summary(list(rows), args.attempts)
+        print_summary(list(rows))
         sys.exit(130)
-    print_summary(rows, args.attempts)
+    if args.resume:   # show the complete picture, not just the runs added now
+        rows = [r for name, (csv_path, _) in outputs.items() if csv_path.exists()
+                for r in read_results(csv_path) if r["endpoint"] == name]
+    print_summary(rows)
 
 
 if __name__ == "__main__":

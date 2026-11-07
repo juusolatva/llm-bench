@@ -150,14 +150,14 @@ def test_list_models_unreachable(capsys):
 
 def test_print_summary(capsys):
     rows = [
-        {"endpoint": "a-long-endpoint-name", "model": "m1", "lang": "python", "passed": 1, "passed_on": 1,
+        {"endpoint": "a-long-endpoint-name", "model": "m1", "task": "py_x", "lang": "python", "passed": 1, "passed_on": 1,
          "prompt_tokens": 10, "completion_tokens": 5, "seconds": 1.0},
-        {"endpoint": "a-long-endpoint-name", "model": "m1", "lang": "go", "passed": 0, "passed_on": 0,
+        {"endpoint": "a-long-endpoint-name", "model": "m1", "task": "go_x", "lang": "go", "passed": 0, "passed_on": 0,
          "prompt_tokens": 10, "completion_tokens": 5, "seconds": 1.0},
     ]
-    llm_bench.print_summary(rows, 3)
+    llm_bench.print_summary(rows)
     out = capsys.readouterr().out
-    assert "pass@3" in out and "python" in out and "go" in out
+    assert "pass@1" in out and "passed" in out and "python" in out and "go" in out
     assert "c" not in out.splitlines()[1].split()   # only languages that were run get a column
     assert "a-long-endpoint-name m1" in out
 
@@ -224,3 +224,16 @@ def test_cli_rejects_bad_params(monkeypatch, args):
     with pytest.raises(SystemExit) as exc:
         run_main(monkeypatch, "localhost:1", *args)
     assert exc.value.code == 2
+
+
+def test_cli_summary_mode(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on\ne,m,py_a,python,1,1\ne,m,py_b,python,0,0\n")
+    monkeypatch.delenv("LLM_BENCH_ENDPOINTS", raising=False)
+    run_main(monkeypatch, "--summary", str(path))
+    assert "1/2" in capsys.readouterr().out
+
+
+def test_cli_summary_bad_file(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit, match="cannot read results"):
+        run_main(monkeypatch, "--summary", str(tmp_path / "missing.csv"))
