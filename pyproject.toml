@@ -1,6 +1,6 @@
 [project]
 name = "llm-bench"
-version = "0.3.0"
+version = "0.4.0"
 description = "Benchmark LLMs served over an OpenAI-compatible API on sandboxed coding tasks"
 readme = "README.md"
 license = "MIT"

@@ -30,13 +30,47 @@ def test_parse_endpoint_name_is_path_safe():
     assert "/" not in name
 
 
-def test_extract_code_takes_last_block_and_strips_think():
-    text = "<think>```python\nbad\n```</think>intro\n```python\nfirst\n```\nthen\n```c\nlast\n```"
-    assert llm_bench.extract_code(text) == "last\n"
+def test_extract_code_strips_think():
+    text = "<think>```python\nbad\n```</think>intro\n```python\nfirst\n```"
+    assert llm_bench.extract_code(text, "python") == "first\n"
+
+
+@pytest.mark.parametrize(("text", "want"), [
+    ("reasoning ```python\nbad\n```</think>\n```python\ngood\n```", "good\n"),   # unpaired </think>
+    ("```python\ngood\n```\n<think>```python\ncut off", "good\n"),            # unclosed <think>
+    ("<think>never finished ```python\nbad\n```", ""),
+])
+def test_extract_code_partial_think(text, want):
+    assert llm_bench.extract_code(text, "python") == want
+
+
+def test_extract_code_prefers_matching_language_tag():
+    text = "```bash\npip install nothing here at all\n```\n```py\ncode\n```\nUsage:\n```\nexample()\n```"
+    assert llm_bench.extract_code(text, "python") == "code\n"
+    assert llm_bench.extract_code(text, "rust") == "pip install nothing here at all\n"   # no rust block: longest
+
+
+def test_extract_code_takes_longest_then_last():
+    text = "```go\nfunc Solution() {}\n```\n```go\nx()\n```"
+    assert llm_bench.extract_code(text, "go") == "func Solution() {}\n"
+    assert llm_bench.extract_code("```c\na\n```\n```C\nb\n```", "c") == "b\n"
+
+
+def test_extract_code_fence_details():
+    # Info strings after the tag, indented fences and backticks inside the code.
+    text = "  ```python title=solution.py\n  s = '```'\n  ```"
+    assert llm_bench.extract_code(text, "python") == "  s = '```'\n"
+    assert llm_bench.extract_code("```cpp\n```", "cpp") == ""
 
 
 def test_extract_code_without_fence_returns_text():
-    assert llm_bench.extract_code("<think>x</think>plain") == "plain"
+    assert llm_bench.extract_code("<think>x</think>plain", "python") == "plain"
+    assert llm_bench.extract_code("plain") == "plain"
+
+
+def test_strip_think():
+    assert llm_bench.strip_think("<think>a</think>b<think>c</think>d") == "bd"
+    assert llm_bench.strip_think("no reasoning") == "no reasoning"
 
 
 def test_clip_keeps_head_and_tail():

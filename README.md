@@ -11,10 +11,10 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 | Language | Tasks |
 |---|---|
 | Python | `py_parse_duration`, `py_fix_top_customers`, `py_deep_merge`, `py_retry_decorator` |
-| C | `c_trim`, `c_join_path`, `c_fix_intvec`, `c_parse_kv` (built with ASan + UBSan) |
-| C++ | `cpp_split`, `cpp_top_words`, `cpp_fix_buffer`, `cpp_lru_cache` (built with ASan + UBSan) |
-| Rust | `rust_word_count`, `rust_version`, `rust_fix_inventory`, `rust_csv_line` |
-| Go | `go_reverse`, `go_word_freq`, `go_fix_count_lengths`, `go_kv_http` (run with `-race`) |
+| C | `c_join_path`, `c_parse_kv`, `c_fix_intvec`, `c_eval_expr` (built with ASan + UBSan) |
+| C++ | `cpp_top_words`, `cpp_lru_cache`, `cpp_fix_buffer`, `cpp_interval_set` (built with ASan + UBSan) |
+| Rust | `rust_version`, `rust_csv_line`, `rust_fix_inventory`, `rust_topo_order` |
+| Go | `go_word_freq`, `go_kv_http`, `go_fix_count_lengths`, `go_parallel_map` (run with `-race`) |
 | Bash | `bash_top_words`, `bash_rotate_backups`, `bash_fix_rename`, `bash_access_log` |
 
 The tests check only what the prompt states. Run `./llm_bench.py --list-tasks` to list them.
@@ -25,6 +25,8 @@ Each task is a directory under [`tasks/`](tasks):
 tasks/<lang>/<task>/
   prompt.md          # sent to the model as is
   test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go or test.sh for other languages)
+  reference/
+    solution.py      # a known-correct solution (not sent to the model), named like the model's solution file
 ```
 
 The task name is the language prefix plus the directory name, so `tasks/python/parse_duration` is `py_parse_duration`.
@@ -95,7 +97,8 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 - **Context length.** With the defaults a retry request can need about 25k tokens of context (roughly 1k + 4k per retry + `--max-tokens`). Configure the server for at least 32k. Many servers default to much less and silently truncate the prompt. For example, Ollama uses `OLLAMA_CONTEXT_LENGTH=32768`, and LM Studio sets the context length in the model's load settings. If you can't, lower `--max-tokens` or `--attempts` so the need fits.
 - **Context check.** Before each model's first task, the benchmark loads it with a tiny request (its time goes into `load_seconds`, not the first task) and then checks the context: it measures the model's tokens per word with a short filler prompt, sends a filler prompt of the needed size, and compares the prompt tokens the server reports. A server that truncates reports too few; one that refuses answers with an error. The result is recorded in the `context` column and a failed check is repeated under the summary. It costs one long prompt per model; `--no-context-check` skips it.
 - **One model at a time.** Models are benchmarked one after another. If the server keeps earlier models loaded, the next model may not fit in VRAM and run partly on the CPU, which only affects timing. Let the server evict old models: Ollama with `OLLAMA_MAX_LOADED_MODELS=1`, LM Studio with the auto-evict option for JIT-loaded models.
-- **Thinking models.** `<think>…</think>` blocks are removed before code extraction. Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
+- **Thinking models.** `<think>…</think>` blocks are removed before code extraction, as is everything before a `</think>` without an opening tag (some chat templates put the opening tag in the prompt). Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
+- **Code extraction.** The system prompt asks for exactly one fenced code block. If a reply has several, the longest one tagged with the task's language (for example ` ```python ` or ` ```py `) is used, or the longest of all blocks if none is tagged that way. A reply without a fenced block is used as is.
 
 ## Output
 
@@ -161,7 +164,7 @@ uv run --locked --no-build --group dev pytest -rs
 
 The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They skip themselves where the sandbox isn't available (containers, CI).
 
-To add a task, create its directory under `tasks/`. No code changes are needed. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
+To add a task, create its directory under `tasks/`, including a reference solution. No code changes are needed. `tests/test_reference.py` runs every reference solution through the sandbox and expects it to pass, which catches broken harnesses. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
 
 ## License
 

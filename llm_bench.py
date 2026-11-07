@@ -39,7 +39,7 @@ from typing import NamedTuple
 # --- CONFIGURATION ---
 # Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
 # code extraction, build/test handling), so rows from different versions are never mixed.
-BENCH_VERSION = "0.3.0"
+BENCH_VERSION = "0.4.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
@@ -77,23 +77,24 @@ SYSTEM = (
 )
 
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
-# Per language: task name prefix, solution file, harness file, whether the harness is appended to the
-# solution instead of written as its own file (Rust's #[cfg(test)] module), extra files, build/test commands.
+# Per language: task name prefix, solution file, harness file, code block language tags (preferred by
+# extract_code), whether the harness is appended to the solution instead of written as its own file (Rust's
+# #[cfg(test)] module), extra files, build/test commands.
 LANGS = {
-    "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py",
+    "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py", "tags": ("python", "py", "python3"),
                "cmds": [["python3", "test_solution.py"]]},
-    "c": {"prefix": "c", "sol": "solution.c", "test": "test.c",
+    "c": {"prefix": "c", "sol": "solution.c", "test": "test.c", "tags": ("c", "h"),
           "cmds": [["gcc", "-std=gnu17", "-O1", "-g", "-Wall", *SAN, "solution.c", "test.c", "-o", "t", "-lm"],
                    ["./t"]]},
-    "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp",
+    "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp", "tags": ("cpp", "c++", "cxx", "cc", "hpp", "h++"),
             "cmds": [["g++", "-std=c++17", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"],
                      ["./t"]]},
-    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "append": True,
+    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "tags": ("rust", "rs"), "append": True,
              "cmds": [["rustc", "--edition", "2021", "--test", "-O", "-o", "t", "lib.rs"], ["./t"]]},
-    "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go",
+    "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
            "cmds": [["go", "test", "-race", "-count=1", "."]]},
-    "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh",
+    "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
              "cmds": [["bash", "test.sh"]]},
 }
 
@@ -149,7 +150,9 @@ FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "pa
           "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-CODE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# A fenced block: an opening fence with an optional info string (its first word is the language tag) and a
+# closing fence, each on its own line (indentation allowed).
+CODE_RE = re.compile(r"^[ \t]*```[ \t]*([^\s`]*)[^\n`]*\n(.*?)^[ \t]*```", re.DOTALL | re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 
@@ -211,10 +214,24 @@ def parse_endpoint(spec):
     return name, base
 
 
-def extract_code(text):
+def strip_think(text):
+    """Remove reasoning: <think>...</think> blocks, everything before an unpaired </think> (servers that
+    drop the opening tag) and everything after an unclosed <think> (reasoning cut off by max_tokens)."""
     text = THINK_RE.sub("", text)
+    text = text.rpartition("</think>")[2]
+    return text.partition("<think>")[0]
+
+
+def extract_code(text, lang=None):
+    """The solution in a reply: the longest fenced block tagged with one of the language's tags (any block
+    if none is tagged so), the last one on ties. A reply without a fenced block is taken as code."""
+    text = strip_think(text)
     blocks = CODE_RE.findall(text)
-    return blocks[-1] if blocks else text
+    if not blocks:
+        return text
+    tags = LANGS[lang]["tags"] if lang else ()
+    candidates = [code for tag, code in blocks if tag.lower() in tags] or [code for _, code in blocks]
+    return max(reversed(candidates), key=lambda code: len(code.strip()))
 
 
 # This trusted launcher runs before bwrap, outside its hidden /sys. Verify that
@@ -586,7 +603,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
             break
         adir = taskdir / f"attempt_{attempt}"
-        code = extract_code(text)
+        code = extract_code(text, task["lang"])
         if code.strip():
             passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
         else:
@@ -601,7 +618,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         if finish == "length":  # hit max tokens: counted as failure, no retry
             break
         messages = messages + [
-            {"role": "assistant", "content": THINK_RE.sub("", text).strip()},
+            {"role": "assistant", "content": strip_think(text).strip()},
             {"role": "user", "content": feedback(stage, fail_cmd, fail_out)},
         ]
     result["seconds"] = round(result["seconds"], 2)
