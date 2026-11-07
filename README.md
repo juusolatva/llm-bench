@@ -94,3 +94,7 @@ uv run --group dev pytest -rs
 The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They skip themselves where the sandbox isn't available (containers, CI).
 
 Tasks are defined in `llm_bench.py` as a prompt plus a test harness, and registered in the `TASKS` list. See [AGENTS.md](AGENTS.md) for the conventions.
+
+## License
+
+[MIT](LICENSE)

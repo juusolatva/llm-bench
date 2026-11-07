@@ -3,6 +3,8 @@ name = "llm-bench"
 version = "0.1.0"
 description = "Benchmark LLMs served over an OpenAI-compatible API on sandboxed coding tasks"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = []
 
