@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Overview
 
-`llm_bench.py` is a standard-library-only Python script, and `tasks/` holds the benchmark tasks it loads at startup. It benchmarks LLMs served over an OpenAI-compatible API on coding tasks and builds and tests the generated code in a sandbox. See `README.md` for user-facing documentation; keep it in sync when you change options, output formats, requirements or tasks.
+`llm_bench.py` is a standard-library-only Python script, and `tasks/` holds the benchmark tasks it loads at startup. It benchmarks LLMs served over an OpenAI-compatible API on coding tasks and builds and tests the generated code in a sandbox. See `README.md` for user-facing documentation; keep it in sync when you change options, output formats, requirements or tasks. `GLOSSARY.md` defines the domain terms (task, harness, run, trial, round, attempt, task version, …); use them in code, docs and output, and update it when a term's meaning changes.
 
 Repository layout:
 

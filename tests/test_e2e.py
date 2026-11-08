@@ -37,6 +37,12 @@ def read_rows(path):
         return list(csv.DictReader(f))
 
 
+def trial_dir(task_dir, repeat=1):
+    """The transcript directory runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/ of the only config."""
+    (d,) = task_dir.glob(f"*/repeat_{repeat}")
+    return d
+
+
 def test_feedback_loop_passes_on_second_attempt(monkeypatch, tmp_path, mock_server):
     s = mock_server(models=["test/model", "nomic-embed-text"], replies=[BAD, GOOD], api_key="k")
     monkeypatch.setenv("LLM_BENCH_API_KEY", "k")
@@ -49,7 +55,7 @@ def test_feedback_loop_passes_on_second_attempt(monkeypatch, tmp_path, mock_serv
     assert len(s.requests) == 2
     feedback = s.requests[1]["messages"][-1]["content"]
     assert "got 0, want 5400" in feedback
-    attempt = tmp_path / "runs/mock_x/test_model/py_parse_duration/repeat_1"
+    attempt = trial_dir(tmp_path / "runs/mock_x/test_model/py_parse_duration")
     assert (attempt / "attempt_1/response.md").read_text() == BAD
     assert "[exit 0]" in (attempt / "attempt_2/log.txt").read_text()
 
@@ -134,7 +140,7 @@ def test_appended_harness_language(monkeypatch, tmp_path, mock_server):
     s = mock_server(replies=[RUST_TOPO_ORDER])
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "rust_topo_order", "--attempts", "1")
     (row,) = read_rows(tmp_path / "results_m.csv")
-    log = (tmp_path / "runs/m/test_model/rust_topo_order/repeat_1/attempt_1/log.txt").read_text()
+    log = (trial_dir(tmp_path / "runs/m/test_model/rust_topo_order") / "attempt_1/log.txt").read_text()
     assert row["passed"] == "1", log
     assert "3 passed" in log
 
@@ -172,7 +178,7 @@ def test_time_limit_is_reported(monkeypatch, tmp_path, mock_server):
     first = s.requests[1]["messages"][-1]["content"]
     assert "exceeded the 3 s time limit" in first
     assert "[killed:" in first
-    log = (tmp_path / "runs/m/test_model/py_parse_duration/repeat_1/attempt_1/log.txt").read_text()
+    log = (trial_dir(tmp_path / "runs/m/test_model/py_parse_duration") / "attempt_1/log.txt").read_text()
     assert "[killed: exceeded the 3 s time limit" in log
 
 
@@ -182,9 +188,9 @@ def test_rerun_appends_and_tag_separates_transcripts(monkeypatch, tmp_path, mock
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration")
     assert len(read_rows(tmp_path / "results_m.csv")) == 2
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "-t", "x")
-    assert (tmp_path / "runs/m/test_model/py_parse_duration/repeat_1").is_dir()
-    assert (tmp_path / "runs/m/test_model/py_parse_duration/repeat_2").is_dir()   # re-run: next repeat number
-    assert (tmp_path / "runs/m_x/test_model/py_parse_duration/repeat_1").is_dir()
+    assert trial_dir(tmp_path / "runs/m/test_model/py_parse_duration").is_dir()
+    assert trial_dir(tmp_path / "runs/m/test_model/py_parse_duration", 2).is_dir()   # re-run: next repeat number
+    assert trial_dir(tmp_path / "runs/m_x/test_model/py_parse_duration").is_dir()
 
 
 def test_ctrl_c_stops_promptly(tmp_path, mock_server):

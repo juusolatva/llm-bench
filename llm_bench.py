@@ -4,8 +4,8 @@
 Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM Studio,
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
 Tasks are loaded from tasks/<lang>/<task>/ next to this script (see load_tasks).
-Output: results_<endpoint>.csv (one row per model x task) and runs/<endpoint>/<model>/<task>/
-attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
+Output: results_<endpoint>.csv (one row per trial: one model on one task) and
+runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
 toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils).
 Run with --help for usage.
@@ -47,7 +47,7 @@ DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens mus
 DEFAULT_ATTEMPTS = 3           # 1 = no feedback; N = initial attempt + N-1 attempts with build/test feedback
 MAX_MODEL_ERRORS = 3           # skip the rest of a model after this many request errors in a row
 SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server is unreachable, then give up
-# Context check: a run needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
+# Context check: a trial needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
 # (system + task prompt; each retry adds the previous reply and the clipped build/test output).
 CONTEXT_BASE_TOKENS = 1000
 CONTEXT_PER_RETRY_TOKENS = 4000
@@ -678,7 +678,7 @@ def is_model_error(finish):
 
 
 def run_one_task(label, base, model, task, taskdir, opts, stop):
-    """Run all attempts of one task. Returns the result fields of its CSV row."""
+    """Run one trial: all attempts of one task. Returns the result fields of its CSV row."""
     if taskdir.exists():
         shutil.rmtree(taskdir)
     messages = [
@@ -829,14 +829,14 @@ def config_hash(settings, task):
 
 
 def skipped_result(finish_reason, fail_stage):
-    """The result fields of a run that was skipped without sending a request."""
+    """The result fields of a trial that was skipped without sending a request."""
     return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
 
 
 INT_FIELDS = ("repeat", "passed", "passed_on", "attempts", "prompt_tokens", "completion_tokens")
 FLOAT_FIELDS = ("seconds", "load_seconds")
-# Rows with these finish reasons failed for reasons outside the model's answer; --resume runs them again.
+# Trials with these finish reasons failed for reasons outside the model's reply; --resume runs them again.
 RETRY_FINISHES = ("bad_response", "disconnected", "skipped")
 
 
@@ -864,22 +864,23 @@ def read_results(path):
 
 
 def is_finished(row):
-    """Whether a results row is final; --resume runs rows that failed for reasons outside the model again."""
+    """Whether a results row is final; --resume runs trials that failed for reasons outside the model again."""
     finish = row.get("finish_reason") or ""
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
 
 def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop):
-    """Run every task opts.repeat times for each model of one endpoint (with opts.resume, only the runs not
+    """Run opts.repeat rounds of trials for each model of one endpoint (with opts.resume, only the trials not
     yet finished in out_path). Appends each row to out_path (and to rows) as it completes."""
     existing = []
     if out_path.exists() and out_path.stat().st_size > 0:
         existing = [r for r in read_results(out_path) if r["endpoint"] == name]
-    # Repeat numbers continue after the rows already in the file, so transcripts are never overwritten.
+    # Trial numbers (the repeat column) continue after the rows already in the file, so transcripts are never
+    # overwritten.
     numbered = Counter((r["model"], r["task"], r["config"]) for r in existing)
     finished = Counter((r["model"], r["task"], r["config"]) for r in existing if is_finished(r))
     new_file = not existing and (not out_path.exists() or out_path.stat().st_size == 0)
-    # Rows are written as they complete, so an aborted run keeps every finished model x task.
+    # Rows are written as they complete, so an aborted run keeps every finished trial.
     with open(out_path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
         if new_file:
@@ -890,7 +891,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
         dirs = model_dirs(models)
 
         def record(model, task, result, model_info):
-            """Number the run, then append its row to the results file and to rows."""
+            """Number the trial, then append its row to the results file and to rows."""
             key = (model, task["name"], task["config"])
             numbered[key] += 1
             row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
@@ -902,29 +903,29 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             log(str(row))
 
         def skip_rest(model, todo, why, finish_reason, fail_stage, model_info):
-            """Record the model's remaining runs as skipped with the given finish reason and fail stage."""
-            log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} run(s)", err=True)
+            """Record the model's remaining trials as skipped with the given finish reason and fail stage."""
+            log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} trial(s)", err=True)
             for task in todo:
                 record(model, task, skipped_result(finish_reason, fail_stage), model_info)
 
         try:
             for model in models:
-                # Repeat-major order: one full pass over the tasks finishes before the second one starts.
+                # Round-major order: one round (a trial of every task) finishes before the next one starts.
                 todo = [task for rep in range(opts.repeat) for task in tasks
                         if not opts.resume or finished[(model, task["name"], task["config"])] <= rep]
                 total = opts.repeat * len(tasks)
                 if not todo:
-                    log(f"{name}/{model}: all {total} run(s) already in {out_path}; skipping", err=True)
+                    log(f"{name}/{model}: all {total} trial(s) already in {out_path}; skipping", err=True)
                     continue
                 if len(todo) < total:
-                    log(f"{name}/{model}: resuming, {len(todo)} of {total} run(s) to go", err=True)
+                    log(f"{name}/{model}: resuming, {len(todo)} of {total} trial(s) to go", err=True)
                 load_seconds, context, error = prepare_model(f"{name}/{model}", base, model, opts, stop)
                 model_info = {"load_seconds": load_seconds, "context": context}
                 if error:
                     skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
                     continue
-                model_errors = 0     # consecutive runs that ended in a request-level model error
-                length_finishes = 0  # runs whose last reply hit --max-tokens
+                model_errors = 0     # consecutive trials that ended in a request error
+                length_finishes = 0  # trials whose last reply hit --max-tokens
                 for i, task in enumerate(todo):
                     if model_errors >= MAX_MODEL_ERRORS:
                         skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
@@ -936,7 +937,9 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
                         break
                     repeat = numbered[(model, task["name"], task["config"])] + 1
                     label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    taskdir = runs_dir / dirs[model] / task["name"] / f"repeat_{repeat}"
+                    # Trial numbers restart for each config, so it's part of the path: no trial can replace
+                    # the transcript of another config's trial.
+                    taskdir = runs_dir / dirs[model] / task["name"] / task["config"] / f"repeat_{repeat}"
                     result = run_one_task(label, base, model, task, taskdir, opts, stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
                     length_finishes += result["finish_reason"] == "length"
@@ -947,30 +950,55 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             pass
 
 
+def new_run_id(now=None):
+    """UTC start time with milliseconds, e.g. 20261107T202918.123Z: sorts by time, and runs started in the same
+    second still get different IDs (newest_configs orders task versions by it)."""
+    now = now or datetime.now(UTC)
+    return f"{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}Z"
+
+
+def newest_configs(rows):
+    """{(settings, task): config of the task's newest version}: the config of its rows from the latest run_id
+    (row order breaks ties, e.g. for old files without run_id)."""
+    newest = {}
+    for i, r in enumerate(rows):
+        key = (r.get("settings") or "", r["task"])
+        run_id = r.get("run_id") or ""
+        if run_id.endswith("Z") and "." not in run_id:   # older versions wrote whole seconds
+            run_id = run_id[:-1] + ".000Z"
+        rank = (run_id, i)
+        if key not in newest or rank > newest[key][0]:
+            newest[key] = (rank, r.get("config"))
+    return {key: config for key, (_, config) in newest.items()}
+
+
 def summarize(rows):
-    """Aggregate rows per (endpoint, model, settings). For each task only the rows with its newest config
-    (the last one seen) count; several rows of a task are repeats. Returns (groups, dropped row count)."""
+    """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
+    (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
+    newest version is scored without that task. Several rows of a task are trials in different rounds.
+    Returns (groups, dropped row count)."""
+    newest = newest_configs(rows)
     tasks_by_group = {}
     dropped = 0
     for r in rows:
-        group = tasks_by_group.setdefault((r["endpoint"], r["model"], r.get("settings") or ""), {})
-        config, task_rows = group.get(r["task"], (None, []))
-        if config is not None and config != r.get("config"):
-            dropped += len(task_rows)
-            task_rows = []
-        group[r["task"]] = (r.get("config"), [*task_rows, r])
+        settings = r.get("settings") or ""
+        if r.get("config") != newest[(settings, r["task"])]:
+            dropped += 1
+            continue
+        group = tasks_by_group.setdefault((r["endpoint"], r["model"], settings), {})
+        group.setdefault(r["task"], []).append(r)
     groups = []
     for (endpoint, model, settings), tasks in tasks_by_group.items():
         g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
-             "runs": [], "context": "unchecked"}
-        for task_rows in (task_rows for _, task_rows in tasks.values()):
+             "trials": [], "tasks": set(tasks), "context": "unchecked"}
+        for task_rows in tasks.values():
             n = len(task_rows)
             p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
             p = sum(r["passed"] for r in task_rows) / n
             g["p1"] += p1
             g["pass"] += p
-            # Variance of one run's score: a sum of per-task Bernoulli variables (unbiased estimate).
+            # Variance of one round's score: a sum of per-task Bernoulli variables (unbiased estimate).
             correction = n / (n - 1) if n > 1 else 0.0
             g["var1"] += p1 * (1 - p1) * correction
             g["var"] += p * (1 - p) * correction
@@ -981,53 +1009,71 @@ def summarize(rows):
             lang = g["langs"][task_rows[0]["lang"]]
             lang[0] += p
             lang[1] += 1
-            g["runs"].append(n)
+            g["trials"].append(n)
             if task_rows[-1].get("context"):
                 g["context"] = task_rows[-1]["context"]
         groups.append(g)
     return groups, dropped
 
 
+def task_set_gaps(groups):
+    """[(group, sorted missing tasks)] for models scored on fewer tasks than others with the same settings."""
+    by_settings = defaultdict(set)
+    for g in groups:
+        by_settings[g["settings"]] |= g["tasks"]
+    return [(g, sorted(by_settings[g["settings"]] - g["tasks"])) for g in groups
+            if by_settings[g["settings"]] - g["tasks"]]
+
+
 def print_summary(rows):
-    """Print the per-endpoint and per-model pass table for result rows (means and spread over repeats)."""
+    """Print the per-endpoint and per-model pass table for result rows (means and spread over rounds)."""
     if not rows:
         print("\nno results")
         return
     groups, dropped = summarize(rows)
-    repeated = any(n > 1 for g in groups for n in g["runs"])
+    repeated = any(n > 1 for g in groups for n in g["trials"])
     show_settings = len({g["settings"] for g in groups}) > 1
     langs = sorted({lang for g in groups for lang in g["langs"]}, key=lambda x: list(LANGS).index(x)
                    if x in LANGS else len(LANGS))
 
     def score(value, var, n):
-        """A pass count: mean±sd/n with repeats, otherwise count/n."""
+        """A pass count: mean±sd/n with several rounds, otherwise count/n."""
         return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
     def lang_cell(value, n):
-        """A per-language pass count: the mean with repeats, otherwise the count, out of n."""
+        """A per-language pass count: the mean with several rounds, otherwise the count, out of n."""
         return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
     ew = max(8, *(len(g["endpoint"]) for g in groups))
     sw = 12 if repeated else 6
     head = f"\n{'endpoint':{ew}} {'model':40} " + (f"{'settings':12} " if show_settings else "")
-    head += (f"{'runs':>5} " if repeated else "") + f"{'pass@1':>{sw}} {'passed':>{sw}} "
+    head += (f"{'rounds':>6} " if repeated else "") + f"{'pass@1':>{sw}} {'passed':>{sw}} "
     print(head + " ".join(f"{lang:>7}" for lang in langs)
           + f" {'prompt_tok':>10} {'compl_tok':>10} {'sec':>8} {'load':>6}")
     for g in sorted(groups, key=lambda g: (-g["pass"], -g["p1"], g["ct"])):
         line = f"{g['endpoint']:{ew}} {g['model'][:40]:40} " + (f"{g['settings']:12} " if show_settings else "")
         if repeated:
-            lo, hi = min(g["runs"]), max(g["runs"])
-            line += f"{lo if lo == hi else f'{lo}-{hi}':>5} "
+            lo, hi = min(g["trials"]), max(g["trials"])
+            line += f"{lo if lo == hi else f'{lo}-{hi}':>6} "
         line += f"{score(g['p1'], g['var1'], g['n']):>{sw}} {score(g['pass'], g['var'], g['n']):>{sw}} "
         line += " ".join(f"{lang_cell(*g['langs'][lang]) if lang in g['langs'] else '-':>7}" for lang in langs)
         print(line + f" {g['pt']:>10.0f} {g['ct']:>10.0f} {g['s']:>8.1f} {g['load']:>6.1f}")
     notes = []
     if repeated:
-        notes.append("with repeats: mean passes per run ± the standard deviation of one run's score; tokens and "
-                     "seconds are means per run")
+        notes.append("with several rounds: mean passes per round ± the standard deviation of one round's score; "
+                     "tokens and seconds are means per round")
     if dropped:
-        notes.append(f"{dropped} row(s) from older versions of a task or of the benchmark were left out")
-    failed = [f"{g['endpoint']}/{g['model']} ({g['context']})" for g in groups
+        notes.append(f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
+                     "are scored on each task's newest version")
+    def name(g):
+        """A table row in a note: endpoint/model, plus [settings] when the table has a settings column."""
+        return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if show_settings else "")
+
+    missing = [f"{name(g)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
+    if missing:
+        notes.append("warning: models with the same settings were scored on different tasks, so their scores "
+                     f"aren't comparable: {', '.join(missing)}")
+    failed = [f"{name(g)} ({g['context']})" for g in groups
               if g["context"] not in ("ok", "unchecked")]
     if failed:
         notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")
@@ -1103,17 +1149,18 @@ def parse_args():
                     help="extra request parameter, e.g. top_p=0.9 or seed=1 (VALUE is parsed as JSON when "
                          "possible). Repeatable. Recorded in the results")
     ap.add_argument("--repeat", type=positive_int, default=1, metavar="K",
-                    help="run every task K times per model, to measure how much results vary (default: 1)")
+                    help="run K rounds: K trials of every task per model, to measure how much results vary "
+                         "(default: 1)")
     ap.add_argument("--resume", action="store_true",
-                    help="skip runs that already have a finished row with the same settings and task version in "
-                         "the results file; rows that failed on request errors are run again")
+                    help="skip trials that already have a finished row with the same settings and task version in "
+                         "the results file; trials that failed on request errors are run again")
     ap.add_argument("--max-length-finishes", type=positive_int, metavar="K",
-                    help="skip a model's remaining runs after K of its runs ended with a reply cut off at "
+                    help="skip a model's remaining trials after K of its trials ended with a reply cut off at "
                          "--max-tokens (default: never)")
     ap.add_argument("--summary", nargs="+", type=Path, metavar="CSV",
                     help="print the summary table of existing results files and exit (no endpoint needed)")
     ap.add_argument("--no-context-check", dest="context_check", action="store_false",
-                    help="skip checking that each model's context holds a worst-case run (saves one long "
+                    help="skip checking that each model's context holds a worst-case trial (saves one long "
                          "prompt per model)")
     ap.add_argument("-o", "--output-dir", type=Path, default=Path("."), metavar="DIR",
                     help="where results_<endpoint>.csv and runs/ are written (default: current directory)")
@@ -1191,7 +1238,7 @@ def main():
 
     check_toolchains(tasks)
     check_sandbox()
-    args.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    args.run_id = new_run_id()
     settings = settings_fingerprint(args)
     args.settings_hash = settings_hash(settings)
     tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
@@ -1249,7 +1296,7 @@ def run_all(args, plan, endpoints, tasks, outputs):
         stop_active_units()
         print_summary(list(rows))
         sys.exit(130)
-    if args.resume:   # show the complete picture, not just the runs added now
+    if args.resume:   # show the complete picture, not just the trials added now
         rows = [r for name, (csv_path, _) in outputs.items() if csv_path.exists()
                 for r in read_results(csv_path) if r["endpoint"] == name]
     print_summary(rows)

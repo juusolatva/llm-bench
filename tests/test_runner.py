@@ -111,7 +111,7 @@ def test_no_code_reply(mock_server, tmp_path):
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
     assert (row["passed"], row["attempts"], row["fail_stage"]) == (0, 2, "no_code")
     assert "did not contain any code" in s.requests[1]["messages"][-1]["content"]
-    assert (tmp_path / "runs/test_model/py_t0/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
+    assert (tmp_path / "runs/test_model/py_t0/cfg/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
 
 
 def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
@@ -121,7 +121,7 @@ def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
     assert len(dirs) == 2
     assert all(d.startswith("_foo-") for d in dirs)
     for d in dirs:
-        assert (tmp_path / "runs" / d / "py_t0/repeat_1/attempt_1/response.md").is_file()
+        assert (tmp_path / "runs" / d / "py_t0/cfg/repeat_1/attempt_1/response.md").is_file()
 
 
 def test_results_are_appended(mock_server, tmp_path):
@@ -220,7 +220,7 @@ def test_repeat_runs_each_task_k_times_repeat_major(mock_server, tmp_path):
     s = mock_server(replies=[""] * 4)
     rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], repeat=2)
     assert [(r["task"], r["repeat"]) for r in rows] == [("py_t0", 1), ("py_t1", 1), ("py_t0", 2), ("py_t1", 2)]
-    assert (tmp_path / "runs/test_model/py_t0/repeat_2/attempt_1").is_dir()
+    assert (tmp_path / "runs/test_model/py_t0/cfg/repeat_2/attempt_1").is_dir()
     assert len(s.probes) == 3   # one warm-up and context check per model, not per repeat
 
 
@@ -256,6 +256,16 @@ def test_resume_ignores_rows_with_other_config(mock_server, tmp_path):
     assert len(run_endpoint(s, tmp_path, tasks=changed, resume=True)) == 1
 
 
+def test_transcripts_of_other_configs_are_kept(mock_server, tmp_path):
+    s = mock_server(replies=["first", "second"])
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    rows = run_endpoint(s, tmp_path, tasks=[{**TASKS[0], "config": "other"}])   # e.g. --attempts changed
+    assert rows[0]["repeat"] == 1   # numbering restarts for the new config, but in its own directory
+    for config, reply in (("cfg", "first"), ("other", "second")):
+        response = tmp_path / f"runs/test_model/py_t0/{config}/repeat_1/attempt_1/response.md"
+        assert response.read_text() == reply
+
+
 def test_length_budget_skips_rest_of_model(mock_server, tmp_path):
     long = Reply(body=json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}).encode())
     s = mock_server(models=["a", "b"], replies=[long, long, long, long])
@@ -274,9 +284,9 @@ def row(task, passed_on, **extra):
 def test_summarize_repeats():
     rows = [row("py_a", 1), row("py_a", 2), row("py_b", 0), row("py_b", 0)]
     (g,) = llm_bench.summarize(rows)[0]
-    assert (g["n"], g["p1"], g["pass"], g["runs"]) == (2, 0.5, 1.0, [2, 2])   # py_a passed twice, once at attempt 1
-    assert g["var1"] == pytest.approx(0.5)   # p=0.5 over 2 runs: 0.25 * 2/1
-    assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)   # means per run, summed over tasks
+    assert (g["n"], g["p1"], g["pass"], g["trials"]) == (2, 0.5, 1.0, [2, 2])   # py_a passed twice, once at attempt 1
+    assert g["var1"] == pytest.approx(0.5)   # p=0.5 over 2 trials: 0.25 * 2/1
+    assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)   # means per round, summed over tasks
 
 
 def test_summarize_keeps_newest_task_version_and_splits_settings():
@@ -286,12 +296,81 @@ def test_summarize_keeps_newest_task_version_and_splits_settings():
     assert sorted((g["settings"], g["pass"]) for g in groups) == [("s1", 1.0), ("s2", 1.0)]
 
 
+def test_summarize_scores_all_models_on_the_same_task_version():
+    # Model a only has trials of py_a's old version; model b was re-run after the task changed.
+    rows = [row("py_a", 1, model="a", config="old", run_id="20261101T000000Z"),
+            row("py_b", 1, model="a", run_id="20261101T000000Z"),
+            row("py_a", 0, model="b", config="old", run_id="20261101T000000Z"),
+            row("py_a", 1, model="b", config="new", run_id="20261102T000000Z")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert dropped == 2
+    assert {g["model"]: (g["n"], g["pass"]) for g in groups} == {"a": (1, 1.0), "b": (1, 1.0)}
+
+
+def test_summarize_newest_task_version_is_the_latest_run_not_the_last_row():
+    # Results files can be passed in any order: the newest version is the one from the latest run.
+    rows = [row("py_a", 1, model="a", config="new", run_id="20261102T000000Z"),
+            row("py_a", 0, model="b", config="old", run_id="20261101T000000Z"),
+            row("py_b", 1, model="b", run_id="20261101T000000Z")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert dropped == 1
+    assert {g["model"]: g["n"] for g in groups} == {"a": 1, "b": 1}   # b keeps only py_b
+
+
+def test_newest_configs():
+    rows = [row("py_a", 0, config="v2", run_id="20261102T000000.000Z"),
+            row("py_a", 0, config="v1", run_id="20261101T000000.000Z"),   # older run, later row
+            row("py_a", 0, config="v0"),                                    # old file without run_id
+            row("py_b", 0, config="b1"), row("py_b", 0, config="b2"),       # no run_id: row order decides
+            row("py_a", 0, config="s2", settings="s2")]
+    assert llm_bench.newest_configs(rows) == {("s1", "py_a"): "v2", ("s1", "py_b"): "b2", ("s2", "py_a"): "s2"}
+
+
+def test_newest_configs_ranks_whole_second_run_ids_first_within_their_second():
+    rows = [row("py_a", 0, config="new", run_id="20261107T202918.123Z"),
+            row("py_a", 0, config="old", run_id="20261107T202918Z")]   # older version wrote whole seconds
+    assert llm_bench.newest_configs(rows) == {("s1", "py_a"): "new"}
+
+
+def test_new_run_id_has_milliseconds():
+    from datetime import UTC, datetime
+    assert llm_bench.new_run_id(datetime(2026, 11, 7, 20, 29, 18, 123456, UTC)) == "20261107T202918.123Z"
+    assert llm_bench.new_run_id(datetime(2026, 11, 7, 20, 29, 18, 999, UTC)) == "20261107T202918.000Z"
+
+
+def test_summarize_omits_models_without_current_trials():
+    rows = [row("py_a", 1, model="a", config="old", run_id="1"), row("py_a", 1, model="b", config="new", run_id="2")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert (dropped, [g["model"] for g in groups]) == (1, ["b"])
+
+
 def test_print_summary_with_repeats(capsys):
     llm_bench.print_summary([row("py_a", 1), row("py_a", 0), row("py_b", 1), row("py_b", 1)])
     out = capsys.readouterr().out
     assert "1.5±0.7/2" in out
-    assert "runs" in out
-    assert "mean passes per run" in out
+    assert "rounds" in out
+    assert "mean passes per round" in out
+
+
+def test_print_summary_warns_about_different_task_sets(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="a"), row("py_b", 1, model="a"), row("py_a", 1, model="b"),
+                             row("py_c", 1, model="c"), row("py_a", 1, model="d", settings="s2")])
+    out = capsys.readouterr().out
+    assert ("warning: models with the same settings were scored on different tasks, so their scores aren't "
+            "comparable: e/a [s1] (missing py_c), e/b [s1] (missing py_b, py_c), e/c [s1] (missing py_a, py_b)") in out
+
+
+def test_print_summary_warnings_name_the_settings_when_they_differ(capsys):
+    llm_bench.print_summary([row("py_a", 1), row("py_a", 1, settings="s2", context="short:4000"),
+                             row("py_b", 1, settings="s2", model="n")])
+    out = capsys.readouterr().out
+    assert "comparable: e/m [s2] (missing py_b), e/n [s2] (missing py_a)" in out
+    assert "results may be cut off: e/m [s2] (short:4000)" in out
+
+
+def test_print_summary_no_task_set_warning_when_tasks_match(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="a"), row("py_a", 0, model="b")])
+    assert "different tasks" not in capsys.readouterr().out
 
 
 def test_read_results_accepts_old_files(tmp_path):
