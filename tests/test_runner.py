@@ -3,9 +3,11 @@ import csv
 import json
 import socket
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import MockServer as llm_bench_mock_server
 from conftest import Reply
 
 import llm_bench
@@ -36,7 +38,7 @@ def chat(server, **kwargs):
 ])
 def test_chat_classifies_failures(mock_server, reply, error):
     s = mock_server(replies=[reply])
-    assert chat(s) == ("", None, {}, error)
+    assert chat(s)[:4] == ("", None, {}, error)
 
 
 def test_chat_timeout(mock_server):
@@ -46,7 +48,9 @@ def test_chat_timeout(mock_server):
 
 def test_chat_success(mock_server):
     s = mock_server(replies=["hello"])
-    assert chat(s) == ("hello", "stop", {"prompt_tokens": 10, "completion_tokens": 5}, None)
+    text, finish, usage, error, seconds = chat(s)
+    assert (text, finish, usage, error) == ("hello", "stop", {"prompt_tokens": 10, "completion_tokens": 5}, None)
+    assert 0 < seconds < 5   # duration of the request
 
 
 def free_port():
@@ -61,6 +65,24 @@ def test_chat_server_down_retries_then_gives_up(monkeypatch, capsys):
     with pytest.raises(llm_bench.ServerDown):
         llm_bench.chat("label", url, {}, options, stop)
     assert capsys.readouterr().err.count("retrying in 0s") == 2
+
+
+def test_chat_request_seconds_exclude_server_retry_waits(monkeypatch):
+    real_http_json, calls = llm_bench.http_json, []
+
+    def flaky_http_json(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionRefusedError("server restarting")
+        return real_http_json(*args, **kwargs)
+
+    with llm_bench_mock_server(replies=["hello"]) as s:
+        monkeypatch.setattr(llm_bench, "http_json", flaky_http_json)
+        monkeypatch.setattr(llm_bench, "server_reachable", lambda *a: False)
+        monkeypatch.setattr(llm_bench, "SERVER_RETRY_DELAYS_S", (0.5,))
+        text, _, _, error, seconds = chat(s)
+    assert (text, error) == ("hello", None)
+    assert seconds < 0.4   # the 0.5 s wait for the server isn't part of the request
 
 
 def test_chat_server_down_interrupted(monkeypatch):
@@ -711,3 +733,31 @@ def test_summarize_throughput_mixes_old_rows_without_usage_seconds():
             row("py_b", 1, completion_tokens=100, seconds=40.0, usage_seconds=10.0)]
     (g,) = llm_bench.summarize(rows)[0]
     assert g["tps"] == pytest.approx(10.0)
+
+
+def test_usage_seconds_use_the_request_time_from_chat(monkeypatch, mock_server, tmp_path):
+    real_chat = llm_bench.chat
+
+    def chat_with_slow_server(*args):   # 0.3 s of waiting for the server around a request it says took 0.0004 s
+        time.sleep(0.3)
+        text, finish, usage, error, _ = real_chat(*args)
+        return text, finish, usage, error, 0.0004
+
+    s = mock_server(replies=[usage_reply()])
+    monkeypatch.setattr(llm_bench, "chat", chat_with_slow_server)
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["seconds"] >= 0.3                 # all waiting, as before
+    assert row["usage_seconds"] == 0.0004         # only the request, not rounded away
+
+
+def test_usage_seconds_count_replies_that_report_zero_tokens(mock_server, tmp_path):
+    zero, measured = usage_reply(completion_tokens=0), usage_reply()
+    zero.sleep = 0.3
+    s = mock_server(replies=[zero, measured])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["usage_seconds"] >= 0.3   # a reported 0 is a measurement, not a missing count
+
+
+def test_summarize_throughput_unknown_when_no_tokens_were_generated():
+    (g,) = llm_bench.summarize([row("py_a", 0, completion_tokens=0, seconds=3.0, usage_seconds=3.0)])[0]
+    assert g["tps"] is None

@@ -620,13 +620,15 @@ def server_reachable(base, api_key):
 
 
 def chat(label, base, payload, opts, stop):
-    """POST one chat completion. Returns (text, finish_reason, usage, error).
+    """POST one chat completion. Returns (text, finish_reason, usage, error, seconds); seconds is the duration of
+    the last HTTP request alone, without the waits for an unreachable server.
     error is None for a usable reply; otherwise it is the row's finish_reason for a failure that is the
     model's (or its loader's) problem rather than the server's: "timeout", "http_<code>", "bad_response"
     or "disconnected". If the server itself is unreachable, wait and retry the same request; raise
     ServerDown when it stays down, Interrupted if the run is interrupted while waiting."""
     for delay in (*SERVER_RETRY_DELAYS_S, None):
         try:
+            t0 = time.time()
             resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
         except urllib.error.HTTPError as e:   # the server answered: model failed to load, crashed, prompt too long
             try:
@@ -634,16 +636,16 @@ def chat(label, base, payload, opts, stop):
             except (OSError, http.client.HTTPException):
                 detail = ""
             log(f"{label}: HTTP {e.code}: {detail or e.reason}", err=True)
-            return "", None, {}, f"http_{e.code}"
+            return "", None, {}, f"http_{e.code}", time.time() - t0
         except TimeoutError:   # raised directly only while waiting for the reply: the model was too slow
             log(f"{label}: no reply within {opts.timeout}s", err=True)
-            return "", None, {}, "timeout"
+            return "", None, {}, "timeout", time.time() - t0
         except (OSError, http.client.HTTPException) as e:
             # Refused, reset or dropped connection. If the server still answers, the model process
             # (not the server) died; otherwise wait for the server to come back.
             if server_reachable(base, opts.api_key):
                 log(f"{label}: connection lost ({e}), server still reachable", err=True)
-                return "", None, {}, "disconnected"
+                return "", None, {}, "disconnected", time.time() - t0
             if delay is None:
                 raise ServerDown(str(e)) from e
             log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
@@ -652,7 +654,8 @@ def chat(label, base, payload, opts, stop):
             continue
         except ValueError as e:   # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
             log(f"{label}: bad response: {e}", err=True)
-            return "", None, {}, "bad_response"
+            return "", None, {}, "bad_response", time.time() - t0
+        seconds = time.time() - t0
         try:
             choice = resp["choices"][0]
             text = choice["message"].get("content") or ""
@@ -663,8 +666,8 @@ def chat(label, base, payload, opts, stop):
                 raise TypeError(f"usage is {type(usage).__name__}")
         except (KeyError, IndexError, TypeError, AttributeError) as e:
             log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
-            return "", None, {}, "bad_response"
-        return text, choice.get("finish_reason"), usage, None
+            return "", None, {}, "bad_response", seconds
+        return text, choice.get("finish_reason"), usage, None, seconds
     raise AssertionError("unreachable")
 
 
@@ -702,10 +705,9 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         log(f"{label}: attempt {attempt}/{opts.attempts}, waiting for response...", err=True)
         t0 = time.time()
         try:
-            text, finish, usage, error = chat(label, base, payload, opts, stop)
+            text, finish, usage, error, request_seconds = chat(label, base, payload, opts, stop)
         finally:
-            elapsed = time.time() - t0
-            result["seconds"] += elapsed
+            result["seconds"] += time.time() - t0   # all waiting, including for an unreachable server
         result["attempts"] = attempt
         if error:
             result["finish_reason"], result["fail_stage"] = error, "request"
@@ -713,8 +715,10 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         result["finish_reason"] = finish
         result["prompt_tokens"] += usage.get("prompt_tokens") or 0
         result["completion_tokens"] += usage.get("completion_tokens") or 0
-        if usage.get("completion_tokens"):   # throughput is measured over the replies that report their tokens
-            result["usage_seconds"] += elapsed
+        completion_tokens = usage.get("completion_tokens")
+        if type(completion_tokens) is int and completion_tokens >= 0:   # reported, even if 0: a measurement
+            # Throughput's time base: the requests of the replies that report their tokens, no server waits.
+            result["usage_seconds"] += request_seconds
         # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
         # the completion tokens of all replies, on another scale. None is an empty cell.
         reasoning = reasoning_tokens(usage)
@@ -745,7 +749,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             {"role": "user", "content": feedback(stage, fail_cmd, fail_out)},
         ]
     result["seconds"] = round(result["seconds"], 2)
-    result["usage_seconds"] = round(result["usage_seconds"], 2)
+    result["usage_seconds"] = round(result["usage_seconds"], 4)   # 0.1 ms: fast replies don't round to 0
     return result
 
 
@@ -771,7 +775,7 @@ def filler(words):
 
 
 def probe(label, base, model, content, opts, stop):
-    """Send a one-token request (warm-up and context check); returns chat()'s (text, finish, usage, error)."""
+    """Send a one-token request (warm-up and context check); returns chat()'s (text, finish, usage, error, seconds)."""
     payload = {**opts.params, "model": model, "max_tokens": 1, "messages": [{"role": "user", "content": content}]}
     return chat(label, base, payload, opts, stop)
 
@@ -782,7 +786,7 @@ def check_context(label, base, model, opts, stop, base_tokens):
     the server reports. Returns "ok", "short:<reported tokens>", "rejected:<error>" or "unchecked"."""
     need = context_needed(opts)
     prefix = "Reply with OK. Ignore the following text.\n\n"
-    _, _, usage, error = probe(label, base, model, prefix + filler(CONTEXT_CALIBRATION_WORDS), opts, stop)
+    _, _, usage, error, _ = probe(label, base, model, prefix + filler(CONTEXT_CALIBRATION_WORDS), opts, stop)
     sample_tokens = usage.get("prompt_tokens")
     if error and error.startswith("http_"):   # even the short calibration prompt doesn't fit
         log(f"{label}: warning: the server rejected a ~{CONTEXT_CALIBRATION_WORDS}-word prompt ({error}); the "
@@ -796,7 +800,7 @@ def check_context(label, base, model, opts, stop, base_tokens):
     words = math.ceil((need - base_tokens) / per_word)
     expected = base_tokens + per_word * words
     log(f"{label}: checking that the context holds {need} tokens...", err=True)
-    _, _, usage, error = probe(label, base, model, prefix + filler(words), opts, stop)
+    _, _, usage, error, _ = probe(label, base, model, prefix + filler(words), opts, stop)
     if error:
         log(f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
             f"smaller. Raise the server's context length or lower --max-tokens / --attempts", err=True)
@@ -815,7 +819,7 @@ def prepare_model(label, base, model, opts, stop):
     context size unless disabled. Returns (load_seconds, context, error)."""
     log(f"{label}: loading...", err=True)
     t0 = time.time()
-    _, _, usage, error = probe(label, base, model, "Reply with OK.", opts, stop)
+    _, _, usage, error, _ = probe(label, base, model, "Reply with OK.", opts, stop)
     load_seconds = round(time.time() - t0, 2)
     if error:
         return load_seconds, "unchecked", error
@@ -1032,7 +1036,8 @@ def summarize(rows):
         measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
                      and ended_with_reply(r) and r["completion_tokens"] > 0]
         usage_seconds = sum(sec for _, sec in measured)
-        g["tps"] = sum(tokens for tokens, _ in measured) / usage_seconds if usage_seconds else None
+        tokens = sum(tokens for tokens, _ in measured)
+        g["tps"] = tokens / usage_seconds if usage_seconds and tokens else None
         # Every trial with a reply needs a count, including one that got replies and then a request error (a
         # request error ends a trial, so every attempt before the last got a reply): its completion tokens count,
         # so its unknown reasoning tokens can't count as zero.
