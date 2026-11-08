@@ -13,7 +13,7 @@ bash "$SOL" 'my dir' txt log > out 2> err < /dev/null || fail "$case1: exit stat
 [ ! -s err ] || fail "$case1: unexpected stderr: $(cat err)"
 (cd 'my dir' && find . -type f | sort) > got
 printf '%s\n' './a file.log' './b.log' './c.md' './sub dir/z.txt' './x.txt.bak' './y.txt.log' > want
-cmp -s got want || { diff want got >&2; fail "$case1: wrong files in 'my dir' afterwards (diff above: < want, > got)"; }
+cmp -s got want || { diff want got >&2; fail "$case1: wrong files in 'my dir' afterwards (diff above: < want, > got; as before, files in subdirectories are not renamed and only the final .txt of a name changes)"; }
 
 case2="bash solution.sh empty txt log, with no files in the directory 'empty'"
 bash "$SOL" empty txt log > out 2> err < /dev/null

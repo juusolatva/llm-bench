@@ -43,7 +43,7 @@ except KeyError:
 else:
     raise AssertionError(f"{case}, calling the decorated f a second time: returned {got!r}, want the last KeyError re-raised")
 assert len(errs) == 3 and close(sleeps, [1, 3]), \
-    f"{case}, calling the decorated f a second time: {len(errs)} calls with time.sleep calls {sleeps}, want 3 calls and [1, 3] (each call starts again with delay)"
+    f"{case}, calling the decorated f a second time: {len(errs)} calls with time.sleep calls {sleeps}, want 3 calls and [1, 3] (each call of the decorated function starts again with the initial delay)"
 
 sleeps.clear(); n = []
 @retry(times=5, exceptions=(ValueError,), delay=1)

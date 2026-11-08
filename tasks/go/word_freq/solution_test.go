@@ -47,13 +47,15 @@ func TestLongLine(t *testing.T) {
 }
 
 func TestHugeLines(t *testing.T) {
-	// A 2 MiB line of short words, then a 100 KiB word on a line of its own.
+	// Lines far above 64 KiB: a 2100000-byte line of short words, then a 100000-byte word on a line of its own.
+	// The prompt sets no upper limit on line length.
 	long := strings.Repeat("ab ", 700000)
 	huge := strings.Repeat("x", 100000)
 	got, err := WordFreq(strings.NewReader(long + "\n" + huge + "\n"))
 	if err != nil || got["ab"] != 700000 || got[huge] != 1 || len(got) != 2 {
 		t.Fatalf("WordFreq(strings.Repeat(\"ab \", 700000) + \"\\n\" + strings.Repeat(\"x\", 100000) + \"\\n\"): "+
-			"got %d for \"ab\", %d for the 100000-letter word and %d distinct words, error %v; want 700000, 1, 2, nil",
+			"(lines of 2100000 and 100000 bytes) got %d for \"ab\", %d for the 100000-letter word and %d distinct words, "+
+			"error %v; want 700000, 1, 2, nil",
 			got["ab"], got[huge], len(got), err)
 	}
 }

@@ -4,7 +4,7 @@
 int parse_kv(const char *line, char *key, size_t keysz, char *val, size_t valsz);
 
 static int fails;
-/* Print s as a C string literal, so control characters such as "\r", "\n" and "\t" in inputs are visible. */
+/* Print s in double quotes with control characters escaped (\n, \r, \t, \xNN), so whitespace in inputs is visible. */
 static void harness_put_escaped(const char *s) {
     fputc('"', stderr);
     for (; *s; s++) {
@@ -25,8 +25,13 @@ static void t(const char *line, size_t ks, size_t vs, int want, const char *wk, 
     if (r == 1 && (!memchr(k, '\0', ks) || !memchr(v, '\0', vs))) {
         fputs("parse_kv(", stderr);
         harness_put_escaped(line);
-        fprintf(stderr, ", key, %zu, val, %zu): got 1, but %s is not NUL-terminated within its %zu bytes (want %d)\n", ks,
-                vs, memchr(k, '\0', ks) ? "val" : "key", memchr(k, '\0', ks) ? vs : ks, want);
+        fprintf(stderr, ", key, %zu, val, %zu): got 1 with %s not NUL-terminated within its %zu bytes, want %d", ks, vs,
+                memchr(k, '\0', ks) ? "val" : "key", memchr(k, '\0', ks) ? vs : ks, want);
+        if (want == 1) {
+            fputs(" key=", stderr); harness_put_escaped(wk);
+            fputs(" val=", stderr); harness_put_escaped(wv);
+        }
+        fputc('\n', stderr);
         fails++;
     } else if (r != want || (want == 1 && (strcmp(k, wk) != 0 || strcmp(v, wv) != 0))) {
         fputs("parse_kv(", stderr);

@@ -11,10 +11,10 @@ static std::string harness_text(const std::optional<int>& o) { return o ? std::t
 
 // Runs calls on an LruCache<K, int> and records them, so a failure can show every call made so far.
 template <typename K>
-struct HarnessCache {
+struct harness_cache {
     LruCache<K, int> cache;
     std::string log;
-    explicit HarnessCache(std::size_t capacity) : cache(capacity), log("LruCache(" + std::to_string(capacity) + ")") {}
+    explicit harness_cache(std::size_t capacity) : cache(capacity), log("LruCache(" + std::to_string(capacity) + ")") {}
     void fail(const std::string& what) {
         std::fprintf(stderr, "FAIL: after %s: %s\n", log.c_str(), what.c_str());
         std::exit(1);
@@ -37,7 +37,7 @@ struct HarnessCache {
 };
 
 int main() {
-    HarnessCache<std::string> c(2);
+    harness_cache<std::string> c(2);
     c.size(0);
     c.get("a", std::nullopt);
     c.put("a", 1);
@@ -54,7 +54,7 @@ int main() {
     c.get("d", 4);
     c.size(2);
 
-    HarnessCache<std::string> u(2);
+    harness_cache<std::string> u(2);
     u.put("a", 1);
     u.put("b", 2);
     u.put("b", 9);                                     // update at capacity: nothing is evicted
@@ -62,15 +62,15 @@ int main() {
     u.get("b", 9);
     u.size(2);
 
-    HarnessCache<int> one(1);
+    harness_cache<int> one(1);
     one.put(1, 1);
     one.put(2, 2);
     one.get(1, std::nullopt);
     one.get(2, 2);
     one.size(1);
 
-    // Timing: put(i, i) for i < n; every third step also get(i - capacity / 2), which is still cached.
-    // The elapsed time is checked during the loop, so an O(capacity) get or put fails here quickly.
+    // Timing: put(i, i) for i < n; from i = capacity / 2 on, every third step also get(i - capacity / 2), which is
+    // still cached. The elapsed time is checked every 1000 puts, so an O(capacity) get or put fails here quickly.
     const int capacity = 200000, n = 600000;
     const double limit = 15;
     auto t0 = std::chrono::steady_clock::now();

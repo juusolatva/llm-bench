@@ -6,7 +6,7 @@
 
 #define HARNESS_CHECK(c, ...) do { if (!(c)) { std::fprintf(stderr, "FAIL: " __VA_ARGS__); std::fputc('\n', stderr); std::exit(1); } } while (0)
 
-// b[i] for failure messages, or -1 if i is out of range (the solution's size() may be wrong).
+// b[i] as an int for failure messages; -1 if i >= b.size() (the solution's size() may be wrong).
 static int harness_at(const Buffer& b, std::size_t i) { return i < b.size() ? b[i] : -1; }
 
 int main() {
