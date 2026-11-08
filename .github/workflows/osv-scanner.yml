@@ -13,9 +13,10 @@ on:
 
 permissions: {}
 
+# One group per event type, so a push, scheduled or manual scan of main never cancels or replaces another kind.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 jobs:
   scan-scheduled:
@@ -48,3 +49,27 @@ jobs:
         --no-resolve
         -r
         ./
+
+  # osv-scanner-reusable-pr.yml writes the base scan to an untracked old-results.json and then runs
+  # `git checkout -f` on the PR, so a PR that commits its own old-results.json replaces the baseline and hides
+  # the vulnerabilities it adds. This job fails on such files. It doesn't use `needs:` on scan-pr (a skipped
+  # required check counts as passing); make both checks required instead.
+  guard-osv-results:
+    name: Guard OSV result files
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Refuse committed OSV result files
+        run: |
+          hits=$(git ls-files | grep -E '(^|/)[^/]*(old-results|new-results)\.json$|\.sarif$' || true)
+          if [ -n "$hits" ]; then
+            while IFS= read -r f; do
+              echo "::error file=${f}::Reserved for OSV-Scanner results in CI; do not commit it."
+            done <<< "$hits"
+            exit 1
+          fi

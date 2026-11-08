@@ -63,6 +63,12 @@ uv run --locked --no-build --group dev pytest
 - `ruff format` isn't enforced. Don't reformat the whole file in an unrelated change.
 - pytest collects only from `tests/` (`testpaths`), so Python harnesses under `tasks/` (named `test_solution.py`) are never run as tests themselves.
 
+## CI
+
+- `.github/workflows/`: `ci.yml` (ruff + pytest on Python 3.13 and 3.14), `sonarqube.yml` (SonarQube Cloud analysis, configured in `sonar-project.properties`; automatic analysis is off) and `osv-scanner.yml` (OSV-Scanner on `uv.lock`).
+- Pin actions to full commit SHAs with the version in a comment, set `persist-credentials: false` on checkouts, and check workflow changes with `actionlint` and `zizmor --persona=auditor`.
+- Don't commit files named `*old-results.json`, `*new-results.json` or `*.sarif`: the OSV PR scan writes its baseline to these paths, and the `guard-osv-results` job fails a PR that tracks one.
+
 ## Future plans
 
 Planned, not started. Discuss the design with the maintainer before implementing.
