@@ -3,9 +3,11 @@ import csv
 import json
 import socket
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import MockServer as llm_bench_mock_server
 from conftest import Reply
 
 import llm_bench
@@ -36,7 +38,7 @@ def chat(server, **kwargs):
 ])
 def test_chat_classifies_failures(mock_server, reply, error):
     s = mock_server(replies=[reply])
-    assert chat(s) == ("", None, {}, error)
+    assert chat(s)[:4] == ("", None, {}, error)
 
 
 def test_chat_timeout(mock_server):
@@ -46,7 +48,9 @@ def test_chat_timeout(mock_server):
 
 def test_chat_success(mock_server):
     s = mock_server(replies=["hello"])
-    assert chat(s) == ("hello", "stop", {"prompt_tokens": 10, "completion_tokens": 5}, None)
+    text, finish, usage, error, seconds = chat(s)
+    assert (text, finish, usage, error) == ("hello", "stop", {"prompt_tokens": 10, "completion_tokens": 5}, None)
+    assert 0 < seconds < 5   # duration of the request
 
 
 def free_port():
@@ -61,6 +65,24 @@ def test_chat_server_down_retries_then_gives_up(monkeypatch, capsys):
     with pytest.raises(llm_bench.ServerDown):
         llm_bench.chat("label", url, {}, options, stop)
     assert capsys.readouterr().err.count("retrying in 0s") == 2
+
+
+def test_chat_request_seconds_exclude_server_retry_waits(monkeypatch):
+    real_http_json, calls = llm_bench.http_json, []
+
+    def flaky_http_json(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionRefusedError("server restarting")
+        return real_http_json(*args, **kwargs)
+
+    with llm_bench_mock_server(replies=["hello"]) as s:
+        monkeypatch.setattr(llm_bench, "http_json", flaky_http_json)
+        monkeypatch.setattr(llm_bench, "server_reachable", lambda *a: False)
+        monkeypatch.setattr(llm_bench, "SERVER_RETRY_DELAYS_S", (0.5,))
+        text, _, _, error, seconds = chat(s)
+    assert (text, error) == ("hello", None)
+    assert seconds < 0.4   # the 0.5 s wait for the server isn't part of the request
 
 
 def test_chat_server_down_interrupted(monkeypatch):
@@ -386,3 +408,365 @@ def test_read_results_rejects_other_csv(tmp_path):
     path.write_text("a,b\n1,2\n")
     with pytest.raises(ValueError, match="not a results file"):
         llm_bench.read_results(path)
+
+
+def usage_reply(text="", **usage):
+    return Reply(body=json.dumps({"choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                                  "usage": {"prompt_tokens": 10, "completion_tokens": 5, **usage}}).encode())
+
+
+def test_reasoning_tokens_are_summed_over_attempts(mock_server, tmp_path):
+    s = mock_server(replies=[usage_reply(completion_tokens_details={"reasoning_tokens": 7}),
+                             usage_reply(completion_tokens_details={"reasoning_tokens": 3})])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["reasoning_tokens"] == 10
+    assert read_csv(tmp_path / "results.csv")[0]["reasoning_tokens"] == "10"
+
+
+@pytest.mark.parametrize("usage", [
+    {},                                                       # not reported
+    {"completion_tokens_details": None},
+    {"completion_tokens_details": "lots"},                    # malformed: ignored, not a bad response
+    {"completion_tokens_details": {"reasoning_tokens": "7"}},
+    {"completion_tokens_details": {"reasoning_tokens": True}},
+])
+def test_reasoning_tokens_empty_when_not_reported(mock_server, tmp_path, usage):
+    s = mock_server(replies=[usage_reply(**usage)])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert (row["finish_reason"], row["reasoning_tokens"]) == ("stop", None)
+    assert read_csv(tmp_path / "results.csv")[0]["reasoning_tokens"] == ""
+
+
+@pytest.mark.parametrize("reported", [(None, 4), (4, None)])
+def test_reasoning_tokens_empty_unless_every_reply_reports_them(mock_server, tmp_path, reported):
+    # A partial sum would sit next to the completion tokens of all replies, on another scale.
+    s = mock_server(replies=[usage_reply() if n is None else usage_reply(completion_tokens_details={"reasoning_tokens": n})
+                             for n in reported])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert (row["attempts"], row["reasoning_tokens"]) == (2, None)
+
+
+def test_skipped_trials_have_no_reasoning_tokens(mock_server, tmp_path):
+    s = mock_server(replies=[Reply(status=500, body=b"{}")] * 3)
+    rows = run_endpoint(s, tmp_path)
+    assert {r["reasoning_tokens"] for r in rows} == {None}
+
+
+def test_read_results_reasoning_tokens(tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on,reasoning_tokens\n"
+                    "e,m,py_a,python,1,1,12\ne,m,py_b,python,1,1,\n")
+    assert [r["reasoning_tokens"] for r in llm_bench.read_results(path)] == [12, None]
+
+
+def test_check_results_file_upgrades_older_columns(tmp_path, capsys):
+    old = [f for f in llm_bench.FIELDS if f != "reasoning_tokens"]
+    path = tmp_path / "results.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=old)
+        w.writeheader()
+        w.writerow({k: "" for k in old} | {"endpoint": "e", "model": "m", "task": "py_a", "lang": "python",
+                                           "passed": "1", "passed_on": "1", "completion_tokens": "5"})
+    llm_bench.check_results_file(path)
+    assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
+    (r,) = read_csv(path)
+    assert (r["model"], r["completion_tokens"], r["reasoning_tokens"]) == ("m", "5", "")
+    assert "upgraded" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == [path]   # no temp file left behind
+
+
+def test_check_results_file_refuses_unreadable_old_file(tmp_path):
+    path = tmp_path / "results.csv"
+    path.write_text("endpoint,model,task\ne,m,py_a\n")   # known columns, but not a results file
+    with pytest.raises(SystemExit, match="cannot read"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == "endpoint,model,task\ne,m,py_a\n"
+
+
+def test_summarize_throughput_counts_only_trials_with_a_reply():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=10.0),
+            row("py_b", 0, completion_tokens=50, seconds=5.0, finish_reason="oversized"),   # a reply, just too long
+            row("py_c", 0, completion_tokens=0, seconds=30.0, finish_reason="timeout"),
+            row("py_d", 0, completion_tokens=0, seconds=2.0, finish_reason="http_500"),
+            row("py_e", 0, completion_tokens=0, seconds=0.0, finish_reason="skipped")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["tps"] == pytest.approx(10.0)   # 150 tokens in 15 s
+
+
+def test_summarize_throughput_unknown_without_replies():
+    (g,) = llm_bench.summarize([row("py_a", 0, completion_tokens=0, seconds=30.0, finish_reason="timeout")])[0]
+    assert g["tps"] is None
+
+
+def test_summarize_reasoning_tokens_mean_per_round():
+    rows = [row("py_a", 1, reasoning_tokens=20), row("py_a", 1, reasoning_tokens=10),
+            row("py_b", 1, reasoning_tokens=4),
+            row("py_b", 0, reasoning_tokens=None, completion_tokens=0, finish_reason="timeout"),   # no reply
+            row("py_a", 1, model="n", reasoning_tokens=None)]
+    groups = {g["model"]: g for g in llm_bench.summarize(rows)[0]}
+    assert groups["m"]["rt"] == pytest.approx(17.0)   # py_a: mean 15; py_b: (4 + 0) / 2, like completion tokens
+    assert groups["n"]["rt"] is None
+
+
+def test_summarize_reasoning_tokens_unknown_unless_every_reply_reports_them():
+    # e.g. an upgraded old file topped up with a round from a server that reports them
+    rows = [row("py_a", 1, reasoning_tokens=None), row("py_a", 1, reasoning_tokens=400)]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["rt"] is None
+
+
+def test_summarize_throughput_skips_replies_without_token_usage():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=10.0),
+            row("py_b", 1, completion_tokens=0, seconds=30.0)]   # the server reported no usage
+    groups = llm_bench.summarize(rows + [row("py_a", 1, model="n", completion_tokens=0)])[0]
+    assert {g["model"]: g["tps"] for g in groups} == {"m": pytest.approx(10.0), "n": None}
+
+
+def test_summarize_per_task_counts():
+    rows = [row("py_a", 1), row("py_a", 2), row("py_a", 0), row("go_b", 0, lang="go")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["per_task"] == {"py_a": {"lang": "python", "trials": 3, "passed": 2, "passed_on_first": 1},
+                             "go_b": {"lang": "go", "trials": 1, "passed": 0, "passed_on_first": 0}}
+
+
+def test_print_summary_table_shows_throughput(capsys):
+    llm_bench.print_summary([row("py_a", 1, completion_tokens=100, seconds=4.0)])
+    head, line = capsys.readouterr().out.strip().splitlines()[:2]
+    assert "tok/s" in head.split()
+    assert "reason_tok" not in head   # no row reports reasoning tokens
+    assert line.split()[-2:] == ["25.0", "2.0"]   # tok/s, load
+
+
+def test_print_summary_table_shows_reasoning_tokens_when_reported(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="a", reasoning_tokens=40), row("py_a", 1, model="b")])
+    lines = capsys.readouterr().out.strip().splitlines()
+    cells = {line.split()[1]: line.split() for line in lines[1:3]}
+    reason = lines[0].split().index("reason_tok")
+    assert (cells["a"][reason], cells["b"][reason]) == ("40", "-")
+
+
+def test_print_summary_markdown(capsys):
+    llm_bench.print_summary([row("py_a", 1, config="old"), row("py_a", 1)], fmt="markdown")
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert lines[0].startswith("| endpoint | model | pass@1 | passed | python |")
+    assert lines[1].startswith("| --- | --- | ---: | ---: | ---: |")
+    assert lines[2].startswith("| e | m | 1/1 | 1/1 | 1/1 |")
+    assert "row(s) from older versions" in lines[-1]   # notes follow the table as paragraphs
+    assert lines[3] == ""
+
+
+def test_print_summary_markdown_escapes_pipes(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="org|model")], fmt="markdown")
+    assert "| org\\|model |" in capsys.readouterr().out
+
+
+def test_print_summary_csv(capsys):
+    rows = [row("go_b", 0, lang="go", completion_tokens=900, seconds=2.0, config="old"),   # left out
+            row("py_a", 1, completion_tokens=100, seconds=4.0, reasoning_tokens=30),
+            row("py_a", 0, completion_tokens=100, seconds=4.0, reasoning_tokens=10),
+            row("go_b", 1, lang="go", completion_tokens=100, seconds=2.0, reasoning_tokens=6)]
+    llm_bench.print_summary(rows, fmt="csv")
+    out, err = capsys.readouterr()
+    (rec,) = csv.DictReader(out.splitlines())
+    assert rec == {"endpoint": "e", "model": "m", "settings": "s1", "tasks": "2", "rounds_min": "1",
+                   "rounds_max": "2", "pass1": "1.5", "pass1_sd": "0.707", "passed": "1.5", "passed_sd": "0.707",
+                   "python": "0.5", "python_tasks": "1", "go": "1.0", "go_tasks": "1", "prompt_tokens": "20.0",
+                   "completion_tokens": "200.0", "reasoning_tokens": "26.0", "seconds": "6.0",
+                   "tok_per_s": "30.0", "load_seconds": "2.0"}
+    assert "row(s) from older versions" in err   # notes go to stderr, so stdout stays a CSV file
+
+
+def test_print_summary_csv_single_round_has_no_spread(capsys):
+    llm_bench.print_summary([row("py_a", 0, completion_tokens=0, finish_reason="timeout")], fmt="csv")
+    (rec,) = csv.DictReader(capsys.readouterr().out.splitlines())
+    assert (rec["pass1_sd"], rec["passed_sd"], rec["reasoning_tokens"], rec["tok_per_s"]) == ("", "", "", "")
+
+
+PER_TASK_ROWS = [row("py_a", 1, model="a"), row("py_a", 0, model="a"), row("go_b", 2, lang="go", model="a"),
+                 row("py_a", 1, model="b")]
+
+
+def test_print_summary_per_task_table(capsys):
+    llm_bench.print_summary(PER_TASK_ROWS, per_task=True)
+    out = capsys.readouterr().out
+    lines = out[out.index("\ntask"):].strip().splitlines()
+    assert lines[0].split() == ["task", "e/a", "e/b"]   # models in the summary's order
+    assert lines[1].split() == ["py_a", "1/2", "1/1"]   # tasks in language order
+    assert lines[2].split() == ["go_b", "1/1", "-"]
+
+
+def test_print_summary_per_task_markdown(capsys):
+    llm_bench.print_summary(PER_TASK_ROWS, fmt="markdown", per_task=True)
+    out = capsys.readouterr().out
+    assert "| task | e/a | e/b |\n| --- | ---: | ---: |\n| py_a | 1/2 | 1/1 |\n| go_b | 1/1 | - |" in out
+
+
+def test_print_summary_per_task_csv(capsys):
+    llm_bench.print_summary(PER_TASK_ROWS, fmt="csv", per_task=True)
+    recs = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+    assert [(r["model"], r["task"], r["lang"], r["trials"], r["passed"], r["passed_on_first"]) for r in recs] == [
+        ("a", "py_a", "python", "2", "1", "1"), ("a", "go_b", "go", "1", "1", "0"),
+        ("b", "py_a", "python", "1", "1", "1")]
+    assert list(recs[0]) == ["endpoint", "model", "settings", "task", "lang", "trials", "passed", "passed_on_first"]
+
+
+def test_print_summary_no_results_csv(capsys):
+    llm_bench.print_summary([], fmt="csv")
+    out, err = capsys.readouterr()
+    assert (out, err.strip()) == ("", "no results")
+
+
+def write_old_results(path, header, *lines):
+    path.write_text(",".join(header) + "\n" + "".join(line + "\n" for line in lines))
+
+
+def test_check_results_file_refuses_duplicate_columns(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on", "seconds", "seconds"],
+                      "e,m,py_a,python,1,1,1.5,2.5")
+    before = path.read_text()
+    with pytest.raises(SystemExit, match="different columns"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == before
+
+
+def test_check_results_file_refuses_upgrade_of_rows_with_extra_cells(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1,extra")
+    before = path.read_text()
+    with pytest.raises(SystemExit, match="cannot upgrade"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == before
+    assert list(tmp_path.iterdir()) == [path]   # temp file removed
+
+
+def test_upgrade_results_file_ignores_planted_temp_symlink(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1")
+    (tmp_path / "results.csv.upgrade").symlink_to(victim)
+    llm_bench.check_results_file(path)
+    assert victim.read_text() == "keep me"
+    assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
+
+
+def test_summarize_reasoning_tokens_unknown_when_an_error_ended_trial_had_replies():
+    # py_b got a 100-token reply without reasoning usage, then a request error: its completion tokens count, so
+    # its unknown reasoning tokens can't count as zero.
+    rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40),
+            row("py_b", 0, completion_tokens=100, reasoning_tokens=None, attempts=2, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert (g["ct"], g["rt"]) == (200, None)
+
+
+def test_summarize_reasoning_tokens_unknown_when_an_error_followed_a_reply_without_usage():
+    # Attempt 1 got a reply without any usage (0 tokens), attempt 2 a request error: attempts > 1 shows the reply.
+    rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40),
+            row("py_b", 0, completion_tokens=0, reasoning_tokens=None, attempts=2, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["rt"] is None
+
+
+def test_summarize_reasoning_tokens_ignore_trials_without_any_reply():
+    rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40, attempts=1),
+            row("py_b", 0, completion_tokens=0, reasoning_tokens=None, attempts=1, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["rt"] == pytest.approx(40.0)
+
+
+def test_upgrade_keeps_file_permissions(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1")
+    path.chmod(0o644)
+    llm_bench.check_results_file(path)
+    assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
+def test_check_results_file_refuses_upgrade_of_short_rows(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python")
+    before = path.read_text()
+    with pytest.raises(SystemExit, match="fewer cells than the header"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+NO_USAGE = json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}).encode()
+
+
+def test_usage_seconds_count_only_replies_that_report_usage(mock_server, tmp_path):
+    measured = usage_reply()
+    measured.sleep = 0.1
+    s = mock_server(replies=[Reply(body=NO_USAGE, sleep=0.5), measured])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["seconds"] >= 0.6
+    assert 0.1 <= row["usage_seconds"] < 0.5   # only the second, measured reply
+    assert float(read_csv(tmp_path / "results.csv")[0]["usage_seconds"]) == row["usage_seconds"]
+
+
+def test_usage_seconds_zero_without_usage_or_reply(mock_server, tmp_path):
+    s = mock_server(replies=[Reply(body=NO_USAGE), Reply(status=500, body=b"{}")])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert (row["finish_reason"], row["usage_seconds"]) == ("http_500", 0.0)
+
+
+def test_read_results_usage_seconds_empty_in_old_rows(tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on,usage_seconds\ne,m,py_a,python,1,1,2.5\ne,m,py_b,python,1,1,\n")
+    assert [r["usage_seconds"] for r in llm_bench.read_results(path)] == [2.5, None]
+
+
+def test_summarize_throughput_uses_usage_seconds():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=40.0, usage_seconds=10.0),   # 30 s reply without usage
+            row("py_b", 0, completion_tokens=50, seconds=1805.0, usage_seconds=5.0, attempts=2,
+                finish_reason="timeout"),   # a measured reply, then a timeout
+            row("py_c", 0, completion_tokens=0, seconds=2.0, usage_seconds=0.0, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["tps"] == pytest.approx(10.0)   # 150 tokens in 15 measured seconds
+
+
+def test_summarize_throughput_mixes_old_rows_without_usage_seconds():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=10.0, usage_seconds=None),   # old row: falls back
+            row("py_b", 1, completion_tokens=100, seconds=40.0, usage_seconds=10.0)]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["tps"] == pytest.approx(10.0)
+
+
+def test_usage_seconds_use_the_request_time_from_chat(monkeypatch, mock_server, tmp_path):
+    real_chat = llm_bench.chat
+
+    def chat_with_slow_server(*args):   # 0.3 s of waiting for the server around a request it says took 0.0004 s
+        time.sleep(0.3)
+        text, finish, usage, error, _ = real_chat(*args)
+        return text, finish, usage, error, 0.0004
+
+    s = mock_server(replies=[usage_reply()])
+    monkeypatch.setattr(llm_bench, "chat", chat_with_slow_server)
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["seconds"] >= 0.3                 # all waiting, as before
+    assert row["usage_seconds"] == 0.0004         # only the request, not rounded away
+
+
+def test_usage_seconds_count_replies_that_report_zero_tokens(mock_server, tmp_path):
+    zero, measured = usage_reply(completion_tokens=0), usage_reply()
+    zero.sleep = 0.3
+    s = mock_server(replies=[zero, measured])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["usage_seconds"] >= 0.3   # a reported 0 is a measurement, not a missing count
+
+
+def test_summarize_throughput_unknown_when_no_tokens_were_generated():
+    (g,) = llm_bench.summarize([row("py_a", 0, completion_tokens=0, seconds=3.0, usage_seconds=3.0)])[0]
+    assert g["tps"] is None
+
+
+def test_durations_ignore_wall_clock_changes(monkeypatch, mock_server, tmp_path):
+    readings = iter(range(10**9, 0, -1000))   # the wall clock jumps back 1000 s on every reading
+    monkeypatch.setattr(llm_bench.time, "time", lambda: next(readings))
+    s = mock_server(replies=[usage_reply()])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert 0 <= row["usage_seconds"] <= row["seconds"] + 0.005 < 5   # seconds is rounded to 0.01 s, usage_seconds to 0.1 ms
+    assert 0 <= row["load_seconds"] < 5
