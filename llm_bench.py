@@ -995,8 +995,10 @@ def summarize(rows):
     """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
     (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
     newest version is scored without that task. Several rows of a task are trials in different rounds.
-    Throughput ("tps") is completion tokens per request second over the trials that ended with a reply; reasoning
-    tokens ("rt") are a mean per round over the trials that reported them (None when none did).
+    Throughput ("tps") is completion tokens per request second over the trials that ended with a reply that
+    reported token usage (a reply has at least one token, so 0 means the server didn't say); None without any.
+    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that ended with
+    a reply reported them (otherwise None: a partial count would be on another scale than completion tokens).
     Returns (groups, dropped row count)."""
     newest = newest_configs(rows)
     tasks_by_group = {}
@@ -1014,8 +1016,12 @@ def summarize(rows):
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
              "trials": [], "tasks": set(tasks), "context": "unchecked", "rt": None, "per_task": {}}
         replied = [r for task_rows in tasks.values() for r in task_rows if ended_with_reply(r)]
-        reply_seconds = sum(r["seconds"] for r in replied)
-        g["tps"] = sum(r["completion_tokens"] for r in replied) / reply_seconds if reply_seconds else None
+        counted = [r for r in replied if r["completion_tokens"] > 0]
+        reply_seconds = sum(r["seconds"] for r in counted)
+        g["tps"] = sum(r["completion_tokens"] for r in counted) / reply_seconds if reply_seconds else None
+        if replied and all(r.get("reasoning_tokens") is not None for r in replied):
+            g["rt"] = sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
+                          for task_rows in tasks.values())
         for task, task_rows in tasks.items():
             n = len(task_rows)
             p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
@@ -1029,9 +1035,6 @@ def summarize(rows):
             g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
             g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
             g["s"] += sum(r["seconds"] for r in task_rows) / n
-            reasoning = [r["reasoning_tokens"] for r in task_rows if r.get("reasoning_tokens") is not None]
-            if reasoning:
-                g["rt"] = (g["rt"] or 0.0) + sum(reasoning) / len(reasoning)
             g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
                                    "passed": sum(r["passed"] for r in task_rows),
                                    "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
@@ -1334,7 +1337,7 @@ def check_results_file(path):
         return
     with open(path, newline="") as f:
         header = next(csv.reader(f), [])
-    if header != FIELDS and not set(header) <= set(FIELDS):
+    if header != FIELDS and (len(set(header)) != len(header) or not set(header) <= set(FIELDS)):
         sys.exit(f"{path} has different columns (written by another version?); "
                  f"move it away or use another --tag or --output-dir")
     try:
@@ -1342,18 +1345,29 @@ def check_results_file(path):
     except (ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot read {path}: {e}")
     if header != FIELDS:
-        upgrade_results_file(path)
+        try:
+            upgrade_results_file(path)
+        except (OSError, ValueError, csv.Error) as e:
+            sys.exit(f"cannot upgrade {path} to the current columns: {e}")
 
 
 def upgrade_results_file(path):
     """Rewrite a results file with the current columns, keeping every cell; columns it lacks stay empty. The
-    new file replaces the old one only once it's complete."""
-    tmp = path.with_name(path.name + ".upgrade")
-    with open(path, newline="") as src, open(tmp, "w", newline="") as dst:
-        w = csv.DictWriter(dst, fieldnames=FIELDS, restval="")
-        w.writeheader()
-        w.writerows(csv.DictReader(src))
-    os.replace(tmp, path)
+    new file (a fresh temp file, never an existing path) replaces the old one only once it's complete; on any
+    error the old file is left as it was."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".upgrade")
+    try:
+        with os.fdopen(fd, "w", newline="") as dst, open(path, newline="") as src:
+            w = csv.DictWriter(dst, fieldnames=FIELDS, restval="")
+            w.writeheader()
+            for line, row in enumerate(csv.DictReader(src), start=2):
+                if None in row:   # DictReader's key for cells beyond the header
+                    raise ValueError(f"line {line} has more cells than the header")
+                w.writerow(row)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
     log(f"upgraded {path} to the current columns (new ones are empty in its existing rows)", err=True)
 
 

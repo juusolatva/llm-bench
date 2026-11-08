@@ -475,11 +475,26 @@ def test_summarize_throughput_unknown_without_replies():
 
 def test_summarize_reasoning_tokens_mean_per_round():
     rows = [row("py_a", 1, reasoning_tokens=20), row("py_a", 1, reasoning_tokens=10),
-            row("py_b", 1, reasoning_tokens=4), row("py_b", 1, reasoning_tokens=None),
+            row("py_b", 1, reasoning_tokens=4),
+            row("py_b", 0, reasoning_tokens=None, completion_tokens=0, finish_reason="timeout"),   # no reply
             row("py_a", 1, model="n", reasoning_tokens=None)]
     groups = {g["model"]: g for g in llm_bench.summarize(rows)[0]}
-    assert groups["m"]["rt"] == pytest.approx(19.0)   # py_a: mean 15, py_b: mean of the reported trials, 4
+    assert groups["m"]["rt"] == pytest.approx(17.0)   # py_a: mean 15; py_b: (4 + 0) / 2, like completion tokens
     assert groups["n"]["rt"] is None
+
+
+def test_summarize_reasoning_tokens_unknown_unless_every_reply_reports_them():
+    # e.g. an upgraded old file topped up with a round from a server that reports them
+    rows = [row("py_a", 1, reasoning_tokens=None), row("py_a", 1, reasoning_tokens=400)]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["rt"] is None
+
+
+def test_summarize_throughput_skips_replies_without_token_usage():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=10.0),
+            row("py_b", 1, completion_tokens=0, seconds=30.0)]   # the server reported no usage
+    groups = llm_bench.summarize(rows + [row("py_a", 1, model="n", completion_tokens=0)])[0]
+    assert {g["model"]: g["tps"] for g in groups} == {"m": pytest.approx(10.0), "n": None}
 
 
 def test_summarize_per_task_counts():
@@ -524,14 +539,14 @@ def test_print_summary_csv(capsys):
     rows = [row("go_b", 0, lang="go", completion_tokens=900, seconds=2.0, config="old"),   # left out
             row("py_a", 1, completion_tokens=100, seconds=4.0, reasoning_tokens=30),
             row("py_a", 0, completion_tokens=100, seconds=4.0, reasoning_tokens=10),
-            row("go_b", 1, lang="go", completion_tokens=100, seconds=2.0)]
+            row("go_b", 1, lang="go", completion_tokens=100, seconds=2.0, reasoning_tokens=6)]
     llm_bench.print_summary(rows, fmt="csv")
     out, err = capsys.readouterr()
     (rec,) = csv.DictReader(out.splitlines())
     assert rec == {"endpoint": "e", "model": "m", "settings": "s1", "tasks": "2", "rounds_min": "1",
                    "rounds_max": "2", "pass1": "1.5", "pass1_sd": "0.707", "passed": "1.5", "passed_sd": "0.707",
                    "python": "0.5", "python_tasks": "1", "go": "1.0", "go_tasks": "1", "prompt_tokens": "20.0",
-                   "completion_tokens": "200.0", "reasoning_tokens": "20.0", "seconds": "6.0",
+                   "completion_tokens": "200.0", "reasoning_tokens": "26.0", "seconds": "6.0",
                    "tok_per_s": "30.0", "load_seconds": "2.0"}
     assert "row(s) from older versions" in err   # notes go to stderr, so stdout stays a CSV file
 
@@ -574,3 +589,38 @@ def test_print_summary_no_results_csv(capsys):
     llm_bench.print_summary([], fmt="csv")
     out, err = capsys.readouterr()
     assert (out, err.strip()) == ("", "no results")
+
+
+def write_old_results(path, header, *lines):
+    path.write_text(",".join(header) + "\n" + "".join(line + "\n" for line in lines))
+
+
+def test_check_results_file_refuses_duplicate_columns(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on", "seconds", "seconds"],
+                      "e,m,py_a,python,1,1,1.5,2.5")
+    before = path.read_text()
+    with pytest.raises(SystemExit, match="different columns"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == before
+
+
+def test_check_results_file_refuses_upgrade_of_rows_with_extra_cells(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1,extra")
+    before = path.read_text()
+    with pytest.raises(SystemExit, match="cannot upgrade"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == before
+    assert list(tmp_path.iterdir()) == [path]   # temp file removed
+
+
+def test_upgrade_results_file_ignores_planted_temp_symlink(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1")
+    (tmp_path / "results.csv.upgrade").symlink_to(victim)
+    llm_bench.check_results_file(path)
+    assert victim.read_text() == "keep me"
+    assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
