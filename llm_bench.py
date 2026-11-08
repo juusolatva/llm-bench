@@ -171,11 +171,22 @@ def safe_name(name):
 
 
 def model_dirs(models):
-    """Transcript directory names for model IDs: safe_name(ID), plus "-" and a short hash of the ID for IDs
-    whose safe names would collide (".foo" and "_foo", "a/b" and "a_b"), so no model overwrites another's."""
-    counts = Counter(safe_name(m) for m in models)
-    return {m: safe_name(m) if counts[safe_name(m)] == 1
-            else f"{safe_name(m)}-{hashlib.sha256(m.encode()).hexdigest()[:8]}" for m in models}
+    """Transcript directory names for model IDs, unique per endpoint: safe_name(ID), or for IDs whose names
+    would collide (".foo" and "_foo", "a/b" and "a_b", or an ID that equals another's hashed name), that plus
+    "-" and a hash of the ID, lengthened until every name is unique. No model can then delete or overwrite
+    another model's transcripts."""
+    models = list(dict.fromkeys(models))
+    names = {m: safe_name(m) for m in models}
+    for length in (8, 16, 64):
+        taken = Counter(names.values())
+        if all(n == 1 for n in taken.values()):
+            break
+        for m in models:
+            if taken[names[m]] > 1:
+                names[m] = f"{safe_name(m)}-{hashlib.sha256(m.encode()).hexdigest()[:length]}"
+    if len(set(names.values())) != len(names):   # only if two different IDs had the same SHA-256
+        raise ValueError("cannot give every model a unique directory name")
+    return names
 
 
 PRINT_LOCK = threading.Lock()

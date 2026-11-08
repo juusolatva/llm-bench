@@ -47,6 +47,14 @@ def test_model_dirs_disambiguate_collisions():
     assert llm_bench.model_dirs([".foo", "_foo"]) == {k: dirs[k] for k in (".foo", "_foo")}   # deterministic
 
 
+def test_model_dirs_unique_even_against_hashed_names():
+    import hashlib
+    tricky = "a_b-" + hashlib.sha256(b"a/b").hexdigest()[:8]   # equals the hashed name "a/b" would get
+    dirs = llm_bench.model_dirs(["a/b", "a_b", tricky])
+    assert len(set(dirs.values())) == 3, dirs
+    assert llm_bench.model_dirs(["x", "x"]) == {"x": "x"}
+
+
 def test_extract_code_strips_think():
     text = "<think>```python\nbad\n```</think>intro\n```python\nfirst\n```"
     assert llm_bench.extract_code(text, "python") == "first\n"

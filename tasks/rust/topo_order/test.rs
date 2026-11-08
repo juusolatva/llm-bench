@@ -7,6 +7,15 @@ mod harness_tests {
         assert!(got.as_deref() == Ok(want), "topo_order({}, {:?}) = {:?}, want Ok({:?})", n, edges, got, want);
     }
 
+    /// The first difference between got and want, with a few entries of context, for large outputs.
+    fn harness_mismatch(got: &[usize], want: &[usize]) -> String {
+        let i = got.iter().zip(want).position(|(g, w)| g != w).unwrap_or(got.len().min(want.len()));
+        let lo = i.saturating_sub(2);
+        format!("got {} nodes, want {}; first difference at index {}: got {:?}, want {:?} (from index {})",
+                got.len(), want.len(), i, &got[lo.min(got.len())..(i + 3).min(got.len())],
+                &want[lo.min(want.len())..(i + 3).min(want.len())], lo)
+    }
+
     #[test] fn small() {
         harness_check(0, &[], &[]);
         harness_check(3, &[], &[0, 1, 2]);
@@ -39,7 +48,8 @@ mod harness_tests {
         edges.extend((2..n).step_by(3).map(|i| (i, i - 2)));
         let got = topo_order(n, &edges).expect("large acyclic graph must succeed");
         let want: Vec<usize> = (0..n).rev().collect();
-        assert!(got == want, "large reverse chain: wrong order (first items {:?})", &got[..5.min(got.len())]);
+        assert!(got == want, "topo_order(200000, edges (i, i-1) for 1 <= i < n and (i, i-2) for i = 2, 5, 8, ...): {}",
+                harness_mismatch(&got, &want));
 
         // Independent pairs: (2k+1) before (2k). The smallest available node always goes first.
         let edges: Vec<(usize, usize)> = (0..n / 2).map(|k| (2 * k + 1, 2 * k)).collect();
@@ -49,7 +59,7 @@ mod harness_tests {
             want.push(2 * k + 1);
             want.push(2 * k);
         }
-        assert!(got == want, "large independent pairs: wrong order (first items {:?})", &got[..6.min(got.len())]);
+        assert!(got == want, "topo_order(200000, edges (2k+1, 2k) for 0 <= k < 100000): {}", harness_mismatch(&got, &want));
         let secs = start.elapsed().as_secs_f64();
         assert!(secs < 5.0, "too slow: two graphs with 200000 nodes took {:.1} s", secs);
     }
