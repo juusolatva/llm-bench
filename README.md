@@ -164,7 +164,7 @@ uv run --locked --no-build --group dev pytest -rs
 
 The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They and the reference-solution runs skip themselves where the sandbox isn't available (containers, CI), and the reference runs also skip languages whose toolchain is missing. Run the full suite on a Linux host with the sandbox requirements above before changing the runner, the sandbox or a task; the first Go reference run warms the Go build cache, which takes about a minute.
 
-CI (GitHub Actions) runs ruff and pytest on Python 3.13 and 3.14, SonarQube Cloud analysis with test coverage and an OSV-Scanner scan of the repository's dependency lockfiles (currently just `uv.lock`).
+CI (GitHub Actions) runs ruff and pytest on Python 3.13 and 3.14, SonarQube Cloud analysis with test coverage, CodeQL, and an OSV-Scanner scan of the repository's dependency lockfiles (currently just `uv.lock`).
 
 To add a task, create its directory under `tasks/`, including a reference solution. No code changes are needed. `tests/test_reference.py` runs every reference solution through the sandbox and expects it to pass, which catches broken harnesses. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
 
