@@ -628,7 +628,7 @@ def chat(label, base, payload, opts, stop):
     ServerDown when it stays down, Interrupted if the run is interrupted while waiting."""
     for delay in (*SERVER_RETRY_DELAYS_S, None):
         try:
-            t0 = time.time()
+            t0 = time.monotonic()
             resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
         except urllib.error.HTTPError as e:   # the server answered: model failed to load, crashed, prompt too long
             try:
@@ -636,16 +636,16 @@ def chat(label, base, payload, opts, stop):
             except (OSError, http.client.HTTPException):
                 detail = ""
             log(f"{label}: HTTP {e.code}: {detail or e.reason}", err=True)
-            return "", None, {}, f"http_{e.code}", time.time() - t0
+            return "", None, {}, f"http_{e.code}", time.monotonic() - t0
         except TimeoutError:   # raised directly only while waiting for the reply: the model was too slow
             log(f"{label}: no reply within {opts.timeout}s", err=True)
-            return "", None, {}, "timeout", time.time() - t0
+            return "", None, {}, "timeout", time.monotonic() - t0
         except (OSError, http.client.HTTPException) as e:
             # Refused, reset or dropped connection. If the server still answers, the model process
             # (not the server) died; otherwise wait for the server to come back.
             if server_reachable(base, opts.api_key):
                 log(f"{label}: connection lost ({e}), server still reachable", err=True)
-                return "", None, {}, "disconnected", time.time() - t0
+                return "", None, {}, "disconnected", time.monotonic() - t0
             if delay is None:
                 raise ServerDown(str(e)) from e
             log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
@@ -654,8 +654,8 @@ def chat(label, base, payload, opts, stop):
             continue
         except ValueError as e:   # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
             log(f"{label}: bad response: {e}", err=True)
-            return "", None, {}, "bad_response", time.time() - t0
-        seconds = time.time() - t0
+            return "", None, {}, "bad_response", time.monotonic() - t0
+        seconds = time.monotonic() - t0
         try:
             choice = resp["choices"][0]
             text = choice["message"].get("content") or ""
@@ -703,11 +703,11 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             raise Interrupted
         payload = {**opts.params, "model": model, "max_tokens": opts.max_tokens, "messages": messages}
         log(f"{label}: attempt {attempt}/{opts.attempts}, waiting for response...", err=True)
-        t0 = time.time()
+        t0 = time.monotonic()
         try:
             text, finish, usage, error, request_seconds = chat(label, base, payload, opts, stop)
         finally:
-            result["seconds"] += time.time() - t0   # all waiting, including for an unreachable server
+            result["seconds"] += time.monotonic() - t0   # all waiting, including for an unreachable server
         result["attempts"] = attempt
         if error:
             result["finish_reason"], result["fail_stage"] = error, "request"
@@ -818,9 +818,9 @@ def prepare_model(label, base, model, opts, stop):
     """Load the model with a tiny request, so load time isn't counted against its first task, and check its
     context size unless disabled. Returns (load_seconds, context, error)."""
     log(f"{label}: loading...", err=True)
-    t0 = time.time()
+    t0 = time.monotonic()
     _, _, usage, error, _ = probe(label, base, model, "Reply with OK.", opts, stop)
-    load_seconds = round(time.time() - t0, 2)
+    load_seconds = round(time.monotonic() - t0, 2)
     if error:
         return load_seconds, "unchecked", error
     log(f"{label}: first reply after {load_seconds:.1f}s", err=True)

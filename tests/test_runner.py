@@ -761,3 +761,12 @@ def test_usage_seconds_count_replies_that_report_zero_tokens(mock_server, tmp_pa
 def test_summarize_throughput_unknown_when_no_tokens_were_generated():
     (g,) = llm_bench.summarize([row("py_a", 0, completion_tokens=0, seconds=3.0, usage_seconds=3.0)])[0]
     assert g["tps"] is None
+
+
+def test_durations_ignore_wall_clock_changes(monkeypatch, mock_server, tmp_path):
+    readings = iter(range(10**9, 0, -1000))   # the wall clock jumps back 1000 s on every reading
+    monkeypatch.setattr(llm_bench.time, "time", lambda: next(readings))
+    s = mock_server(replies=[usage_reply()])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert 0 <= row["usage_seconds"] <= row["seconds"] + 0.005 < 5   # seconds is rounded to 0.01 s, usage_seconds to 0.1 ms
+    assert 0 <= row["load_seconds"] < 5
