@@ -274,9 +274,9 @@ def row(task, passed_on, **extra):
 def test_summarize_repeats():
     rows = [row("py_a", 1), row("py_a", 2), row("py_b", 0), row("py_b", 0)]
     (g,) = llm_bench.summarize(rows)[0]
-    assert (g["n"], g["p1"], g["pass"], g["runs"]) == (2, 0.5, 1.0, [2, 2])   # py_a passed twice, once at attempt 1
-    assert g["var1"] == pytest.approx(0.5)   # p=0.5 over 2 runs: 0.25 * 2/1
-    assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)   # means per run, summed over tasks
+    assert (g["n"], g["p1"], g["pass"], g["trials"]) == (2, 0.5, 1.0, [2, 2])   # py_a passed twice, once at attempt 1
+    assert g["var1"] == pytest.approx(0.5)   # p=0.5 over 2 trials: 0.25 * 2/1
+    assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)   # means per round, summed over tasks
 
 
 def test_summarize_keeps_newest_task_version_and_splits_settings():
@@ -286,12 +286,39 @@ def test_summarize_keeps_newest_task_version_and_splits_settings():
     assert sorted((g["settings"], g["pass"]) for g in groups) == [("s1", 1.0), ("s2", 1.0)]
 
 
+def test_summarize_scores_all_models_on_the_same_task_version():
+    # Model a only has trials of py_a's old version; model b was re-run after the task changed.
+    rows = [row("py_a", 1, model="a", config="old", run_id="20261101T000000Z"),
+            row("py_b", 1, model="a", run_id="20261101T000000Z"),
+            row("py_a", 0, model="b", config="old", run_id="20261101T000000Z"),
+            row("py_a", 1, model="b", config="new", run_id="20261102T000000Z")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert dropped == 2
+    assert {g["model"]: (g["n"], g["pass"]) for g in groups} == {"a": (1, 1.0), "b": (1, 1.0)}
+
+
+def test_summarize_newest_task_version_is_the_latest_run_not_the_last_row():
+    # Results files can be passed in any order: the newest version is the one from the latest run.
+    rows = [row("py_a", 1, model="a", config="new", run_id="20261102T000000Z"),
+            row("py_a", 0, model="b", config="old", run_id="20261101T000000Z"),
+            row("py_b", 1, model="b", run_id="20261101T000000Z")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert dropped == 1
+    assert {g["model"]: g["n"] for g in groups} == {"a": 1, "b": 1}   # b keeps only py_b
+
+
+def test_summarize_omits_models_without_current_trials():
+    rows = [row("py_a", 1, model="a", config="old", run_id="1"), row("py_a", 1, model="b", config="new", run_id="2")]
+    groups, dropped = llm_bench.summarize(rows)
+    assert (dropped, [g["model"] for g in groups]) == (1, ["b"])
+
+
 def test_print_summary_with_repeats(capsys):
     llm_bench.print_summary([row("py_a", 1), row("py_a", 0), row("py_b", 1), row("py_b", 1)])
     out = capsys.readouterr().out
     assert "1.5±0.7/2" in out
-    assert "runs" in out
-    assert "mean passes per run" in out
+    assert "rounds" in out
+    assert "mean passes per round" in out
 
 
 def test_read_results_accepts_old_files(tmp_path):

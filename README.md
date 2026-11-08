@@ -66,7 +66,7 @@ sudo apt install bubblewrap build-essential golang rustc
 ./llm_bench.py a=host-a:11434 b=host-b:1234         # two servers, benchmarked in parallel
 ./llm_bench.py localhost:8080 -m 'qwen*' --task 'py_*' --task 'rust_*'
 ./llm_bench.py localhost:11434 --resume              # continue an interrupted run
-./llm_bench.py localhost:11434 --repeat 3 --resume   # top up to 3 runs per task
+./llm_bench.py localhost:11434 --repeat 3 --resume   # top up to 3 trials per task
 ./llm_bench.py --summary results_*.csv               # summary table of earlier runs
 ```
 
@@ -85,9 +85,9 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | `--temperature T` | server default | Sampling temperature. Same as `--param temperature=T`. |
 | `--param KEY=VALUE` | | Extra request parameter such as `top_p=0.9`, `seed=1` or `reasoning_effort=low`. `VALUE` is parsed as JSON when possible (numbers, `true`, lists), otherwise used as a string. Repeatable. |
 | `--no-context-check` | | Skip the per-model context check (see below). |
-| `--repeat K` | 1 | Run every task `K` times per model. Results vary between runs (sampling), so repeats show how much of a difference between models is noise. |
-| `--resume` | | Skip runs that already have a finished row in the results file with the same settings and task version (`config`), e.g. after an interruption or to add `--repeat` runs. Rows that failed on request errors (`http_*`, `bad_response`, `disconnected`, `skipped`) are run again. |
-| `--max-length-finishes K` | never | Skip a model's remaining runs after `K` of them ended with a reply cut off at `--max-tokens`, so one model that rambles can't eat the whole run. |
+| `--repeat K` | 1 | Run `K` rounds: `K` trials of every task per model. Results vary between trials (sampling), so several rounds show how much of a difference between models is noise. |
+| `--resume` | | Skip trials that already have a finished row in the results file with the same settings and task version (`config`), e.g. after an interruption or to add `--repeat` rounds. Trials that failed on request errors (`http_*`, `bad_response`, `disconnected`, `skipped`) are run again. |
+| `--max-length-finishes K` | never | Skip a model's remaining trials after `K` of them ended with a reply cut off at `--max-tokens`, so one model that rambles can't eat the whole run. |
 | `--summary CSV...` | | Print the summary table of existing results files and exit. No endpoint needed. |
 | `-o, --output-dir DIR` | `.` | Where results and transcripts are written. |
 | `-t, --tag TAG` | | Write `results_<endpoint>_<TAG>.csv`, so runs with different settings don't overwrite each other. |
@@ -102,13 +102,13 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 
 ## Output
 
-- `results_<endpoint>[_<tag>].csv`: one row per model × task, written as each task finishes, so an interrupted run keeps its results. Rows are **appended**, so re-running a few models adds to an existing file instead of replacing it. Re-running the same model and task under the same settings adds another repeat of it (unless `--resume` finds it already done). Columns:
+- `results_<endpoint>[_<tag>].csv`: one row per trial (one model working on one task, through all its attempts), written as each trial finishes, so an interrupted run keeps its results. Rows are **appended**, so re-running a few models adds to an existing file instead of replacing it. Re-running the same model and task under the same settings adds another trial of it (unless `--resume` finds it already done). Columns:
 
   | Column | Meaning |
   |---|---|
   | `run_id` | UTC start time of the run, e.g. `20261107T202918Z`. |
   | `endpoint`, `model`, `task`, `lang` | What was run. |
-  | `repeat` | Number of this run of the task for this model and `config` (1, 2, …), continuing after the rows already in the file. |
+  | `repeat` | Number of this trial of the task for this model and `config` (1, 2, …), continuing after the rows already in the file. |
   | `passed`, `passed_on`, `attempts` | 1 if any attempt passed; which attempt passed (0 = none); attempts made. |
   | `prompt_tokens`, `completion_tokens` | Token usage summed over all attempts, as reported by the server. |
   | `seconds` | Time spent waiting for replies (not building and testing). |
@@ -120,10 +120,10 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
   | `config` | Hash of everything that affects the result: benchmark version, system prompt, `--max-tokens`, `--attempts`, `--timeout`, parameters, sandbox limits, and the task's own prompt, harness and build commands. Rows with equal hashes were produced under the same conditions. |
 
   The benchmark refuses to append to a file that has different columns (e.g. from an older version).
-- `runs/<endpoint>[_<tag>]/<model>/<task>/repeat_<r>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. `r` matches the row's `repeat`, so later runs never overwrite earlier transcripts. `<model>` is the model ID with characters other than letters, digits, `.`, `_` and `-` (and a leading dot) replaced by `_`; if two of an endpoint's models end up with the same name, both get a short hash of their ID appended (and `-2`, `-3`, … in the unlikely case that a name is still taken).
-- A summary table on stdout, one line per endpoint and model: `pass@1` (tasks passed on the first attempt), `passed` (tasks passed within `--attempts`), per-language results, token counts, total reply time and load time. Models are sorted by `passed`, then `pass@1`. With `--resume` the table covers the whole results file; otherwise just this run. Ctrl-C stops the run promptly and still prints the summary of the tasks finished so far.
+- `runs/<endpoint>[_<tag>]/<model>/<task>/repeat_<r>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. `r` matches the row's `repeat`, so later trials never overwrite earlier transcripts. `<model>` is the model ID with characters other than letters, digits, `.`, `_` and `-` (and a leading dot) replaced by `_`; if two of an endpoint's models end up with the same name, both get a short hash of their ID appended (and `-2`, `-3`, … in the unlikely case that a name is still taken).
+- A summary table on stdout, one line per endpoint and model: `pass@1` (tasks passed on the first attempt), `passed` (tasks passed within `--attempts`), per-language results, token counts, total reply time and load time. Models are sorted by `passed`, then `pass@1`. With `--resume` the table covers the whole results file; otherwise just this run. Ctrl-C stops the run promptly and still prints the summary of the trials finished so far.
 
-  When tasks have several runs (`--repeat`, or re-runs under the same settings), scores are mean passes per run, shown as `mean±sd/tasks`. The ± is the standard deviation of a single run's score, estimated from each task's pass rate: if two models are closer than that, one run can't tell them apart. Tokens and seconds are then means per run. `--summary` works the same on any set of results files; rows are only averaged when their `settings` match (otherwise a `settings` column tells the groups apart), and for each task only rows of its newest version count.
+  A **round** is one trial of every task. When tasks have several trials (`--repeat`, or re-runs under the same settings), scores are mean passes per round, shown as `mean±sd/tasks`, and a `rounds` column shows the number of trials per task. The ± is the standard deviation of a single round's score, estimated from each task's pass rate: if two models are closer than that, one round can't tell them apart. Tokens and seconds are then means per round. `--summary` works the same on any set of results files; rows are only averaged when their `settings` match (otherwise a `settings` column tells the groups apart). Models with the same settings are all scored on the same version of each task, its newest one (from the latest `run_id`): rows of older versions are left out, so a model without trials of a task's newest version is scored without that task.
 
 `finish_reason` is the server's value for the last reply (`stop`, `length`, …) or one of these:
 
@@ -134,7 +134,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | `bad_response` | The reply wasn't a valid chat completion (invalid or truncated JSON, no `choices`, a body over 8 MiB, …). |
 | `disconnected` | The connection dropped while the server itself stayed reachable (typically a crashed model process). |
 | `oversized` | The reply text exceeded 1,048,576 characters. Nothing is written to disk for it. |
-| `skipped` | Not attempted: the model had 3 request errors (`http_*`, `bad_response`, `disconnected`) in a row (`fail_stage` `request`), or reached `--max-length-finishes` (`fail_stage` `budget`), so its remaining runs were skipped. |
+| `skipped` | Not attempted: the model had 3 request errors (`http_*`, `bad_response`, `disconnected`) in a row (`fail_stage` `request`), or reached `--max-length-finishes` (`fail_stage` `budget`), so its remaining trials were skipped. |
 
 If the model's warm-up request fails (for example it can't be loaded), all its tasks get that request error as `finish_reason` with `fail_stage` `load`, and the next model runs.
 
