@@ -1,9 +1,10 @@
 name: OSV-Scanner
 
+# No merge_group trigger: the reusable PR workflow takes its baseline from GITHUB_BASE_REF, which is unset for merge
+# groups, so it would compare the merge-group commit with itself. Add a merge-group-aware baseline before using a
+# merge queue.
 on:
   pull_request:
-    branches: [main]
-  merge_group:
     branches: [main]
   schedule:
     - cron: '40 15 * * 6'
@@ -16,7 +17,7 @@ permissions: {}
 # One group per event type, so a push, scheduled or manual scan of main never cancels or replaces another kind.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scan-scheduled:
@@ -27,8 +28,6 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
-      # SARIF upload (Security > Code scanning) is disabled until the repository is public.
-      upload-sarif: false
       scan-args: |-
         --no-resolve
         -r
@@ -39,12 +38,11 @@ jobs:
       actions: read # Required for SARIF upload
       contents: read # Read commit contents
       security-events: write # Upload SARIF file to GitHub code scanning
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    if: ${{ github.event_name == 'pull_request' }}
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
-      # SARIF upload (Security > Code scanning) is disabled until the repository is public.
-      # When public, restore: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      upload-sarif: false
+      # Fork PRs get a read-only token, so only same-repository PRs upload SARIF.
+      upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       scan-args: |-
         --no-resolve
         -r
@@ -56,7 +54,7 @@ jobs:
   # required check counts as passing); make both checks required instead.
   guard-osv-results:
     name: Guard OSV result files
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
