@@ -1017,12 +1017,12 @@ def summarize(rows):
 
 
 def task_set_gaps(groups):
-    """["endpoint/model (missing task, ...)"] for models scored on fewer tasks than others with the same settings."""
+    """[(group, sorted missing tasks)] for models scored on fewer tasks than others with the same settings."""
     by_settings = defaultdict(set)
     for g in groups:
         by_settings[g["settings"]] |= g["tasks"]
-    return [f"{g['endpoint']}/{g['model']} (missing {', '.join(sorted(by_settings[g['settings']] - g['tasks']))})"
-            for g in groups if by_settings[g["settings"]] - g["tasks"]]
+    return [(g, sorted(by_settings[g["settings"]] - g["tasks"])) for g in groups
+            if by_settings[g["settings"]] - g["tasks"]]
 
 
 def print_summary(rows):
@@ -1065,11 +1065,15 @@ def print_summary(rows):
     if dropped:
         notes.append(f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
                      "are scored on each task's newest version")
-    missing = task_set_gaps(groups)
+    def name(g):
+        """A table row in a note: endpoint/model, plus [settings] when the table has a settings column."""
+        return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if show_settings else "")
+
+    missing = [f"{name(g)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:
         notes.append("warning: models with the same settings were scored on different tasks, so their scores "
                      f"aren't comparable: {', '.join(missing)}")
-    failed = [f"{g['endpoint']}/{g['model']} ({g['context']})" for g in groups
+    failed = [f"{name(g)} ({g['context']})" for g in groups
               if g["context"] not in ("ok", "unchecked")]
     if failed:
         notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")

@@ -357,7 +357,15 @@ def test_print_summary_warns_about_different_task_sets(capsys):
                              row("py_c", 1, model="c"), row("py_a", 1, model="d", settings="s2")])
     out = capsys.readouterr().out
     assert ("warning: models with the same settings were scored on different tasks, so their scores aren't "
-            "comparable: e/a (missing py_c), e/b (missing py_b, py_c), e/c (missing py_a, py_b)") in out
+            "comparable: e/a [s1] (missing py_c), e/b [s1] (missing py_b, py_c), e/c [s1] (missing py_a, py_b)") in out
+
+
+def test_print_summary_warnings_name_the_settings_when_they_differ(capsys):
+    llm_bench.print_summary([row("py_a", 1), row("py_a", 1, settings="s2", context="short:4000"),
+                             row("py_b", 1, settings="s2", model="n")])
+    out = capsys.readouterr().out
+    assert "comparable: e/m [s2] (missing py_b), e/n [s2] (missing py_a)" in out
+    assert "results may be cut off: e/m [s2] (short:4000)" in out
 
 
 def test_print_summary_no_task_set_warning_when_tasks_match(capsys):
