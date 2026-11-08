@@ -1001,8 +1001,8 @@ def summarize(rows):
     newest version is scored without that task. Several rows of a task are trials in different rounds.
     Throughput ("tps") is completion tokens per request second over the trials that ended with a reply that
     reported token usage (a reply has at least one token, so 0 means the server didn't say); None without any.
-    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that ended with
-    a reply reported them (otherwise None: a partial count would be on another scale than completion tokens).
+    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
+    reported them (otherwise None: a partial count would be on another scale than completion tokens).
     Returns (groups, dropped row count)."""
     newest = newest_configs(rows)
     tasks_by_group = {}
@@ -1023,7 +1023,11 @@ def summarize(rows):
         counted = [r for r in replied if r["completion_tokens"] > 0]
         reply_seconds = sum(r["seconds"] for r in counted)
         g["tps"] = sum(r["completion_tokens"] for r in counted) / reply_seconds if reply_seconds else None
-        if replied and all(r.get("reasoning_tokens") is not None for r in replied):
+        # Every trial with a reply needs a count, including one that got replies and then a request error: its
+        # completion tokens count, so its unknown reasoning tokens can't count as zero.
+        with_replies = [r for task_rows in tasks.values() for r in task_rows
+                        if ended_with_reply(r) or r["completion_tokens"] > 0]
+        if with_replies and all(r.get("reasoning_tokens") is not None for r in with_replies):
             g["rt"] = sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
                           for task_rows in tasks.values())
         for task, task_rows in tasks.items():
@@ -1300,7 +1304,7 @@ def parse_args():
                          "--max-tokens (default: never)")
     ap.add_argument("--summary", nargs="+", type=Path, metavar="CSV",
                     help="print the summary table of existing results files and exit (no endpoint needed)")
-    ap.add_argument("--format", choices=("table", "markdown", "csv"), default="table",
+    ap.add_argument("--format", choices=("table", "markdown", "csv"),
                     help="with --summary: print the summary as a terminal table (default), Markdown or CSV")
     ap.add_argument("--per-task", action="store_true",
                     help="with --summary: also print a task x model table of passes per trial (with --format csv: "
@@ -1313,8 +1317,9 @@ def parse_args():
     ap.add_argument("-t", "--tag",
                     help="write results_<endpoint>_<TAG>.csv instead of results_<endpoint>.csv")
     args = ap.parse_args()
-    if not args.summary and (args.format != "table" or args.per_task):
+    if not args.summary and (args.format or args.per_task):   # no default, so an explicit table is caught too
         ap.error("--format and --per-task work only with --summary")
+    args.format = args.format or "table"
     if not args.endpoints:
         args.endpoints = os.environ.get("LLM_BENCH_ENDPOINTS", "").split()
     if not args.endpoints and not args.list_tasks and not args.summary:

@@ -402,7 +402,7 @@ def test_cli_summary_formats(monkeypatch, capsys, tmp_path):
     assert capsys.readouterr().out.splitlines()[1:] == ["e,m,,py_a,python,1,1,1", "e,m,,py_b,python,1,0,0"]
 
 
-@pytest.mark.parametrize("args", [["--format", "csv"], ["--per-task"]])
+@pytest.mark.parametrize("args", [["--format", "csv"], ["--format", "table"], ["--per-task"]])
 def test_cli_summary_options_need_summary(monkeypatch, capsys, args):
     with pytest.raises(SystemExit) as exc:
         run_main(monkeypatch, "http://localhost:1/v1", *args)

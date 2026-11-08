@@ -627,3 +627,12 @@ def test_upgrade_results_file_ignores_planted_temp_symlink(tmp_path):
     llm_bench.check_results_file(path)
     assert victim.read_text() == "keep me"
     assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
+
+
+def test_summarize_reasoning_tokens_unknown_when_an_error_ended_trial_had_replies():
+    # py_b got a 100-token reply without reasoning usage, then a request error: its completion tokens count, so
+    # its unknown reasoning tokens can't count as zero.
+    rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40),
+            row("py_b", 0, completion_tokens=100, reasoning_tokens=None, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert (g["ct"], g["rt"]) == (200, None)
