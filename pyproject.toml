@@ -9,7 +9,11 @@ requires-python = ">=3.13"
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = [
+    "coverage>=7.17",
+    "pytest>=8",
+    "ruff>=0.6",
+]
 
 [tool.ruff]
 line-length = 120
@@ -21,6 +25,13 @@ extend-exclude = ["tasks"]
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]
 # Task prompts and harnesses are long string literals that are sent to the model verbatim.
 ignore = ["E501"]
+
+[tool.coverage.run]
+# Coverage of the script for SonarQube Cloud (.github/workflows/sonarqube.yml); relative paths so the scanner
+# can map the report onto the checkout.
+include = ["llm_bench.py"]
+relative_files = true
+branch = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,6 +8,8 @@ import pytest
 import llm_bench
 
 TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
+GO_TASKS = [t for t in TASKS if t["lang"] == "go"]
+OTHER_TASKS = [t for t in TASKS if t["lang"] != "go"]
 
 
 def reference_file(task):
@@ -28,6 +30,10 @@ def test_reference_exists(task):
 @pytest.fixture(scope="session")
 def go_cache():
     """Warm the Go build cache once, like a real run does, so Go tasks stay under the time limit."""
+    try:
+        llm_bench.check_toolchains(GO_TASKS)
+    except SystemExit as exc:
+        pytest.skip(str(exc))
     with tempfile.TemporaryDirectory(prefix="llm-bench-test-go-") as d:
         llm_bench.prepare_go_cache(d)
         if llm_bench.GO_CACHE is None:
@@ -37,15 +43,25 @@ def go_cache():
         llm_bench.GO_CACHE = None
 
 
-@pytest.mark.sandbox
-@pytest.mark.parametrize("task", TASKS, ids=[t["name"] for t in TASKS])
-def test_reference_passes(task, tmp_path, request):
-    """The reference solution passes the task's harness in the sandbox (skipped without its toolchain)."""
+def check_reference(task, tmp_path):
+    """Run the task's reference solution in the sandbox and expect it to pass (skip without its toolchain)."""
     try:
         llm_bench.check_toolchains([task])
     except SystemExit as exc:
         pytest.skip(str(exc))
-    if task["lang"] == "go":
-        request.getfixturevalue("go_cache")
     passed, _, stage, cmd, out = llm_bench.run_task(task, reference_file(task).read_text(), tmp_path / "work")
     assert passed, f"{task['name']}: reference failed at {stage} ({cmd}):\n{out}"
+
+
+@pytest.mark.sandbox
+@pytest.mark.parametrize("task", OTHER_TASKS, ids=[t["name"] for t in OTHER_TASKS])
+def test_reference_passes(task, tmp_path):
+    """The reference solution passes the task's harness in the sandbox."""
+    check_reference(task, tmp_path)
+
+
+@pytest.mark.sandbox
+@pytest.mark.parametrize("task", GO_TASKS, ids=[t["name"] for t in GO_TASKS])
+def test_go_reference_passes(task, tmp_path, go_cache):
+    """Like test_reference_passes, for Go tasks, which need the warmed build cache."""
+    check_reference(task, tmp_path)

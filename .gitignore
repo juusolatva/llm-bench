@@ -4,6 +4,8 @@ runs/
 
 # Python
 __pycache__/
+.coverage
+coverage.xml
 *.py[cod]
 .venv/
 

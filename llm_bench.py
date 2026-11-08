@@ -150,14 +150,15 @@ FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "pa
           "prompt_tokens", "completion_tokens", "seconds", "load_seconds", "finish_reason", "fail_stage", "context",
           "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
+THINK_CLOSE = "</think>"
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Fenced code blocks are found by a left-to-right scan (_code_blocks), so a fence is never used twice. An
 # opening fence is a run of 3+ backticks either at the start of a line with an optional info string (it
 # starts with the language tag: "python", "python:solution.py", "c++ title=x") or mid-line directly followed
 # by a (required) tag and the end of the line ("Here: ```python"). Possessive quantifiers (*+, ++) and the
-# lookbehind keep matching linear on degenerate replies such as long runs of backticks or spaces.
-FENCE_OPEN_RE = re.compile(r"^[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n",
-                           re.MULTILINE)
+# lookbehind keep matching linear on degenerate replies such as long runs of backticks or spaces. "(?<![^\n])"
+# is the start of a line (like "^" with re.MULTILINE, without an anchor in only one alternative).
+FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n")
 # A closing fence: a run of 3+ backticks followed only by whitespace up to the end of the line.
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
@@ -299,8 +300,8 @@ def strip_think(text):
     text = text.replace("\r\n", "\n")
     # Search only up to the last </think>: an unclosed <think> after it would make each match attempt scan
     # to the end of the reply (quadratic in replies full of <think>).
-    last_close = text.rfind("</think>")
-    pairs = list(THINK_RE.finditer(text, 0, last_close + len("</think>"))) if last_close >= 0 else []
+    last_close = text.rfind(THINK_CLOSE)
+    pairs = list(THINK_RE.finditer(text, 0, last_close + len(THINK_CLOSE))) if last_close >= 0 else []
     outside = set(_outside_code(_code_blocks(text), [m.start() for m in pairs]))
     pieces, end = [], 0
     for m in pairs:
@@ -309,12 +310,12 @@ def strip_think(text):
             end = m.end()
     text = "".join(pieces) + text[end:]
     blocks = _code_blocks(text)
-    closes = _outside_code(blocks, [m.start() for m in re.finditer("</think>", text)])
+    closes = _outside_code(blocks, [m.start() for m in re.finditer(THINK_CLOSE, text)])
     followed = [c for c in closes if blocks and blocks[-1][0] > c]
     if followed:
-        text = text[followed[-1] + len("</think>"):]
+        text = text[followed[-1] + len(THINK_CLOSE):]
     elif closes and not blocks:
-        text = text[closes[0] + len("</think>"):]
+        text = text[closes[0] + len(THINK_CLOSE):]
     return "" if text.lstrip().startswith("<think>") else text
 
 
