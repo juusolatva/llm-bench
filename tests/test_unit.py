@@ -49,9 +49,13 @@ def test_model_dirs_disambiguate_collisions():
 
 def test_model_dirs_unique_even_against_hashed_names():
     import hashlib
-    tricky = "a_b-" + hashlib.sha256(b"a/b").hexdigest()[:8]   # equals the hashed name "a/b" would get
+    h = hashlib.sha256(b"a/b").hexdigest()
+    tricky = "a_b-" + h[:8]   # equals the hashed name "a/b" gets
     dirs = llm_bench.model_dirs(["a/b", "a_b", tricky])
     assert len(set(dirs.values())) == 3, dirs
+    chain = ["a/b", "a_b", "a_b-" + h[:8], "a_b-" + h[:16], "a_b-" + h]   # collides on every hash length
+    for models in (chain, chain[::-1]):
+        assert len(set(llm_bench.model_dirs(models).values())) == len(chain)
     assert llm_bench.model_dirs(["x", "x"]) == {"x": "x"}
 
 

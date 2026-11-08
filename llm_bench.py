@@ -171,21 +171,22 @@ def safe_name(name):
 
 
 def model_dirs(models):
-    """Transcript directory names for model IDs, unique per endpoint: safe_name(ID), or for IDs whose names
-    would collide (".foo" and "_foo", "a/b" and "a_b", or an ID that equals another's hashed name), that plus
-    "-" and a hash of the ID, lengthened until every name is unique. No model can then delete or overwrite
-    another model's transcripts."""
+    """Transcript directory names for model IDs, unique per endpoint, so no model can delete or overwrite
+    another model's transcripts. Each ID gets safe_name(ID), or that plus "-" and a short hash of the ID if
+    another ID has the same safe name (".foo" and "_foo", "a/b" and "a_b"). A name still taken by an earlier
+    model (e.g. an ID that equals another's hashed name) gets "-2", "-3", ... appended."""
     models = list(dict.fromkeys(models))
-    names = {m: safe_name(m) for m in models}
-    for length in (8, 16, 64):
-        taken = Counter(names.values())
-        if all(n == 1 for n in taken.values()):
-            break
-        for m in models:
-            if taken[names[m]] > 1:
-                names[m] = f"{safe_name(m)}-{hashlib.sha256(m.encode()).hexdigest()[:length]}"
-    if len(set(names.values())) != len(names):   # only if two different IDs had the same SHA-256
-        raise ValueError("cannot give every model a unique directory name")
+    counts = Counter(safe_name(m) for m in models)
+    names, taken = {}, set()
+    for m in models:
+        name = safe_name(m)
+        if counts[name] > 1:
+            name = f"{name}-{hashlib.sha256(m.encode()).hexdigest()[:8]}"
+        candidate, k = name, 2
+        while name in taken:
+            name, k = f"{candidate}-{k}", k + 1
+        names[m] = name
+        taken.add(name)
     return names
 
 
