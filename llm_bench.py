@@ -694,6 +694,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         {"role": "user", "content": task["prompt"]},
     ]
     result = skipped_result(None, None)
+    reasoning_complete = True
     for attempt in range(1, opts.attempts + 1):
         if stop.is_set():
             raise Interrupted
@@ -711,9 +712,12 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         result["finish_reason"] = finish
         result["prompt_tokens"] += usage.get("prompt_tokens") or 0
         result["completion_tokens"] += usage.get("completion_tokens") or 0
+        # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
+        # the completion tokens of all replies, on another scale. None is an empty cell.
         reasoning = reasoning_tokens(usage)
-        if reasoning is not None:   # stays None (an empty cell) unless some attempt reported it
-            result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning
+        if reasoning is None:
+            reasoning_complete = False
+        result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning if reasoning_complete else None
         if len(text) > MAX_CONTENT_CHARS:  # counted as failure, nothing written to disk
             log(f"{label}: response exceeds {MAX_CONTENT_CHARS} chars", err=True)
             result["finish_reason"], result["fail_stage"] = "oversized", "request"

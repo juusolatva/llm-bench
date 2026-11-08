@@ -415,10 +415,13 @@ def test_reasoning_tokens_empty_when_not_reported(mock_server, tmp_path, usage):
     assert read_csv(tmp_path / "results.csv")[0]["reasoning_tokens"] == ""
 
 
-def test_reasoning_tokens_count_attempts_that_report_them(mock_server, tmp_path):
-    s = mock_server(replies=[usage_reply(), usage_reply(completion_tokens_details={"reasoning_tokens": 4})])
+@pytest.mark.parametrize("reported", [(None, 4), (4, None)])
+def test_reasoning_tokens_empty_unless_every_reply_reports_them(mock_server, tmp_path, reported):
+    # A partial sum would sit next to the completion tokens of all replies, on another scale.
+    s = mock_server(replies=[usage_reply() if n is None else usage_reply(completion_tokens_details={"reasoning_tokens": n})
+                             for n in reported])
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
-    assert row["reasoning_tokens"] == 4
+    assert (row["attempts"], row["reasoning_tokens"]) == (2, None)
 
 
 def test_skipped_trials_have_no_reasoning_tokens(mock_server, tmp_path):

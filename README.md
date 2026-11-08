@@ -114,7 +114,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
   | `repeat` | Number of this trial of the task for this model and `config` (1, 2, …), continuing after the rows already in the file. |
   | `passed`, `passed_on`, `attempts` | 1 if any attempt passed; which attempt passed (0 = none); attempts made. |
   | `prompt_tokens`, `completion_tokens` | Token usage summed over all attempts, as reported by the server. |
-  | `reasoning_tokens` | The part of `completion_tokens` spent on reasoning, summed over the attempts that report it (`usage.completion_tokens_details.reasoning_tokens`). Empty when the server doesn't report it. |
+  | `reasoning_tokens` | The part of `completion_tokens` spent on reasoning, summed over all attempts (`usage.completion_tokens_details.reasoning_tokens`). Empty unless every reply reported it. |
   | `seconds` | Time spent waiting for replies (not building and testing). |
   | `load_seconds` | Time of the model's warm-up request, i.e. mostly load time. The same for all of a model's rows in a run. |
   | `finish_reason`, `fail_stage` | See below. |
