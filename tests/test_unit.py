@@ -41,7 +41,8 @@ def test_safe_name(name, want):
 
 def test_model_dirs_disambiguate_collisions():
     dirs = llm_bench.model_dirs([".foo", "_foo", "a/b", "qwen/qwen3:8b"])
-    assert dirs["qwen/qwen3:8b"] == "qwen_qwen3_8b" and dirs["a/b"] == "a_b"   # no collision: plain safe name
+    assert dirs["qwen/qwen3:8b"] == "qwen_qwen3_8b"   # no collision: plain safe name
+    assert dirs["a/b"] == "a_b"
     assert dirs[".foo"] != dirs["_foo"]
     assert all(d.startswith("_foo-") and len(d) == len("_foo-") + 8 for d in (dirs[".foo"], dirs["_foo"]))
     assert llm_bench.model_dirs([".foo", "_foo"]) == {k: dirs[k] for k in (".foo", "_foo")}   # deterministic

@@ -118,7 +118,8 @@ def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
     s = mock_server(models=[".foo", "_foo"], replies=["", ""])
     run_endpoint(s, tmp_path, models=[".foo", "_foo"], tasks=TASKS[:1])
     dirs = sorted(p.name for p in (tmp_path / "runs").iterdir())
-    assert len(dirs) == 2 and all(d.startswith("_foo-") for d in dirs)
+    assert len(dirs) == 2
+    assert all(d.startswith("_foo-") for d in dirs)
     for d in dirs:
         assert (tmp_path / "runs" / d / "py_t0/repeat_1/attempt_1/response.md").is_file()
 
