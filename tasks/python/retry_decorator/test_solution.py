@@ -14,43 +14,68 @@ def flaky(x, y=0):
     if len(calls) < 3:
         raise ValueError("no")
     return x + y
-assert flaky(1, y=2) == 3 and len(calls) == 3
-assert close(sleeps, [0.5, 1.0]), sleeps
-assert flaky.__name__ == "flaky" and flaky.__doc__ == "doc here"
+case = "retry(times=4, exceptions=(ValueError,), delay=0.5, backoff=2) on f(x, y=0) that raises ValueError twice, then returns x + y"
+got = flaky(1, y=2)
+assert got == 3, f"{case}: f(1, y=2) returned {got!r}, want 3"
+assert len(calls) == 3, f"{case}: f was called {len(calls)} times, want 3"
+assert close(sleeps, [0.5, 1.0]), f"{case}: time.sleep calls {sleeps}, want [0.5, 1.0]"
+assert flaky.__name__ == "flaky" and flaky.__doc__ == "doc here", \
+    f"decorated function has __name__ {flaky.__name__!r} and __doc__ {flaky.__doc__!r}, want 'flaky' and 'doc here'"
 
 sleeps.clear(); errs = []
 @retry(times=3, exceptions=(KeyError, ValueError), delay=1, backoff=3)
 def always():
     e = KeyError(len(errs)); errs.append(e); raise e
+case = "retry(times=3, exceptions=(KeyError, ValueError), delay=1, backoff=3) on f() that always raises KeyError"
 try:
-    always()
+    got = always()
 except KeyError as e:
-    assert e is errs[-1], "must re-raise the last exception"
+    assert e is errs[-1], f"{case}: re-raised KeyError({e}), want the exception from the last call, KeyError({len(errs) - 1})"
 else:
-    raise AssertionError("no exception")
-assert len(errs) == 3 and close(sleeps, [1, 3]), (len(errs), sleeps)
+    raise AssertionError(f"{case}: returned {got!r}, want the last KeyError re-raised")
+assert len(errs) == 3, f"{case}: f was called {len(errs)} times, want 3"
+assert close(sleeps, [1, 3]), f"{case}: time.sleep calls {sleeps}, want [1, 3]"
 
 sleeps.clear(); n = []
 @retry(times=5, exceptions=(ValueError,), delay=1)
 def other():
     n.append(1); raise TypeError("x")
+case = "retry(times=5, exceptions=(ValueError,), delay=1) on f() that raises TypeError"
 try:
-    other()
+    got = other()
 except TypeError:
     pass
 else:
-    raise AssertionError("no exception")
-assert len(n) == 1 and sleeps == [], "unlisted exception must not be retried"
+    raise AssertionError(f"{case}: returned {got!r}, want TypeError to propagate")
+assert len(n) == 1 and sleeps == [], \
+    f"{case}: f was called {len(n)} times with time.sleep calls {sleeps}, want 1 call and no sleep (not retried)"
 
 sleeps.clear()
 @retry(times=1, delay=1)
 def once():
     raise RuntimeError("x")
+case = "retry(times=1, delay=1) on f() that raises RuntimeError"
 try:
-    once()
+    got = once()
 except RuntimeError:
     pass
-assert sleeps == [], "no sleep after the last call"
+else:
+    raise AssertionError(f"{case}: returned {got!r}, want RuntimeError re-raised")
+assert sleeps == [], f"{case}: time.sleep calls {sleeps}, want none (no sleep after the last call)"
+
+sleeps.clear(); d = []
+@retry(times=3)
+def defaults():
+    d.append(1); raise RuntimeError("x")
+case = "retry(times=3) (default exceptions, delay and backoff) on f() that raises RuntimeError"
+try:
+    got = defaults()
+except RuntimeError:
+    pass
+else:
+    raise AssertionError(f"{case}: returned {got!r}, want RuntimeError re-raised")
+assert len(d) == 3, f"{case}: f was called {len(d)} times, want 3"
+assert close(sleeps, [1.0, 2.0]), f"{case}: time.sleep calls {sleeps}, want [1.0, 2.0]"
 
 for bad in (0, -1):
     try:
@@ -58,5 +83,5 @@ for bad in (0, -1):
     except ValueError:
         pass
     else:
-        raise AssertionError(f"times={bad}: expected ValueError")
+        raise AssertionError(f"retry(times={bad}): did not raise, want ValueError")
 print("ok")

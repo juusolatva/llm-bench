@@ -15,10 +15,11 @@ func TestCountLengths(t *testing.T) {
 	}
 	for round := 0; round < 20; round++ {
 		if got := CountLengths(words); !reflect.DeepEqual(got, want) {
-			t.Fatalf("round %d: wrong counts", round)
+			t.Fatalf("round %d: CountLengths(5000 words, word i is strings.Repeat(\"x\", i%%17)): got %v, want %v",
+				round, got, want)
 		}
 	}
 	if got := CountLengths(nil); len(got) != 0 {
-		t.Fatalf("nil input: got %v", got)
+		t.Fatalf("CountLengths(nil): got %v, want an empty map", got)
 	}
 }

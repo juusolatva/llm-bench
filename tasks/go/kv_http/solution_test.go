@@ -20,7 +20,11 @@ func harnessExpect(t *testing.T, h http.Handler, method, path, body string, code
 	t.Helper()
 	got, b := harnessDo(h, method, path, body)
 	if got != code || (want != "" && b != want) {
-		t.Fatalf("%s %s: got %d %q, want %d %q", method, path, got, b, code, want)
+		wantBody := ""
+		if want != "" {
+			wantBody = fmt.Sprintf(" %q", want)
+		}
+		t.Fatalf("%s %s with body %q: got %d %q, want %d%s", method, path, body, got, b, code, wantBody)
 	}
 }
 
@@ -38,6 +42,9 @@ func TestCRUD(t *testing.T) {
 	harnessExpect(t, h, "GET", "/kv/", "", 404, "")
 	harnessExpect(t, h, "GET", "/other", "", 404, "")
 	harnessExpect(t, h, "GET", "/kv/a/b", "", 404, "")
+	harnessExpect(t, h, "GET", "/kv", "", 404, "")
+	harnessExpect(t, h, "PUT", "/kv/empty", "", 204, "")
+	harnessExpect(t, h, "GET", "/kv/empty", "", 200, "")
 	h2 := NewHandler()
 	harnessExpect(t, h, "PUT", "/kv/x", "1", 204, "")
 	harnessExpect(t, h2, "GET", "/kv/x", "", 404, "")
@@ -54,11 +61,11 @@ func TestConcurrent(t *testing.T) {
 			for j := 0; j < 20; j++ {
 				val := fmt.Sprintf("%d-%d", i, j)
 				if c, _ := harnessDo(h, "PUT", key, val); c != 204 {
-					t.Errorf("PUT %s: %d", key, c)
+					t.Errorf("concurrent PUT %s with body %q: got %d, want 204", key, val, c)
 					return
 				}
 				if c, b := harnessDo(h, "GET", key, ""); c != 200 || b != val {
-					t.Errorf("GET %s: %d %q, want %q", key, c, b, val)
+					t.Errorf("concurrent GET %s right after PUT %q: got %d %q, want 200 %q", key, val, c, b, val)
 					return
 				}
 			}
