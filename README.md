@@ -97,7 +97,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 - **Context length.** With the defaults a retry request can need about 25k tokens of context (roughly 1k + 4k per retry + `--max-tokens`). Configure the server for at least 32k. Many servers default to much less and silently truncate the prompt. For example, Ollama uses `OLLAMA_CONTEXT_LENGTH=32768`, and LM Studio sets the context length in the model's load settings. If you can't, lower `--max-tokens` or `--attempts` so the need fits.
 - **Context check.** Before each model's first task, the benchmark loads it with a tiny request (its time goes into `load_seconds`, not the first task) and then checks the context: it measures the model's tokens per word with a short filler prompt, sends a filler prompt of the needed size, and compares the prompt tokens the server reports. A server that truncates reports too few; one that refuses answers with an error. The result is recorded in the `context` column and a failed check is repeated under the summary. It costs one long prompt per model; `--no-context-check` skips it.
 - **One model at a time.** Models are benchmarked one after another. If the server keeps earlier models loaded, the next model may not fit in VRAM and run partly on the CPU, which only affects timing. Let the server evict old models: Ollama with `OLLAMA_MAX_LOADED_MODELS=1`, LM Studio with the auto-evict option for JIT-loaded models.
-- **Thinking models.** `<think>…</think>` blocks are removed before code extraction, as is everything before a `</think>` without an opening tag (some chat templates put the opening tag in the prompt). Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
+- **Thinking models.** `<think>…</think>` blocks are removed before code extraction, as is everything before a `</think>` without an opening tag (some chat templates put the opening tag in the prompt). Tags inside a fenced code block are left alone, as part of the code. A reply that is only unfinished reasoning (an opening `<think>` that never closes, typically cut off at `--max-tokens`) counts as containing no code. Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
 - **Code extraction.** The system prompt asks for exactly one fenced code block. If a reply has several, the blocks tagged with the task's language (for example ` ```python ` or ` ```py `) are the candidates, or all blocks if none is tagged that way. The last candidate is used, which is the fix when a reply quotes the original code first, unless it is less than half as long as the longest one (a usage example or a snippet after the full file); then the longest is used. A reply without a fenced block is used as is.
 
 ## Output
@@ -131,9 +131,9 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 |---|---|
 | `timeout` | No reply within `--timeout`. |
 | `http_<code>` | The server returned an HTTP error, e.g. the model failed to load or crashed, or the prompt didn't fit its context. |
-| `bad_response` | The reply wasn't a valid chat completion (invalid or truncated JSON, no `choices`, …). |
+| `bad_response` | The reply wasn't a valid chat completion (invalid or truncated JSON, no `choices`, a body over 8 MiB, …). |
 | `disconnected` | The connection dropped while the server itself stayed reachable (typically a crashed model process). |
-| `oversized` | The reply text exceeded 1 MiB. |
+| `oversized` | The reply text exceeded 1,048,576 characters. Nothing is written to disk for it. |
 | `skipped` | Not attempted: the model had 3 request errors (`http_*`, `bad_response`, `disconnected`) in a row (`fail_stage` `request`), or reached `--max-length-finishes` (`fail_stage` `budget`), so its remaining runs were skipped. |
 
 If the model's warm-up request fails (for example it can't be loaded), all its tasks get that request error as `finish_reason` with `fail_stage` `load`, and the next model runs.
@@ -162,7 +162,9 @@ uv run --locked --no-build --group dev ruff check .
 uv run --locked --no-build --group dev pytest -rs
 ```
 
-The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They skip themselves where the sandbox isn't available (containers, CI).
+The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They and the reference-solution runs skip themselves where the sandbox isn't available (containers, CI), and the reference runs also skip languages whose toolchain is missing. Run the full suite on a Linux host with the sandbox requirements above before changing the runner, the sandbox or a task; the first Go reference run warms the Go build cache, which takes about a minute.
+
+CI (GitHub Actions) runs ruff and pytest on Python 3.13 and 3.14, SonarQube Cloud analysis and OSV-Scanner on `uv.lock`.
 
 To add a task, create its directory under `tasks/`, including a reference solution. No code changes are needed. `tests/test_reference.py` runs every reference solution through the sandbox and expects it to pass, which catches broken harnesses. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
 
