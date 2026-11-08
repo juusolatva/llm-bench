@@ -386,3 +386,191 @@ def test_read_results_rejects_other_csv(tmp_path):
     path.write_text("a,b\n1,2\n")
     with pytest.raises(ValueError, match="not a results file"):
         llm_bench.read_results(path)
+
+
+def usage_reply(text="", **usage):
+    return Reply(body=json.dumps({"choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                                  "usage": {"prompt_tokens": 10, "completion_tokens": 5, **usage}}).encode())
+
+
+def test_reasoning_tokens_are_summed_over_attempts(mock_server, tmp_path):
+    s = mock_server(replies=[usage_reply(completion_tokens_details={"reasoning_tokens": 7}),
+                             usage_reply(completion_tokens_details={"reasoning_tokens": 3})])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["reasoning_tokens"] == 10
+    assert read_csv(tmp_path / "results.csv")[0]["reasoning_tokens"] == "10"
+
+
+@pytest.mark.parametrize("usage", [
+    {},                                                       # not reported
+    {"completion_tokens_details": None},
+    {"completion_tokens_details": "lots"},                    # malformed: ignored, not a bad response
+    {"completion_tokens_details": {"reasoning_tokens": "7"}},
+    {"completion_tokens_details": {"reasoning_tokens": True}},
+])
+def test_reasoning_tokens_empty_when_not_reported(mock_server, tmp_path, usage):
+    s = mock_server(replies=[usage_reply(**usage)])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert (row["finish_reason"], row["reasoning_tokens"]) == ("stop", None)
+    assert read_csv(tmp_path / "results.csv")[0]["reasoning_tokens"] == ""
+
+
+def test_reasoning_tokens_count_attempts_that_report_them(mock_server, tmp_path):
+    s = mock_server(replies=[usage_reply(), usage_reply(completion_tokens_details={"reasoning_tokens": 4})])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["reasoning_tokens"] == 4
+
+
+def test_skipped_trials_have_no_reasoning_tokens(mock_server, tmp_path):
+    s = mock_server(replies=[Reply(status=500, body=b"{}")] * 3)
+    rows = run_endpoint(s, tmp_path)
+    assert {r["reasoning_tokens"] for r in rows} == {None}
+
+
+def test_read_results_reasoning_tokens(tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on,reasoning_tokens\n"
+                    "e,m,py_a,python,1,1,12\ne,m,py_b,python,1,1,\n")
+    assert [r["reasoning_tokens"] for r in llm_bench.read_results(path)] == [12, None]
+
+
+def test_check_results_file_upgrades_older_columns(tmp_path, capsys):
+    old = [f for f in llm_bench.FIELDS if f != "reasoning_tokens"]
+    path = tmp_path / "results.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=old)
+        w.writeheader()
+        w.writerow({k: "" for k in old} | {"endpoint": "e", "model": "m", "task": "py_a", "lang": "python",
+                                           "passed": "1", "passed_on": "1", "completion_tokens": "5"})
+    llm_bench.check_results_file(path)
+    assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
+    (r,) = read_csv(path)
+    assert (r["model"], r["completion_tokens"], r["reasoning_tokens"]) == ("m", "5", "")
+    assert "upgraded" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == [path]   # no temp file left behind
+
+
+def test_check_results_file_refuses_unreadable_old_file(tmp_path):
+    path = tmp_path / "results.csv"
+    path.write_text("endpoint,model,task\ne,m,py_a\n")   # known columns, but not a results file
+    with pytest.raises(SystemExit, match="cannot read"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == "endpoint,model,task\ne,m,py_a\n"
+
+
+def test_summarize_throughput_counts_only_trials_with_a_reply():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=10.0),
+            row("py_b", 0, completion_tokens=50, seconds=5.0, finish_reason="oversized"),   # a reply, just too long
+            row("py_c", 0, completion_tokens=0, seconds=30.0, finish_reason="timeout"),
+            row("py_d", 0, completion_tokens=0, seconds=2.0, finish_reason="http_500"),
+            row("py_e", 0, completion_tokens=0, seconds=0.0, finish_reason="skipped")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["tps"] == pytest.approx(10.0)   # 150 tokens in 15 s
+
+
+def test_summarize_throughput_unknown_without_replies():
+    (g,) = llm_bench.summarize([row("py_a", 0, completion_tokens=0, seconds=30.0, finish_reason="timeout")])[0]
+    assert g["tps"] is None
+
+
+def test_summarize_reasoning_tokens_mean_per_round():
+    rows = [row("py_a", 1, reasoning_tokens=20), row("py_a", 1, reasoning_tokens=10),
+            row("py_b", 1, reasoning_tokens=4), row("py_b", 1, reasoning_tokens=None),
+            row("py_a", 1, model="n", reasoning_tokens=None)]
+    groups = {g["model"]: g for g in llm_bench.summarize(rows)[0]}
+    assert groups["m"]["rt"] == pytest.approx(19.0)   # py_a: mean 15, py_b: mean of the reported trials, 4
+    assert groups["n"]["rt"] is None
+
+
+def test_summarize_per_task_counts():
+    rows = [row("py_a", 1), row("py_a", 2), row("py_a", 0), row("go_b", 0, lang="go")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["per_task"] == {"py_a": {"lang": "python", "trials": 3, "passed": 2, "passed_on_first": 1},
+                             "go_b": {"lang": "go", "trials": 1, "passed": 0, "passed_on_first": 0}}
+
+
+def test_print_summary_table_shows_throughput(capsys):
+    llm_bench.print_summary([row("py_a", 1, completion_tokens=100, seconds=4.0)])
+    head, line = capsys.readouterr().out.strip().splitlines()[:2]
+    assert "tok/s" in head.split()
+    assert "reason_tok" not in head   # no row reports reasoning tokens
+    assert line.split()[-2:] == ["25.0", "2.0"]   # tok/s, load
+
+
+def test_print_summary_table_shows_reasoning_tokens_when_reported(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="a", reasoning_tokens=40), row("py_a", 1, model="b")])
+    lines = capsys.readouterr().out.strip().splitlines()
+    cells = {line.split()[1]: line.split() for line in lines[1:3]}
+    reason = lines[0].split().index("reason_tok")
+    assert (cells["a"][reason], cells["b"][reason]) == ("40", "-")
+
+
+def test_print_summary_markdown(capsys):
+    llm_bench.print_summary([row("py_a", 1, config="old"), row("py_a", 1)], fmt="markdown")
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert lines[0].startswith("| endpoint | model | pass@1 | passed | python |")
+    assert lines[1].startswith("| --- | --- | ---: | ---: | ---: |")
+    assert lines[2].startswith("| e | m | 1/1 | 1/1 | 1/1 |")
+    assert "row(s) from older versions" in lines[-1]   # notes follow the table as paragraphs
+    assert lines[3] == ""
+
+
+def test_print_summary_markdown_escapes_pipes(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="org|model")], fmt="markdown")
+    assert "| org\\|model |" in capsys.readouterr().out
+
+
+def test_print_summary_csv(capsys):
+    rows = [row("go_b", 0, lang="go", completion_tokens=900, seconds=2.0, config="old"),   # left out
+            row("py_a", 1, completion_tokens=100, seconds=4.0, reasoning_tokens=30),
+            row("py_a", 0, completion_tokens=100, seconds=4.0, reasoning_tokens=10),
+            row("go_b", 1, lang="go", completion_tokens=100, seconds=2.0)]
+    llm_bench.print_summary(rows, fmt="csv")
+    out, err = capsys.readouterr()
+    (rec,) = csv.DictReader(out.splitlines())
+    assert rec == {"endpoint": "e", "model": "m", "settings": "s1", "tasks": "2", "rounds_min": "1",
+                   "rounds_max": "2", "pass1": "1.5", "pass1_sd": "0.707", "passed": "1.5", "passed_sd": "0.707",
+                   "python": "0.5", "python_tasks": "1", "go": "1.0", "go_tasks": "1", "prompt_tokens": "20.0",
+                   "completion_tokens": "200.0", "reasoning_tokens": "20.0", "seconds": "6.0",
+                   "tok_per_s": "30.0", "load_seconds": "2.0"}
+    assert "row(s) from older versions" in err   # notes go to stderr, so stdout stays a CSV file
+
+
+def test_print_summary_csv_single_round_has_no_spread(capsys):
+    llm_bench.print_summary([row("py_a", 0, completion_tokens=0, finish_reason="timeout")], fmt="csv")
+    (rec,) = csv.DictReader(capsys.readouterr().out.splitlines())
+    assert (rec["pass1_sd"], rec["passed_sd"], rec["reasoning_tokens"], rec["tok_per_s"]) == ("", "", "", "")
+
+
+PER_TASK_ROWS = [row("py_a", 1, model="a"), row("py_a", 0, model="a"), row("go_b", 2, lang="go", model="a"),
+                 row("py_a", 1, model="b")]
+
+
+def test_print_summary_per_task_table(capsys):
+    llm_bench.print_summary(PER_TASK_ROWS, per_task=True)
+    out = capsys.readouterr().out
+    lines = out[out.index("\ntask"):].strip().splitlines()
+    assert lines[0].split() == ["task", "e/a", "e/b"]   # models in the summary's order
+    assert lines[1].split() == ["py_a", "1/2", "1/1"]   # tasks in language order
+    assert lines[2].split() == ["go_b", "1/1", "-"]
+
+
+def test_print_summary_per_task_markdown(capsys):
+    llm_bench.print_summary(PER_TASK_ROWS, fmt="markdown", per_task=True)
+    out = capsys.readouterr().out
+    assert "| task | e/a | e/b |\n| --- | ---: | ---: |\n| py_a | 1/2 | 1/1 |\n| go_b | 1/1 | - |" in out
+
+
+def test_print_summary_per_task_csv(capsys):
+    llm_bench.print_summary(PER_TASK_ROWS, fmt="csv", per_task=True)
+    recs = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+    assert [(r["model"], r["task"], r["lang"], r["trials"], r["passed"], r["passed_on_first"]) for r in recs] == [
+        ("a", "py_a", "python", "2", "1", "1"), ("a", "go_b", "go", "1", "1", "0"),
+        ("b", "py_a", "python", "1", "1", "1")]
+    assert list(recs[0]) == ["endpoint", "model", "settings", "task", "lang", "trials", "passed", "passed_on_first"]
+
+
+def test_print_summary_no_results_csv(capsys):
+    llm_bench.print_summary([], fmt="csv")
+    out, err = capsys.readouterr()
+    assert (out, err.strip()) == ("", "no results")

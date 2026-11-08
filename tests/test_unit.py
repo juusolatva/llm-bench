@@ -391,3 +391,26 @@ def test_cli_summary_mode(monkeypatch, capsys, tmp_path):
 def test_cli_summary_bad_file(monkeypatch, tmp_path):
     with pytest.raises(SystemExit, match="cannot read results"):
         run_main(monkeypatch, "--summary", str(tmp_path / "missing.csv"))
+
+
+def test_cli_summary_formats(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on\ne,m,py_a,python,1,1\ne,m,py_b,python,0,0\n")
+    run_main(monkeypatch, "--summary", str(path), "--format", "markdown")
+    assert "| e | m | 1/2 |" in capsys.readouterr().out
+    run_main(monkeypatch, "--summary", str(path), "--format", "csv", "--per-task")
+    assert capsys.readouterr().out.splitlines()[1:] == ["e,m,,py_a,python,1,1,1", "e,m,,py_b,python,1,0,0"]
+
+
+@pytest.mark.parametrize("args", [["--format", "csv"], ["--per-task"]])
+def test_cli_summary_options_need_summary(monkeypatch, capsys, args):
+    with pytest.raises(SystemExit) as exc:
+        run_main(monkeypatch, "http://localhost:1/v1", *args)
+    assert exc.value.code == 2
+    assert "only with --summary" in capsys.readouterr().err
+
+
+def test_cli_rejects_unknown_format(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        run_main(monkeypatch, "--summary", str(tmp_path / "r.csv"), "--format", "html")
+    assert exc.value.code == 2

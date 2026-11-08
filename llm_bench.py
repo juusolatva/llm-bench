@@ -147,8 +147,8 @@ def load_tasks(roots):
 # --------------------------------------------------------------------------------------------
 
 FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "passed_on", "attempts",
-          "prompt_tokens", "completion_tokens", "seconds", "load_seconds", "finish_reason", "fail_stage", "context",
-          "params", "settings", "config"]
+          "prompt_tokens", "completion_tokens", "reasoning_tokens", "seconds", "load_seconds", "finish_reason",
+          "fail_stage", "context", "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_CLOSE = "</think>"
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -672,6 +672,14 @@ def chat(label, base, payload, opts, stop):
 MODEL_ERRORS = ("bad_response", "disconnected")
 
 
+def reasoning_tokens(usage):
+    """usage.completion_tokens_details.reasoning_tokens, or None when the server doesn't report it (or reports
+    something other than a count)."""
+    details = usage.get("completion_tokens_details")
+    count = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    return count if type(count) is int and count >= 0 else None
+
+
 def is_model_error(finish):
     """Whether a finish reason means the model or server failed the request (counts toward MAX_MODEL_ERRORS)."""
     return finish in MODEL_ERRORS or (finish or "").startswith("http_")
@@ -685,8 +693,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": task["prompt"]},
     ]
-    result = {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
-              "seconds": 0.0, "finish_reason": None, "fail_stage": None}
+    result = skipped_result(None, None)
     for attempt in range(1, opts.attempts + 1):
         if stop.is_set():
             raise Interrupted
@@ -704,6 +711,9 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         result["finish_reason"] = finish
         result["prompt_tokens"] += usage.get("prompt_tokens") or 0
         result["completion_tokens"] += usage.get("completion_tokens") or 0
+        reasoning = reasoning_tokens(usage)
+        if reasoning is not None:   # stays None (an empty cell) unless some attempt reported it
+            result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning
         if len(text) > MAX_CONTENT_CHARS:  # counted as failure, nothing written to disk
             log(f"{label}: response exceeds {MAX_CONTENT_CHARS} chars", err=True)
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
@@ -829,9 +839,9 @@ def config_hash(settings, task):
 
 
 def skipped_result(finish_reason, fail_stage):
-    """The result fields of a trial that was skipped without sending a request."""
+    """The result fields of a trial that was skipped without sending a request (also a trial's starting point)."""
     return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
-            "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
+            "reasoning_tokens": None, "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
 
 
 INT_FIELDS = ("repeat", "passed", "passed_on", "attempts", "prompt_tokens", "completion_tokens")
@@ -859,6 +869,8 @@ def read_results(path):
             for k in FIELDS:
                 if row.get(k) is None:
                     row[k] = ""
+            # Empty when the server didn't report it, so a missing count isn't read as zero.
+            row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
             rows.append(row)
     return rows
 
@@ -972,10 +984,19 @@ def newest_configs(rows):
     return {key: config for key, (_, config) in newest.items()}
 
 
+def ended_with_reply(row):
+    """Whether a trial's last request got a reply: not a request error, a timeout or a skipped trial. Throughput
+    only counts these, so time spent waiting for a reply that never came doesn't lower it."""
+    finish = row.get("finish_reason") or ""
+    return not (is_model_error(finish) or finish in ("timeout", "skipped"))
+
+
 def summarize(rows):
     """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
     (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
     newest version is scored without that task. Several rows of a task are trials in different rounds.
+    Throughput ("tps") is completion tokens per request second over the trials that ended with a reply; reasoning
+    tokens ("rt") are a mean per round over the trials that reported them (None when none did).
     Returns (groups, dropped row count)."""
     newest = newest_configs(rows)
     tasks_by_group = {}
@@ -991,8 +1012,11 @@ def summarize(rows):
     for (endpoint, model, settings), tasks in tasks_by_group.items():
         g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
-             "trials": [], "tasks": set(tasks), "context": "unchecked"}
-        for task_rows in tasks.values():
+             "trials": [], "tasks": set(tasks), "context": "unchecked", "rt": None, "per_task": {}}
+        replied = [r for task_rows in tasks.values() for r in task_rows if ended_with_reply(r)]
+        reply_seconds = sum(r["seconds"] for r in replied)
+        g["tps"] = sum(r["completion_tokens"] for r in replied) / reply_seconds if reply_seconds else None
+        for task, task_rows in tasks.items():
             n = len(task_rows)
             p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
             p = sum(r["passed"] for r in task_rows) / n
@@ -1005,6 +1029,12 @@ def summarize(rows):
             g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
             g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
             g["s"] += sum(r["seconds"] for r in task_rows) / n
+            reasoning = [r["reasoning_tokens"] for r in task_rows if r.get("reasoning_tokens") is not None]
+            if reasoning:
+                g["rt"] = (g["rt"] or 0.0) + sum(reasoning) / len(reasoning)
+            g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
+                                   "passed": sum(r["passed"] for r in task_rows),
+                                   "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
             g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
             lang = g["langs"][task_rows[0]["lang"]]
             lang[0] += p
@@ -1025,60 +1055,164 @@ def task_set_gaps(groups):
             if by_settings[g["settings"]] - g["tasks"]]
 
 
-def print_summary(rows):
-    """Print the per-endpoint and per-model pass table for result rows (means and spread over rounds)."""
-    if not rows:
-        print("\nno results")
-        return
-    groups, dropped = summarize(rows)
-    repeated = any(n > 1 for g in groups for n in g["trials"])
-    show_settings = len({g["settings"] for g in groups}) > 1
-    langs = sorted({lang for g in groups for lang in g["langs"]}, key=lambda x: list(LANGS).index(x)
-                   if x in LANGS else len(LANGS))
+def lang_order(lang):
+    """Sort key for language names: LANGS order, unknown languages last."""
+    return list(LANGS).index(lang) if lang in LANGS else len(LANGS)
+
+
+def summary_layout(groups):
+    """What the summary tables show: whether there are several rounds, a settings column and reasoning tokens,
+    and the languages that were run."""
+    return {"repeated": any(n > 1 for g in groups for n in g["trials"]),
+            "show_settings": len({g["settings"] for g in groups}) > 1,
+            "reasoning": any(g["rt"] is not None for g in groups),
+            "langs": sorted({lang for g in groups for lang in g["langs"]}, key=lang_order)}
+
+
+def group_label(g, layout):
+    """A model in notes and column headers: endpoint/model, plus [settings] when the table has a settings column."""
+    return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if layout["show_settings"] else "")
+
+
+def summary_cells(groups, layout):
+    """The summary as display strings: (header, rows, number of leading text columns)."""
+    repeated, langs = layout["repeated"], layout["langs"]
 
     def score(value, var, n):
         """A pass count: mean±sd/n with several rounds, otherwise count/n."""
         return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
-    def lang_cell(value, n):
+    def lang_cell(lang_counts):
         """A per-language pass count: the mean with several rounds, otherwise the count, out of n."""
+        value, n = lang_counts
         return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
-    ew = max(8, *(len(g["endpoint"]) for g in groups))
-    sw = 12 if repeated else 6
-    head = f"\n{'endpoint':{ew}} {'model':40} " + (f"{'settings':12} " if show_settings else "")
-    head += (f"{'rounds':>6} " if repeated else "") + f"{'pass@1':>{sw}} {'passed':>{sw}} "
-    print(head + " ".join(f"{lang:>7}" for lang in langs)
-          + f" {'prompt_tok':>10} {'compl_tok':>10} {'sec':>8} {'load':>6}")
-    for g in sorted(groups, key=lambda g: (-g["pass"], -g["p1"], g["ct"])):
-        line = f"{g['endpoint']:{ew}} {g['model'][:40]:40} " + (f"{g['settings']:12} " if show_settings else "")
+    text = ["endpoint", "model"] + (["settings"] if layout["show_settings"] else [])
+    header = (text + (["rounds"] if repeated else []) + ["pass@1", "passed", *langs, "prompt_tok", "compl_tok"]
+              + (["reason_tok"] if layout["reasoning"] else []) + ["sec", "tok/s", "load"])
+    body = []
+    for g in groups:
+        cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
         if repeated:
             lo, hi = min(g["trials"]), max(g["trials"])
-            line += f"{lo if lo == hi else f'{lo}-{hi}':>6} "
-        line += f"{score(g['p1'], g['var1'], g['n']):>{sw}} {score(g['pass'], g['var'], g['n']):>{sw}} "
-        line += " ".join(f"{lang_cell(*g['langs'][lang]) if lang in g['langs'] else '-':>7}" for lang in langs)
-        print(line + f" {g['pt']:>10.0f} {g['ct']:>10.0f} {g['s']:>8.1f} {g['load']:>6.1f}")
+            cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
+        cells += [score(g["p1"], g["var1"], g["n"]), score(g["pass"], g["var"], g["n"])]
+        cells += [lang_cell(g["langs"][lang]) if lang in g["langs"] else "-" for lang in langs]
+        cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
+        if layout["reasoning"]:
+            cells.append("-" if g["rt"] is None else f"{g['rt']:.0f}")
+        cells += [f"{g['s']:.1f}", "-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
+        body.append(cells)
+    return header, body, len(text)
+
+
+def summary_records(groups, layout):
+    """The summary as CSV records: plain numbers, empty where a value is unknown (or, with one round, the spread)."""
+    def num(value, digits):
+        return "" if value is None else round(value, digits)
+
+    def spread(var):
+        return round(math.sqrt(var), 3) if layout["repeated"] else ""
+
+    records = []
+    for g in groups:
+        rec = {"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "tasks": g["n"],
+               "rounds_min": min(g["trials"]), "rounds_max": max(g["trials"]), "pass1": num(g["p1"], 3),
+               "pass1_sd": spread(g["var1"]), "passed": num(g["pass"], 3), "passed_sd": spread(g["var"])}
+        for lang in layout["langs"]:
+            passed, n = g["langs"].get(lang, (None, 0))   # .get: langs is a defaultdict
+            rec[lang], rec[f"{lang}_tasks"] = num(passed, 3), n
+        rec |= {"prompt_tokens": num(g["pt"], 1), "completion_tokens": num(g["ct"], 1),
+                "reasoning_tokens": num(g["rt"], 1), "seconds": num(g["s"], 2), "tok_per_s": num(g["tps"], 1),
+                "load_seconds": num(g["load"], 2)}
+        records.append(rec)
+    return records
+
+
+def task_order(groups):
+    """Every task of the groups, in language order, then by name."""
+    tasks = {task: info["lang"] for g in groups for task, info in g["per_task"].items()}
+    return sorted(tasks, key=lambda task: (lang_order(tasks[task]), task))
+
+
+def per_task_cells(groups, layout):
+    """The task x model table as display strings: passes/trials per task and model, "-" without trials."""
+    header = ["task"] + [group_label(g, layout) for g in groups]
+    body = [[task] + [f"{g['per_task'][task]['passed']}/{g['per_task'][task]['trials']}"
+                      if task in g["per_task"] else "-" for g in groups]
+            for task in task_order(groups)]
+    return header, body, 1
+
+
+def per_task_records(groups):
+    """The task x model table as CSV records in long form: one per model and task."""
+    return [{"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "task": task,
+             **g["per_task"][task]}
+            for g in groups for task in task_order([g])]
+
+
+def summary_notes(groups, dropped, layout):
+    """Explanations and warnings to print under the summary."""
     notes = []
-    if repeated:
+    if layout["repeated"]:
         notes.append("with several rounds: mean passes per round ± the standard deviation of one round's score; "
                      "tokens and seconds are means per round")
     if dropped:
         notes.append(f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
                      "are scored on each task's newest version")
-    def name(g):
-        """A table row in a note: endpoint/model, plus [settings] when the table has a settings column."""
-        return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if show_settings else "")
-
-    missing = [f"{name(g)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
+    missing = [f"{group_label(g, layout)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:
         notes.append("warning: models with the same settings were scored on different tasks, so their scores "
                      f"aren't comparable: {', '.join(missing)}")
-    failed = [f"{name(g)} ({g['context']})" for g in groups
-              if g["context"] not in ("ok", "unchecked")]
+    failed = [f"{group_label(g, layout)} ({g['context']})" for g in groups if g["context"] not in ("ok", "unchecked")]
     if failed:
         notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")
+    return notes
+
+
+def text_table(header, body, text_columns):
+    """A terminal table: text columns left-aligned, the rest right-aligned."""
+    widths = [max(len(cells[i]) for cells in (header, *body)) for i in range(len(header))]
+
+    def line(cells):
+        return " ".join(c.ljust(w) if i < text_columns else c.rjust(w)
+                        for i, (c, w) in enumerate(zip(cells, widths, strict=True))).rstrip()
+    return "\n".join(line(cells) for cells in (header, *body))
+
+
+def markdown_table(header, body, text_columns):
+    """A Markdown (GFM) pipe table: text columns left-aligned, the rest right-aligned."""
+    def line(cells):
+        return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+    rule = ["---" if i < text_columns else "---:" for i in range(len(header))]
+    return "\n".join(line(cells) for cells in (header, rule, *body))
+
+
+def print_summary(rows, fmt="table", per_task=False):
+    """Print the per-endpoint and per-model pass table for result rows (means and spread over rounds) as a terminal
+    table ("table"), Markdown or CSV. per_task adds a task x model table; in CSV it's printed instead of the
+    summary (one CSV per output), and notes go to stderr so stdout stays a valid CSV file."""
+    if not rows:
+        print("\nno results", file=sys.stderr if fmt == "csv" else sys.stdout)
+        return
+    groups, dropped = summarize(rows)
+    groups.sort(key=lambda g: (-g["pass"], -g["p1"], g["ct"]))
+    layout = summary_layout(groups)
+    notes = summary_notes(groups, dropped, layout)
+    if fmt == "csv":
+        records = per_task_records(groups) if per_task else summary_records(groups, layout)
+        w = csv.DictWriter(sys.stdout, fieldnames=list(records[0]), lineterminator="\n")
+        w.writeheader()
+        w.writerows(records)
+        for note in notes:
+            print(note, file=sys.stderr)
+        return
+    render = markdown_table if fmt == "markdown" else text_table
+    print("\n" + render(*summary_cells(groups, layout)))
     for note in notes:
         print(f"\n{note}")
+    if per_task:
+        print("\n" + render(*per_task_cells(groups, layout)))
 
 
 def parse_param(spec):
@@ -1159,6 +1293,11 @@ def parse_args():
                          "--max-tokens (default: never)")
     ap.add_argument("--summary", nargs="+", type=Path, metavar="CSV",
                     help="print the summary table of existing results files and exit (no endpoint needed)")
+    ap.add_argument("--format", choices=("table", "markdown", "csv"), default="table",
+                    help="with --summary: print the summary as a terminal table (default), Markdown or CSV")
+    ap.add_argument("--per-task", action="store_true",
+                    help="with --summary: also print a task x model table of passes per trial (with --format csv: "
+                         "instead of the summary, one row per model and task)")
     ap.add_argument("--no-context-check", dest="context_check", action="store_false",
                     help="skip checking that each model's context holds a worst-case trial (saves one long "
                          "prompt per model)")
@@ -1167,6 +1306,8 @@ def parse_args():
     ap.add_argument("-t", "--tag",
                     help="write results_<endpoint>_<TAG>.csv instead of results_<endpoint>.csv")
     args = ap.parse_args()
+    if not args.summary and (args.format != "table" or args.per_task):
+        ap.error("--format and --per-task work only with --summary")
     if not args.endpoints:
         args.endpoints = os.environ.get("LLM_BENCH_ENDPOINTS", "").split()
     if not args.endpoints and not args.list_tasks and not args.summary:
@@ -1187,18 +1328,33 @@ def parse_args():
 
 
 def check_results_file(path):
-    """Results are appended; refuse to mix rows into a file written with different columns."""
+    """Results are appended; refuse to mix rows into a file written with different columns. A file written by an
+    older version whose columns are all still in FIELDS is upgraded: rewritten with empty cells in the new ones."""
     if not path.exists() or path.stat().st_size == 0:
         return
     with open(path, newline="") as f:
         header = next(csv.reader(f), [])
-    if header != FIELDS:
+    if header != FIELDS and not set(header) <= set(FIELDS):
         sys.exit(f"{path} has different columns (written by another version?); "
                  f"move it away or use another --tag or --output-dir")
     try:
         read_results(path)
     except (ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot read {path}: {e}")
+    if header != FIELDS:
+        upgrade_results_file(path)
+
+
+def upgrade_results_file(path):
+    """Rewrite a results file with the current columns, keeping every cell; columns it lacks stay empty. The
+    new file replaces the old one only once it's complete."""
+    tmp = path.with_name(path.name + ".upgrade")
+    with open(path, newline="") as src, open(tmp, "w", newline="") as dst:
+        w = csv.DictWriter(dst, fieldnames=FIELDS, restval="")
+        w.writeheader()
+        w.writerows(csv.DictReader(src))
+    os.replace(tmp, path)
+    log(f"upgraded {path} to the current columns (new ones are empty in its existing rows)", err=True)
 
 
 def main():
@@ -1209,7 +1365,7 @@ def main():
             rows = [r for path in args.summary for r in read_results(path)]
         except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
             sys.exit(f"cannot read results: {e}")
-        print_summary(rows)
+        print_summary(rows, args.format, args.per_task)
         return
     try:
         all_tasks = load_tasks(args.tasks_dir or [DEFAULT_TASKS_DIR])
