@@ -66,7 +66,7 @@ uv run --locked --no-build --group dev pytest
 
 ## CI
 
-- `.github/workflows/`: `ci.yml` (ruff + pytest on Python 3.13 and 3.14), `sonarqube.yml` (SonarQube Cloud analysis, configured in `sonar-project.properties`; automatic analysis is off) and `osv-scanner.yml` (OSV-Scanner over the whole repository; `uv.lock` is currently its only lockfile).
+- `.github/workflows/`: `ci.yml` (ruff + pytest on Python 3.13 and 3.14), `sonarqube.yml` (runs pytest under `coverage`, then SonarQube Cloud analysis, configured in `sonar-project.properties`; automatic analysis is off; the quality gate requires 80 % coverage of new code, and sandbox tests skip on CI, so new runner code needs tests that work without the sandbox too) and `osv-scanner.yml` (OSV-Scanner over the whole repository; `uv.lock` is currently its only lockfile).
 - Pin actions to full commit SHAs with the version in a comment, set `persist-credentials: false` on checkouts, and check workflow changes with `actionlint` and `zizmor --persona=auditor`.
 - Don't commit files named `*old-results.json`, `*new-results.json` or `*.sarif`: the OSV PR scan writes its baseline to these paths, and the `guard-osv-results` job fails a PR that tracks one.
 

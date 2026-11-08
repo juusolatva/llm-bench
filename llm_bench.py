@@ -156,9 +156,9 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # opening fence is a run of 3+ backticks either at the start of a line with an optional info string (it
 # starts with the language tag: "python", "python:solution.py", "c++ title=x") or mid-line directly followed
 # by a (required) tag and the end of the line ("Here: ```python"). Possessive quantifiers (*+, ++) and the
-# lookbehind keep matching linear on degenerate replies such as long runs of backticks or spaces.
-FENCE_OPEN_RE = re.compile(r"(?:^[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n)|(?:(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n)",
-                           re.MULTILINE)
+# lookbehind keep matching linear on degenerate replies such as long runs of backticks or spaces. "(?<![^\n])"
+# is the start of a line (like "^" with re.MULTILINE, without an anchor in only one alternative).
+FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n")
 # A closing fence: a run of 3+ backticks followed only by whitespace up to the end of the line.
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
