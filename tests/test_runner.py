@@ -111,7 +111,7 @@ def test_no_code_reply(mock_server, tmp_path):
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
     assert (row["passed"], row["attempts"], row["fail_stage"]) == (0, 2, "no_code")
     assert "did not contain any code" in s.requests[1]["messages"][-1]["content"]
-    assert (tmp_path / "runs/test_model/py_t0/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
+    assert (tmp_path / "runs/test_model/py_t0/cfg/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
 
 
 def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
@@ -121,7 +121,7 @@ def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
     assert len(dirs) == 2
     assert all(d.startswith("_foo-") for d in dirs)
     for d in dirs:
-        assert (tmp_path / "runs" / d / "py_t0/repeat_1/attempt_1/response.md").is_file()
+        assert (tmp_path / "runs" / d / "py_t0/cfg/repeat_1/attempt_1/response.md").is_file()
 
 
 def test_results_are_appended(mock_server, tmp_path):
@@ -220,7 +220,7 @@ def test_repeat_runs_each_task_k_times_repeat_major(mock_server, tmp_path):
     s = mock_server(replies=[""] * 4)
     rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], repeat=2)
     assert [(r["task"], r["repeat"]) for r in rows] == [("py_t0", 1), ("py_t1", 1), ("py_t0", 2), ("py_t1", 2)]
-    assert (tmp_path / "runs/test_model/py_t0/repeat_2/attempt_1").is_dir()
+    assert (tmp_path / "runs/test_model/py_t0/cfg/repeat_2/attempt_1").is_dir()
     assert len(s.probes) == 3   # one warm-up and context check per model, not per repeat
 
 
@@ -254,6 +254,16 @@ def test_resume_ignores_rows_with_other_config(mock_server, tmp_path):
     run_endpoint(s, tmp_path, tasks=TASKS[:1])
     changed = [{**TASKS[0], "config": "other"}]          # e.g. the prompt changed
     assert len(run_endpoint(s, tmp_path, tasks=changed, resume=True)) == 1
+
+
+def test_transcripts_of_other_configs_are_kept(mock_server, tmp_path):
+    s = mock_server(replies=["first", "second"])
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    rows = run_endpoint(s, tmp_path, tasks=[{**TASKS[0], "config": "other"}])   # e.g. --attempts changed
+    assert rows[0]["repeat"] == 1   # numbering restarts for the new config, but in its own directory
+    for config, reply in (("cfg", "first"), ("other", "second")):
+        response = tmp_path / f"runs/test_model/py_t0/{config}/repeat_1/attempt_1/response.md"
+        assert response.read_text() == reply
 
 
 def test_length_budget_skips_rest_of_model(mock_server, tmp_path):
@@ -316,6 +326,12 @@ def test_newest_configs():
     assert llm_bench.newest_configs(rows) == {("s1", "py_a"): "v2", ("s1", "py_b"): "b2", ("s2", "py_a"): "s2"}
 
 
+def test_newest_configs_ranks_whole_second_run_ids_first_within_their_second():
+    rows = [row("py_a", 0, config="new", run_id="20261107T202918.123Z"),
+            row("py_a", 0, config="old", run_id="20261107T202918Z")]   # older version wrote whole seconds
+    assert llm_bench.newest_configs(rows) == {("s1", "py_a"): "new"}
+
+
 def test_new_run_id_has_milliseconds():
     from datetime import UTC, datetime
     assert llm_bench.new_run_id(datetime(2026, 11, 7, 20, 29, 18, 123456, UTC)) == "20261107T202918.123Z"
@@ -334,6 +350,19 @@ def test_print_summary_with_repeats(capsys):
     assert "1.5±0.7/2" in out
     assert "rounds" in out
     assert "mean passes per round" in out
+
+
+def test_print_summary_warns_about_different_task_sets(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="a"), row("py_b", 1, model="a"), row("py_a", 1, model="b"),
+                             row("py_c", 1, model="c"), row("py_a", 1, model="d", settings="s2")])
+    out = capsys.readouterr().out
+    assert ("warning: models with the same settings were scored on different tasks, so their scores aren't "
+            "comparable: e/a (missing py_c), e/b (missing py_b, py_c), e/c (missing py_a, py_b)") in out
+
+
+def test_print_summary_no_task_set_warning_when_tasks_match(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="a"), row("py_a", 0, model="b")])
+    assert "different tasks" not in capsys.readouterr().out
 
 
 def test_read_results_accepts_old_files(tmp_path):

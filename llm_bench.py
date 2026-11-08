@@ -5,7 +5,7 @@ Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM S
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
 Tasks are loaded from tasks/<lang>/<task>/ next to this script (see load_tasks).
 Output: results_<endpoint>.csv (one row per trial: one model on one task) and
-runs/<endpoint>/<model>/<task>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
+runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
 toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils).
 Run with --help for usage.
@@ -937,7 +937,9 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
                         break
                     repeat = numbered[(model, task["name"], task["config"])] + 1
                     label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    taskdir = runs_dir / dirs[model] / task["name"] / f"repeat_{repeat}"
+                    # Trial numbers restart for each config, so it's part of the path: no trial can replace
+                    # the transcript of another config's trial.
+                    taskdir = runs_dir / dirs[model] / task["name"] / task["config"] / f"repeat_{repeat}"
                     result = run_one_task(label, base, model, task, taskdir, opts, stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
                     length_finishes += result["finish_reason"] == "length"
@@ -961,7 +963,10 @@ def newest_configs(rows):
     newest = {}
     for i, r in enumerate(rows):
         key = (r.get("settings") or "", r["task"])
-        rank = (r.get("run_id") or "", i)
+        run_id = r.get("run_id") or ""
+        if run_id.endswith("Z") and "." not in run_id:   # older versions wrote whole seconds
+            run_id = run_id[:-1] + ".000Z"
+        rank = (run_id, i)
         if key not in newest or rank > newest[key][0]:
             newest[key] = (rank, r.get("config"))
     return {key: config for key, (_, config) in newest.items()}
@@ -986,7 +991,7 @@ def summarize(rows):
     for (endpoint, model, settings), tasks in tasks_by_group.items():
         g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
-             "trials": [], "context": "unchecked"}
+             "trials": [], "tasks": set(tasks), "context": "unchecked"}
         for task_rows in tasks.values():
             n = len(task_rows)
             p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
@@ -1009,6 +1014,15 @@ def summarize(rows):
                 g["context"] = task_rows[-1]["context"]
         groups.append(g)
     return groups, dropped
+
+
+def task_set_gaps(groups):
+    """["endpoint/model (missing task, ...)"] for models scored on fewer tasks than others with the same settings."""
+    by_settings = defaultdict(set)
+    for g in groups:
+        by_settings[g["settings"]] |= g["tasks"]
+    return [f"{g['endpoint']}/{g['model']} (missing {', '.join(sorted(by_settings[g['settings']] - g['tasks']))})"
+            for g in groups if by_settings[g["settings"]] - g["tasks"]]
 
 
 def print_summary(rows):
@@ -1051,6 +1065,10 @@ def print_summary(rows):
     if dropped:
         notes.append(f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
                      "are scored on each task's newest version")
+    missing = task_set_gaps(groups)
+    if missing:
+        notes.append("warning: models with the same settings were scored on different tasks, so their scores "
+                     f"aren't comparable: {', '.join(missing)}")
     failed = [f"{g['endpoint']}/{g['model']} ({g['context']})" for g in groups
               if g["context"] not in ("ok", "unchecked")]
     if failed:
