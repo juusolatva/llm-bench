@@ -101,7 +101,7 @@ A task's exact content: its prompt, harness and the way it is built and tested. 
 _Avoid_: Config, task revision
 
 **Comparable**:
-Trials are comparable when they share the same settings and task version. Scores are compared only across comparable trials, so a summary scores every model on the same version of each task.
+Trials are comparable when they share the same settings and task version. Two models' scores are comparable only when they come from comparable trials of the same tasks.
 
 ## Scores
 

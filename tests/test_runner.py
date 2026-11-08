@@ -307,6 +307,21 @@ def test_summarize_newest_task_version_is_the_latest_run_not_the_last_row():
     assert {g["model"]: g["n"] for g in groups} == {"a": 1, "b": 1}   # b keeps only py_b
 
 
+def test_newest_configs():
+    rows = [row("py_a", 0, config="v2", run_id="20261102T000000.000Z"),
+            row("py_a", 0, config="v1", run_id="20261101T000000.000Z"),   # older run, later row
+            row("py_a", 0, config="v0"),                                    # old file without run_id
+            row("py_b", 0, config="b1"), row("py_b", 0, config="b2"),       # no run_id: row order decides
+            row("py_a", 0, config="s2", settings="s2")]
+    assert llm_bench.newest_configs(rows) == {("s1", "py_a"): "v2", ("s1", "py_b"): "b2", ("s2", "py_a"): "s2"}
+
+
+def test_new_run_id_has_milliseconds():
+    from datetime import UTC, datetime
+    assert llm_bench.new_run_id(datetime(2026, 11, 7, 20, 29, 18, 123456, UTC)) == "20261107T202918.123Z"
+    assert llm_bench.new_run_id(datetime(2026, 11, 7, 20, 29, 18, 999, UTC)) == "20261107T202918.000Z"
+
+
 def test_summarize_omits_models_without_current_trials():
     rows = [row("py_a", 1, model="a", config="old", run_id="1"), row("py_a", 1, model="b", config="new", run_id="2")]
     groups, dropped = llm_bench.summarize(rows)

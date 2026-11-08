@@ -948,6 +948,13 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             pass
 
 
+def new_run_id(now=None):
+    """UTC start time with milliseconds, e.g. 20261107T202918.123Z: sorts by time, and runs started in the same
+    second still get different IDs (newest_configs orders task versions by it)."""
+    now = now or datetime.now(UTC)
+    return f"{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}Z"
+
+
 def newest_configs(rows):
     """{(settings, task): config of the task's newest version}: the config of its rows from the latest run_id
     (row order breaks ties, e.g. for old files without run_id)."""
@@ -1209,7 +1216,7 @@ def main():
 
     check_toolchains(tasks)
     check_sandbox()
-    args.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    args.run_id = new_run_id()
     settings = settings_fingerprint(args)
     args.settings_hash = settings_hash(settings)
     tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
