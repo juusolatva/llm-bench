@@ -15,13 +15,15 @@ mod harness_tests {
                     self.log.join(", "), name, qty, got, if want_ok { "Ok(())" } else { "an Err" });
             self.log.push(format!("remove({:?}, {})", name, qty));
         }
-        fn get(&self, name: &str, want: u32) {
+        fn get(&mut self, name: &str, want: u32) {
             let got = self.inv.get(name);
             assert!(got == want, "after {}: get({:?}) returned {}, want {}", self.log.join(", "), name, got, want);
+            self.log.push(format!("get({:?})", name));
         }
-        fn len(&self, want: usize) {
+        fn len(&mut self, want: usize) {
             let got = self.inv.len();
             assert!(got == want, "after {}: len() returned {}, want {}", self.log.join(", "), got, want);
+            self.log.push("len()".to_string());
         }
     }
 

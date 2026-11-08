@@ -35,6 +35,16 @@ r = harness_check(only, {}, only)
 r["n"]["m"].append(2)
 assert only == {"n": {"m": [1]}}, (f"r = deep_merge({{'n': {{'m': [1]}}}}, {{}}); r['n']['m'].append(2) changed a to "
                                    f"{only!r}; the result must not share dicts or lists with a or b")
+for which in ("a", "b"):
+    nested = {"l": [[1], {"d": 1}]}
+    args = (nested, {}) if which == "a" else ({}, nested)
+    shown = ", ".join(repr(x) for x in args)
+    r = harness_check(*args, {"l": [[1], {"d": 1}]})
+    r["l"][0].append(2)
+    r["l"][1]["d"] = 9
+    assert nested == {"l": [[1], {"d": 1}]}, (
+        f"r = deep_merge({shown}); r['l'][0].append(2); r['l'][1]['d'] = 9 changed {which} to {nested!r}; "
+        f"the result must not share dicts or lists with a or b, including ones nested in lists")
 harness_check({"k": 1}, {"k": {"z": 1}}, {"k": {"z": 1}})
 harness_check({"k": {"z": 1}}, {"k": None}, {"k": None})
 harness_check({"k": {"z": 1}}, {"k": [1]}, {"k": [1]})

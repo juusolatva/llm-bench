@@ -6,16 +6,20 @@
 
 #define HARNESS_CHECK(c, ...) do { if (!(c)) { std::fprintf(stderr, "FAIL: " __VA_ARGS__); std::fputc('\n', stderr); std::exit(1); } } while (0)
 
+// b[i] for failure messages, or -1 if i is out of range (the solution's size() may be wrong).
+static int harness_at(const Buffer& b, std::size_t i) { return i < b.size() ? b[i] : -1; }
+
 int main() {
     Buffer a(4);
     HARNESS_CHECK(a.size() == 4 && a[0] == 0 && a[3] == 0,
-                  "Buffer a(4): size() = %zu, a[0] = %d, a[3] = %d; want size() 4 and zero-filled", a.size(), a[0], a[3]);
+                  "Buffer a(4): size() = %zu, a[0] = %d, a[3] = %d; want size() 4 and zero-filled", a.size(), harness_at(a, 0),
+                  harness_at(a, 3));
     a[0] = 'x';
     {
         Buffer b = a;
         HARNESS_CHECK(b.size() == 4 && b[0] == 'x',
                       "Buffer b = a (a has size 4, a[0] = 'x'): b.size() = %zu, b[0] = %d; want 4 and 'x' (%d)",
-                      b.size(), b[0], 'x');
+                      b.size(), harness_at(b, 0), 'x');
         b[0] = 'y';
         HARNESS_CHECK(a[0] == 'x', "Buffer b = a; b[0] = 'y': a[0] = %d, want 'x' (%d); copies must be independent",
                       a[0], 'x');
@@ -27,7 +31,7 @@ int main() {
         c = a;
         HARNESS_CHECK(c.size() == 4 && c[0] == 'x',
                       "Buffer c(2); c = a (a has size 4, a[0] = 'x'): c.size() = %zu, c[0] = %d; want 4 and 'x' (%d)",
-                      c.size(), c[0], 'x');
+                      c.size(), harness_at(c, 0), 'x');
         c[1] = 'z';
         HARNESS_CHECK(a[1] == 0, "c = a; c[1] = 'z': a[1] = %d, want 0; copy assignment must make an independent copy",
                       a[1]);
@@ -36,7 +40,7 @@ int main() {
     a = ref;
     HARNESS_CHECK(a.size() == 4 && a[0] == 'x',
                   "self-assignment a = a (a has size 4, a[0] = 'x'): a.size() = %zu, a[0] = %d; want 4 and 'x' (%d)",
-                  a.size(), a[0], 'x');
+                  a.size(), harness_at(a, 0), 'x');
 
     char* p = a.data();
     Buffer m(std::move(a));
@@ -49,7 +53,7 @@ int main() {
     HARNESS_CHECK(n.data() == p && n.size() == 4 && n[0] == 'x',
                   "Buffer n(1); n = std::move(m) (m has size 4, m[0] = 'x'): n.size() = %zu, n[0] = %d, n.data() %s "
                   "m's old data(); want 4, 'x' (%d) and the same pointer (move assignment must transfer the memory)",
-                  n.size(), n[0], n.data() == p ? "==" : "!=", 'x');
+                  n.size(), harness_at(n, 0), n.data() == p ? "==" : "!=", 'x');
     HARNESS_CHECK(m.size() == 0, "n = std::move(m): moved-from m.size() = %zu, want 0", m.size());
 
     std::vector<Buffer> v;

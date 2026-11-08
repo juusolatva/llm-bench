@@ -46,6 +46,18 @@ func TestLongLine(t *testing.T) {
 	}
 }
 
+func TestHugeLines(t *testing.T) {
+	// A 2 MiB line of short words, then a 100 KiB word on a line of its own.
+	long := strings.Repeat("ab ", 700000)
+	huge := strings.Repeat("x", 100000)
+	got, err := WordFreq(strings.NewReader(long + "\n" + huge + "\n"))
+	if err != nil || got["ab"] != 700000 || got[huge] != 1 || len(got) != 2 {
+		t.Fatalf("WordFreq(strings.Repeat(\"ab \", 700000) + \"\\n\" + strings.Repeat(\"x\", 100000) + \"\\n\"): "+
+			"got %d for \"ab\", %d for the 100000-letter word and %d distinct words, error %v; want 700000, 1, 2, nil",
+			got["ab"], got[huge], len(got), err)
+	}
+}
+
 func TestReadError(t *testing.T) {
 	boom := errors.New("boom")
 	_, err := WordFreq(iotest.ErrReader(boom))

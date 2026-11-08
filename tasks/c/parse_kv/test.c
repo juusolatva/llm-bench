@@ -4,7 +4,7 @@
 int parse_kv(const char *line, char *key, size_t keysz, char *val, size_t valsz);
 
 static int fails;
-/* Print s as a C string literal, so "\r", "\n" and "\t" in inputs are visible. */
+/* Print s as a C string literal, so control characters such as "\r", "\n" and "\t" in inputs are visible. */
 static void harness_put_escaped(const char *s) {
     fputc('"', stderr);
     for (; *s; s++) {
@@ -12,6 +12,7 @@ static void harness_put_escaped(const char *s) {
         else if (*s == '\r') fputs("\\r", stderr);
         else if (*s == '\t') fputs("\\t", stderr);
         else if (*s == '"' || *s == '\\') fprintf(stderr, "\\%c", *s);
+        else if ((unsigned char)*s < 0x20 || *s == 0x7f) fprintf(stderr, "\\x%02x", (unsigned char)*s);
         else fputc(*s, stderr);
     }
     fputc('"', stderr);
@@ -21,7 +22,13 @@ static void t(const char *line, size_t ks, size_t vs, int want, const char *wk, 
     char *l = malloc(n); memcpy(l, line, n);
     char *k = malloc(ks), *v = malloc(vs);   /* exact sizes: ASan catches overflows */
     int r = parse_kv(l, k, ks, v, vs);
-    if (r != want || (want == 1 && (strcmp(k, wk) != 0 || strcmp(v, wv) != 0))) {
+    if (r == 1 && (!memchr(k, '\0', ks) || !memchr(v, '\0', vs))) {
+        fputs("parse_kv(", stderr);
+        harness_put_escaped(line);
+        fprintf(stderr, ", key, %zu, val, %zu): got 1, but %s is not NUL-terminated within its %zu bytes (want %d)\n", ks,
+                vs, memchr(k, '\0', ks) ? "val" : "key", memchr(k, '\0', ks) ? vs : ks, want);
+        fails++;
+    } else if (r != want || (want == 1 && (strcmp(k, wk) != 0 || strcmp(v, wv) != 0))) {
         fputs("parse_kv(", stderr);
         harness_put_escaped(line);
         fprintf(stderr, ", key, %zu, val, %zu): got %d", ks, vs, r);
@@ -47,6 +54,9 @@ int main(void) {
     t("\tkey\t=\t v\tw \t\n", 32, 32, 1, "key", "v\tw");
     t("empty =", 32, 32, 1, "empty", "");
     t("a=b=c", 32, 32, 1, "a", "b=c");
+    t("k = a # b", 32, 32, 1, "k", "a # b");
+    t("a#b=c", 32, 32, 1, "a#b", "c");
+    t("\v\fk\f=\vv\v", 32, 32, 1, "k", "v");
     t("# comment", 32, 32, 0, 0, 0);
     t("   # indented = comment", 32, 32, 0, 0, 0);
     t("", 32, 32, 0, 0, 0);
@@ -56,6 +66,7 @@ int main(void) {
     t("= x", 32, 32, -1, 0, 0);
     t("   =x", 32, 32, -1, 0, 0);
     t("abc=1", 4, 32, 1, "abc", "1");
+    t("  abc  =  1  ", 4, 2, 1, "abc", "1");
     t("abcd=1", 4, 32, -1, 0, 0);
     t("k=abc", 4, 4, 1, "k", "abc");
     t("k=abcd", 4, 4, -1, 0, 0);

@@ -12,7 +12,7 @@ check() {
         printf '===== input file "%s":\n' "$2" >&2; cat "$1" >&2; printf '===== end of input\n' >&2
         [ "$rc" -eq 0 ] || fail "bash solution.sh '$2': exit status $rc, want 0 (stderr: $(cat "$T/err"))"
         diff "$T/want" "$T/out" >&2
-        fail "bash solution.sh '$2': wrong output (diff above: < want, > got)"
+        fail "bash solution.sh '$2': wrong output (diff above: < want, > got; stderr: $(cat "$T/err"))"
     fi
 }
 T=$(mktemp -d) || exit 1
@@ -21,6 +21,11 @@ trap 'rm -rf "$T"' EXIT
 printf 'The cat and the hat.\nTHE end, cat! Zebra zebra\n' > "$T/in put.txt"
 printf '%s\n' '3 the' '2 cat' '2 zebra' > "$T/want"
 check "$T/in put.txt" "in put.txt"
+
+# Tied words appear in reverse alphabetical order, and a digit splits "b9b" into two words.
+printf 'zed Zed amy\namy b9b\n' > "$T/ties"
+printf '%s\n' '2 amy' '2 b' '2 zed' > "$T/want"
+check "$T/ties" "ties"
 
 printf 'b a b\n' > "$T/two"
 printf '%s\n' '2 b' '1 a' > "$T/want"

@@ -50,6 +50,29 @@ int main(void) {
     HARNESS_CHECK(rc == 0 && v.len == n - 1, "iv_remove_at(v, len - 1) with len %zu: got %d and len %zu, want 0 and len %zu",
                   n, rc, v.len, n - 1);
     iv_free(&v);
+
+    /* The harness shrinks the allocation to exactly len elements (cap = len), so any read or write past len is
+       out of bounds and ASan reports it, whatever the growth policy. */
+    intvec f; iv_init(&f);
+    for (int i = 0; i < 100; i++) {
+        rc = iv_push(&f, i);
+        HARNESS_CHECK(rc == 0, "iv_push(f, %d) (pushing 0, 1, 2, ... in order): got %d, want 0", i, rc);
+    }
+    HARNESS_CHECK(f.len == 100, "after pushing 0..99: len = %zu, want 100", f.len);
+    for (int round = 0; round < 2; round++) {
+        int *shrunk = realloc(f.data, f.len * sizeof *f.data);
+        HARNESS_CHECK(shrunk != NULL, "harness: realloc failed");
+        f.data = shrunk;
+        f.cap = n = f.len;
+        size_t i = round == 0 ? 0 : n - 1;
+        rc = iv_remove_at(&f, i);
+        HARNESS_CHECK(rc == 0 && f.len == n - 1, "iv_remove_at(f, %zu) with len == cap == %zu (allocation shrunk to "
+                      "len elements): got %d and len %zu, want 0 and len %zu", i, n, rc, f.len, n - 1);
+        for (size_t j = 0; j < f.len; j++)
+            HARNESS_CHECK(f.data[j] == (int)j + 1, "after pushing 0..99, iv_remove_at(f, 0)%s: data[%zu] = %d, "
+                          "want %d", round ? " and iv_remove_at(f, len - 1)" : "", j, f.data[j], (int)j + 1);
+    }
+    iv_free(&f);
     puts("ok");
     return 0;
 }

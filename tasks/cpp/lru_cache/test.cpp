@@ -32,6 +32,7 @@ struct HarnessCache {
     void size(std::size_t want) {
         std::size_t got = cache.size();
         if (got != want) fail("size() returned " + std::to_string(got) + ", want " + std::to_string(want));
+        log += ", size()";
     }
 };
 
@@ -52,6 +53,14 @@ int main() {
     c.get("a", 10);
     c.get("d", 4);
     c.size(2);
+
+    HarnessCache<std::string> u(2);
+    u.put("a", 1);
+    u.put("b", 2);
+    u.put("b", 9);                                     // update at capacity: nothing is evicted
+    u.get("a", 1);
+    u.get("b", 9);
+    u.size(2);
 
     HarnessCache<int> one(1);
     one.put(1, 1);
