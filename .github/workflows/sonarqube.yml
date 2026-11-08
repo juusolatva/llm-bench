@@ -15,6 +15,9 @@ concurrency:
 jobs:
   analyze:
     name: SonarQube analysis
+    # GitHub withholds secrets from fork PRs, so the scan can't authenticate there. Dependabot PRs come from this
+    # repository and use the Dependabot copy of SONAR_TOKEN.
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
