@@ -11,6 +11,7 @@ toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils).
 Run with --help for usage.
 """
 import argparse
+import bisect
 import csv
 import hashlib
 import http.client
@@ -39,7 +40,7 @@ from typing import NamedTuple
 # --- CONFIGURATION ---
 # Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
 # code extraction, build/test handling), so rows from different versions are never mixed.
-BENCH_VERSION = "0.3.0"
+BENCH_VERSION = "0.4.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
@@ -77,23 +78,24 @@ SYSTEM = (
 )
 
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
-# Per language: task name prefix, solution file, harness file, whether the harness is appended to the
-# solution instead of written as its own file (Rust's #[cfg(test)] module), extra files, build/test commands.
+# Per language: task name prefix, solution file, harness file, code block language tags (preferred by
+# extract_code), whether the harness is appended to the solution instead of written as its own file (Rust's
+# #[cfg(test)] module), extra files, build/test commands.
 LANGS = {
-    "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py",
+    "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py", "tags": ("python", "py", "python3"),
                "cmds": [["python3", "test_solution.py"]]},
-    "c": {"prefix": "c", "sol": "solution.c", "test": "test.c",
+    "c": {"prefix": "c", "sol": "solution.c", "test": "test.c", "tags": ("c", "h"),
           "cmds": [["gcc", "-std=gnu17", "-O1", "-g", "-Wall", *SAN, "solution.c", "test.c", "-o", "t", "-lm"],
                    ["./t"]]},
-    "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp",
+    "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp", "tags": ("cpp", "c++", "cxx", "cc", "hpp", "h++"),
             "cmds": [["g++", "-std=c++17", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"],
                      ["./t"]]},
-    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "append": True,
+    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "tags": ("rust", "rs"), "append": True,
              "cmds": [["rustc", "--edition", "2021", "--test", "-O", "-o", "t", "lib.rs"], ["./t"]]},
-    "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go",
+    "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
            "cmds": [["go", "test", "-race", "-count=1", "."]]},
-    "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh",
+    "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
              "cmds": [["bash", "test.sh"]]},
 }
 
@@ -149,9 +151,43 @@ FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "pa
           "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-CODE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# Fenced code blocks are found by a left-to-right scan (_code_blocks), so a fence is never used twice. An
+# opening fence is a run of 3+ backticks either at the start of a line with an optional info string (it
+# starts with the language tag: "python", "python:solution.py", "c++ title=x") or mid-line directly followed
+# by a (required) tag and the end of the line ("Here: ```python"). Possessive quantifiers (*+, ++) and the
+# lookbehind keep matching linear on degenerate replies such as long runs of backticks or spaces.
+FENCE_OPEN_RE = re.compile(r"^[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n",
+                           re.MULTILINE)
+# A closing fence: a run of 3+ backticks followed only by whitespace up to the end of the line.
+FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
+
+
+def safe_name(name):
+    """A single path component derived from a model, endpoint or tag name: unsafe characters become "_",
+    and a leading dot too, so the result is never "", "." or ".." (or a hidden file)."""
+    return re.sub(r"^\.", "_", UNSAFE_NAME_RE.sub("_", name)) or "_"
+
+
+def model_dirs(models):
+    """Transcript directory names for model IDs, unique per endpoint, so no model can delete or overwrite
+    another model's transcripts. Each ID gets safe_name(ID), or that plus "-" and a short hash of the ID if
+    another ID has the same safe name (".foo" and "_foo", "a/b" and "a_b"). A name still taken by an earlier
+    model (e.g. an ID that equals another's hashed name) gets "-2", "-3", ... appended."""
+    models = list(dict.fromkeys(models))
+    counts = Counter(safe_name(m) for m in models)
+    names, taken = {}, set()
+    for m in models:
+        name = safe_name(m)
+        if counts[name] > 1:
+            name = f"{name}-{hashlib.sha256(m.encode()).hexdigest()[:8]}"
+        candidate, k = name, 2
+        while name in taken:
+            name, k = f"{candidate}-{k}", k + 1
+        names[m] = name
+        taken.add(name)
+    return names
 
 
 PRINT_LOCK = threading.Lock()
@@ -166,6 +202,8 @@ def log(msg, err=False):
 
 
 def http_json(url, payload=None, timeout=60, api_key=None):
+    """GET url (or POST payload as JSON) and return the decoded JSON reply. Raises ValueError if the reply
+    exceeds MAX_RESPONSE_BYTES or isn't JSON, and urllib/http.client errors on HTTP or connection failures."""
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -180,6 +218,7 @@ def http_json(url, payload=None, timeout=60, api_key=None):
 
 
 def list_models(name, base, api_key):
+    """The model IDs the endpoint serves, or [] (with a message) if they can't be listed."""
     try:
         return [m["id"] for m in http_json(f"{base}/models", timeout=10, api_key=api_key)["data"]]
     except (OSError, http.client.HTTPException, KeyError, TypeError, ValueError) as e:
@@ -207,14 +246,94 @@ def parse_endpoint(spec):
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     if not name:
         name = parts.hostname if parts.port is None else f"{parts.hostname}_{parts.port}"
-    name = UNSAFE_NAME_RE.sub("_", name)
-    return name, base
+    return safe_name(name), base
 
 
-def extract_code(text):
-    text = THINK_RE.sub("", text)
-    blocks = CODE_RE.findall(text)
-    return blocks[-1] if blocks else text
+def _code_blocks(text):
+    """Fenced blocks as (start, end, tag, code), in reply order. A block ends at the first closing fence after
+    it: a run of at least as many backticks as its opening fence followed only by whitespace up to the end of
+    the line, either on its own line or glued to the end of the code. Scanning stops at an unclosed block.
+    The closing fences are found in one pass, so this stays linear in the reply length."""
+    closes = [(m.start(), m.end(), len(m.group(1))) for m in FENCE_CLOSE_RE.finditer(text)]
+    starts = [c[0] for c in closes]
+    longest_after = [0] * (len(closes) + 1)   # longest closing fence at or after each index
+    for i in range(len(closes) - 1, -1, -1):
+        longest_after[i] = max(closes[i][2], longest_after[i + 1])
+    blocks, pos = [], 0
+    while (opening := FENCE_OPEN_RE.search(text, pos)):
+        fence, tag = (opening.group(1), opening.group(2)) if opening.group(1) else (opening.group(3), opening.group(4))
+        i = bisect.bisect_left(starts, opening.end())
+        if longest_after[i] < len(fence):
+            break
+        while closes[i][2] < len(fence):   # shorter fences inside the block are code
+            i += 1
+        code_end, end, _ = closes[i]
+        line_start = text.rfind("\n", 0, code_end) + 1
+        if line_start >= opening.end() and not text[line_start:code_end].strip():
+            code_end = line_start   # a fence on its own (possibly indented) line: the code ends before it
+        blocks.append((opening.start(), end, tag, text[opening.end():code_end]))
+        pos = end
+    return blocks
+
+
+def _outside_code(blocks, positions):
+    """The positions that aren't inside one of the blocks (from _code_blocks)."""
+    starts = [b[0] for b in blocks]
+    keep = []
+    for pos in positions:
+        i = bisect.bisect_right(starts, pos) - 1
+        if i < 0 or pos >= blocks[i][1]:
+            keep.append(pos)
+    return keep
+
+
+def strip_think(text):
+    """Remove reasoning and return the rest of the reply:
+    - <think>...</think> blocks;
+    - for servers that drop the opening tag, everything up to the last unpaired </think> that is followed
+      by a code block (if the reply has no code block, up to the first one; if code blocks exist but none
+      follows a </think>, nothing, so a tag mentioned after the answer can't erase it);
+    - a reply that starts with a <think> that never closes (reasoning cut off by max_tokens) becomes "".
+    Tags inside fenced code blocks are part of the code, and an unpaired <think> later in the reply is text.
+    CRLF line endings become LF first (the fence patterns and the build tools, bash especially, expect LF)."""
+    text = text.replace("\r\n", "\n")
+    # Search only up to the last </think>: an unclosed <think> after it would make each match attempt scan
+    # to the end of the reply (quadratic in replies full of <think>).
+    last_close = text.rfind("</think>")
+    pairs = list(THINK_RE.finditer(text, 0, last_close + len("</think>"))) if last_close >= 0 else []
+    outside = set(_outside_code(_code_blocks(text), [m.start() for m in pairs]))
+    pieces, end = [], 0
+    for m in pairs:
+        if m.start() in outside:   # pairs inside code stay in place
+            pieces.append(text[end:m.start()])
+            end = m.end()
+    text = "".join(pieces) + text[end:]
+    blocks = _code_blocks(text)
+    closes = _outside_code(blocks, [m.start() for m in re.finditer("</think>", text)])
+    followed = [c for c in closes if blocks and blocks[-1][0] > c]
+    if followed:
+        text = text[followed[-1] + len("</think>"):]
+    elif closes and not blocks:
+        text = text[closes[0] + len("</think>"):]
+    return "" if text.lstrip().startswith("<think>") else text
+
+
+def extract_code(text, lang=None):
+    """The solution in a reply. Candidates are the fenced blocks tagged with one of the language's tags (all
+    blocks if none is tagged so). The last candidate wins, which is the fixed version when a reply quotes the
+    original code first, unless it's less than half as long as the longest one: then it's a usage example or
+    a snippet after the full file, and the longest (the last of equally long ones) wins. A reply without a
+    fenced block is taken as code."""
+    text = strip_think(text)
+    blocks = _code_blocks(text)
+    if not blocks:
+        return text
+    tags = LANGS[lang]["tags"] if lang else ()
+    candidates = ([code for _, _, tag, code in blocks if tag.lower() in tags]
+                  or [code for _, _, _, code in blocks])
+    longest = max(reversed(candidates), key=lambda code: len(code.strip()))
+    last = candidates[-1]
+    return last if 2 * len(last.strip()) >= len(longest.strip()) else longest
 
 
 # This trusted launcher runs before bwrap, outside its hidden /sys. Verify that
@@ -249,6 +368,7 @@ ACTIVE_UNITS_LOCK = threading.Lock()
 
 
 def stop_active_units():
+    """Stop the transient systemd units of sandboxes that are still running (on Ctrl-C)."""
     with ACTIVE_UNITS_LOCK:
         units = list(ACTIVE_UNITS)
     for unit in units:
@@ -490,6 +610,7 @@ class Interrupted(Exception):
 
 
 def server_reachable(base, api_key):
+    """Whether the endpoint answers its /models request (used to tell a dead server from a failed request)."""
     try:
         http_json(f"{base}/models", timeout=10, api_key=api_key)
         return True
@@ -551,6 +672,7 @@ MODEL_ERRORS = ("bad_response", "disconnected")
 
 
 def is_model_error(finish):
+    """Whether a finish reason means the model or server failed the request (counts toward MAX_MODEL_ERRORS)."""
     return finish in MODEL_ERRORS or (finish or "").startswith("http_")
 
 
@@ -586,7 +708,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
             break
         adir = taskdir / f"attempt_{attempt}"
-        code = extract_code(text)
+        code = extract_code(text, task["lang"])
         if code.strip():
             passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
         else:
@@ -601,7 +723,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         if finish == "length":  # hit max tokens: counted as failure, no retry
             break
         messages = messages + [
-            {"role": "assistant", "content": THINK_RE.sub("", text).strip()},
+            {"role": "assistant", "content": strip_think(text).strip()},
             {"role": "user", "content": feedback(stage, fail_cmd, fail_out)},
         ]
     result["seconds"] = round(result["seconds"], 2)
@@ -609,6 +731,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
 
 
 def context_needed(opts):
+    """Tokens of context the longest request needs: the prompt, feedback for each retry and max_tokens."""
     return CONTEXT_BASE_TOKENS + (opts.attempts - 1) * CONTEXT_PER_RETRY_TOKENS + opts.max_tokens
 
 
@@ -623,11 +746,13 @@ FILLER_WORDS = (  # noqa: SIM905 -- easier to read than a list literal
 
 
 def filler(words):
+    """A deterministic prompt of `words` common English words, for the context check."""
     rng = random.Random(words)
     return " ".join(rng.choice(FILLER_WORDS) for _ in range(words))
 
 
 def probe(label, base, model, content, opts, stop):
+    """Send a one-token request (warm-up and context check); returns chat()'s (text, finish, usage, error)."""
     payload = {**opts.params, "model": model, "max_tokens": 1, "messages": [{"role": "user", "content": content}]}
     return chat(label, base, payload, opts, stop)
 
@@ -703,6 +828,7 @@ def config_hash(settings, task):
 
 
 def skipped_result(finish_reason, fail_stage):
+    """The result fields of a run that was skipped without sending a request."""
     return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
 
@@ -737,6 +863,7 @@ def read_results(path):
 
 
 def is_finished(row):
+    """Whether a results row is final; --resume runs rows that failed for reasons outside the model again."""
     finish = row.get("finish_reason") or ""
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
@@ -759,8 +886,10 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             f.flush()
 
         params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
+        dirs = model_dirs(models)
 
         def record(model, task, result, model_info):
+            """Number the run, then append its row to the results file and to rows."""
             key = (model, task["name"], task["config"])
             numbered[key] += 1
             row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
@@ -772,6 +901,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
             log(str(row))
 
         def skip_rest(model, todo, why, finish_reason, fail_stage, model_info):
+            """Record the model's remaining runs as skipped with the given finish reason and fail stage."""
             log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} run(s)", err=True)
             for task in todo:
                 record(model, task, skipped_result(finish_reason, fail_stage), model_info)
@@ -805,7 +935,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
                         break
                     repeat = numbered[(model, task["name"], task["config"])] + 1
                     label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    taskdir = runs_dir / UNSAFE_NAME_RE.sub("_", model) / task["name"] / f"repeat_{repeat}"
+                    taskdir = runs_dir / dirs[model] / task["name"] / f"repeat_{repeat}"
                     result = run_one_task(label, base, model, task, taskdir, opts, stop)
                     model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
                     length_finishes += result["finish_reason"] == "length"
@@ -858,6 +988,7 @@ def summarize(rows):
 
 
 def print_summary(rows):
+    """Print the per-endpoint and per-model pass table for result rows (means and spread over repeats)."""
     if not rows:
         print("\nno results")
         return
@@ -868,9 +999,11 @@ def print_summary(rows):
                    if x in LANGS else len(LANGS))
 
     def score(value, var, n):
+        """A pass count: mean±sd/n with repeats, otherwise count/n."""
         return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
     def lang_cell(value, n):
+        """A per-language pass count: the mean with repeats, otherwise the count, out of n."""
         return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
 
     ew = max(8, *(len(g["endpoint"]) for g in groups))
@@ -913,6 +1046,7 @@ def parse_param(spec):
 
 
 def positive_int(value):
+    """argparse type: an integer >= 1."""
     n = int(value)
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
@@ -934,6 +1068,7 @@ The API key is read from --api-key, LLM_BENCH_API_KEY or OPENAI_API_KEY, in that
 
 
 def parse_args():
+    """Parse and validate the command line (endpoints may also come from LLM_BENCH_ENDPOINTS)."""
     ap = argparse.ArgumentParser(
         description="Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go "
                     "and Bash coding tasks. Generated code is built and tested in a sandbox.",
@@ -991,7 +1126,7 @@ def parse_args():
                  "http://localhost:1234/v1 for LM Studio)")
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if args.tag:
-        args.tag = UNSAFE_NAME_RE.sub("_", args.tag)
+        args.tag = safe_name(args.tag)
     args.params = dict(args.param)
     if args.temperature is not None and args.params.get("temperature", args.temperature) != args.temperature:
         ap.error("--temperature conflicts with --param temperature=...")
@@ -1019,6 +1154,7 @@ def check_results_file(path):
 
 
 def main():
+    """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
     args = parse_args()
     if args.summary:
         try:

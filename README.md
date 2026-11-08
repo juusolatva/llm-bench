@@ -11,10 +11,10 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 | Language | Tasks |
 |---|---|
 | Python | `py_parse_duration`, `py_fix_top_customers`, `py_deep_merge`, `py_retry_decorator` |
-| C | `c_trim`, `c_join_path`, `c_fix_intvec`, `c_parse_kv` (built with ASan + UBSan) |
-| C++ | `cpp_split`, `cpp_top_words`, `cpp_fix_buffer`, `cpp_lru_cache` (built with ASan + UBSan) |
-| Rust | `rust_word_count`, `rust_version`, `rust_fix_inventory`, `rust_csv_line` |
-| Go | `go_reverse`, `go_word_freq`, `go_fix_count_lengths`, `go_kv_http` (run with `-race`) |
+| C | `c_join_path`, `c_parse_kv`, `c_fix_intvec`, `c_eval_expr` (built with ASan + UBSan) |
+| C++ | `cpp_top_words`, `cpp_lru_cache`, `cpp_fix_buffer`, `cpp_interval_set` (built with ASan + UBSan) |
+| Rust | `rust_version`, `rust_csv_line`, `rust_fix_inventory`, `rust_topo_order` |
+| Go | `go_word_freq`, `go_kv_http`, `go_fix_count_lengths`, `go_parallel_map` (run with `-race`) |
 | Bash | `bash_top_words`, `bash_rotate_backups`, `bash_fix_rename`, `bash_access_log` |
 
 The tests check only what the prompt states. Run `./llm_bench.py --list-tasks` to list them.
@@ -25,6 +25,8 @@ Each task is a directory under [`tasks/`](tasks):
 tasks/<lang>/<task>/
   prompt.md          # sent to the model as is
   test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go or test.sh for other languages)
+  reference/
+    solution.py      # a known-correct solution (not sent to the model), named like the model's solution file
 ```
 
 The task name is the language prefix plus the directory name, so `tasks/python/parse_duration` is `py_parse_duration`.
@@ -95,7 +97,8 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 - **Context length.** With the defaults a retry request can need about 25k tokens of context (roughly 1k + 4k per retry + `--max-tokens`). Configure the server for at least 32k. Many servers default to much less and silently truncate the prompt. For example, Ollama uses `OLLAMA_CONTEXT_LENGTH=32768`, and LM Studio sets the context length in the model's load settings. If you can't, lower `--max-tokens` or `--attempts` so the need fits.
 - **Context check.** Before each model's first task, the benchmark loads it with a tiny request (its time goes into `load_seconds`, not the first task) and then checks the context: it measures the model's tokens per word with a short filler prompt, sends a filler prompt of the needed size, and compares the prompt tokens the server reports. A server that truncates reports too few; one that refuses answers with an error. The result is recorded in the `context` column and a failed check is repeated under the summary. It costs one long prompt per model; `--no-context-check` skips it.
 - **One model at a time.** Models are benchmarked one after another. If the server keeps earlier models loaded, the next model may not fit in VRAM and run partly on the CPU, which only affects timing. Let the server evict old models: Ollama with `OLLAMA_MAX_LOADED_MODELS=1`, LM Studio with the auto-evict option for JIT-loaded models.
-- **Thinking models.** `<think>…</think>` blocks are removed before code extraction. Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
+- **Thinking models.** `<think>…</think>` blocks are removed before code extraction, as is everything before a `</think>` without an opening tag (some chat templates put the opening tag in the prompt). Reasoning returned in a separate field is ignored. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
+- **Code extraction.** The system prompt asks for exactly one fenced code block. If a reply has several, the blocks tagged with the task's language (for example ` ```python ` or ` ```py `) are the candidates, or all blocks if none is tagged that way. The last candidate is used, which is the fix when a reply quotes the original code first, unless it is less than half as long as the longest one (a usage example or a snippet after the full file); then the longest is used. A reply without a fenced block is used as is.
 
 ## Output
 
@@ -117,7 +120,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
   | `config` | Hash of everything that affects the result: benchmark version, system prompt, `--max-tokens`, `--attempts`, `--timeout`, parameters, sandbox limits, and the task's own prompt, harness and build commands. Rows with equal hashes were produced under the same conditions. |
 
   The benchmark refuses to append to a file that has different columns (e.g. from an older version).
-- `runs/<endpoint>[_<tag>]/<model>/<task>/repeat_<r>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. `r` matches the row's `repeat`, so later runs never overwrite earlier transcripts.
+- `runs/<endpoint>[_<tag>]/<model>/<task>/repeat_<r>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. `r` matches the row's `repeat`, so later runs never overwrite earlier transcripts. `<model>` is the model ID with characters other than letters, digits, `.`, `_` and `-` (and a leading dot) replaced by `_`; if two of an endpoint's models end up with the same name, both get a short hash of their ID appended (and `-2`, `-3`, … in the unlikely case that a name is still taken).
 - A summary table on stdout, one line per endpoint and model: `pass@1` (tasks passed on the first attempt), `passed` (tasks passed within `--attempts`), per-language results, token counts, total reply time and load time. Models are sorted by `passed`, then `pass@1`. With `--resume` the table covers the whole results file; otherwise just this run. Ctrl-C stops the run promptly and still prints the summary of the tasks finished so far.
 
   When tasks have several runs (`--repeat`, or re-runs under the same settings), scores are mean passes per run, shown as `mean±sd/tasks`. The ± is the standard deviation of a single run's score, estimated from each task's pass rate: if two models are closer than that, one run can't tell them apart. Tokens and seconds are then means per run. `--summary` works the same on any set of results files; rows are only averaged when their `settings` match (otherwise a `settings` column tells the groups apart), and for each task only rows of its newest version count.
@@ -161,7 +164,7 @@ uv run --locked --no-build --group dev pytest -rs
 
 The end-to-end tests run scripted replies from a mock OpenAI-compatible server through the real sandbox. They skip themselves where the sandbox isn't available (containers, CI).
 
-To add a task, create its directory under `tasks/`. No code changes are needed. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
+To add a task, create its directory under `tasks/`, including a reference solution. No code changes are needed. `tests/test_reference.py` runs every reference solution through the sandbox and expects it to pass, which catches broken harnesses. See [AGENTS.md](AGENTS.md) for the conventions tasks follow.
 
 ## License
 

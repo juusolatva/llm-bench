@@ -126,27 +126,17 @@ def test_private_tasks_dir(monkeypatch, tmp_path, mock_server):
     assert s.requests[0]["messages"][1]["content"] == "Write `double(x)` in solution.py."
 
 
-RUST_WORD_COUNT = """```rust
-use std::collections::HashMap;
-
-pub fn word_count(text: &str) -> HashMap<String, usize> {
-    let mut m = HashMap::new();
-    for w in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
-        *m.entry(w.to_lowercase()).or_insert(0) += 1;
-    }
-    m
-}
-```"""
+RUST_TOPO_ORDER = "```rust\n" + (llm_bench.DEFAULT_TASKS_DIR / "rust/topo_order/reference/lib.rs").read_text() + "```"
 
 
 def test_appended_harness_language(monkeypatch, tmp_path, mock_server):
     """Rust harnesses are appended to the solution file instead of written separately."""
-    s = mock_server(replies=[RUST_WORD_COUNT])
-    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "rust_word_count", "--attempts", "1")
+    s = mock_server(replies=[RUST_TOPO_ORDER])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "rust_topo_order", "--attempts", "1")
     (row,) = read_rows(tmp_path / "results_m.csv")
-    log = (tmp_path / "runs/m/test_model/rust_word_count/repeat_1/attempt_1/log.txt").read_text()
+    log = (tmp_path / "runs/m/test_model/rust_topo_order/repeat_1/attempt_1/log.txt").read_text()
     assert row["passed"] == "1", log
-    assert "4 passed" in log
+    assert "3 passed" in log
 
 
 def test_feedback_names_failing_command(monkeypatch, tmp_path, mock_server):
@@ -157,17 +147,17 @@ def test_feedback_names_failing_command(monkeypatch, tmp_path, mock_server):
     assert row["fail_stage"] == ""   # passed in the end
 
 
-C_TRIM_WRONG = "```c\nchar *trim(char *s) { return s; }\n```"
-C_TRIM_BROKEN = "```c\nchar *trim(char *s) { return s }\n```"
+C_JOIN_WRONG = "```c\nchar *join_path(const char *a, const char *b) { (void)a; (void)b; return 0; }\n```"
+C_JOIN_BROKEN = "```c\nchar *join_path(const char *a, const char *b) { return a }\n```"
 
 
 @pytest.mark.parametrize(("reply", "stage", "cmd"), [
-    (C_TRIM_BROKEN, "build", "gcc -std=gnu17"),
-    (C_TRIM_WRONG, "test", "./t"),
+    (C_JOIN_BROKEN, "build", "gcc -std=gnu17"),
+    (C_JOIN_WRONG, "test", "./t"),
 ])
 def test_fail_stage_build_vs_test(monkeypatch, tmp_path, mock_server, reply, stage, cmd):
     s = mock_server(replies=[reply, reply])
-    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "c_trim", "--attempts", "2")
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "c_join_path", "--attempts", "2")
     (row,) = read_rows(tmp_path / "results_m.csv")
     assert row["fail_stage"] == stage
     assert f"Output of `{cmd}" in s.requests[1]["messages"][-1]["content"]

@@ -1,4 +1,5 @@
 import sys
+import time
 from collections import Counter
 
 import pytest
@@ -30,13 +31,160 @@ def test_parse_endpoint_name_is_path_safe():
     assert "/" not in name
 
 
-def test_extract_code_takes_last_block_and_strips_think():
-    text = "<think>```python\nbad\n```</think>intro\n```python\nfirst\n```\nthen\n```c\nlast\n```"
-    assert llm_bench.extract_code(text) == "last\n"
+@pytest.mark.parametrize(("name", "want"), [
+    ("qwen/qwen3:8b", "qwen_qwen3_8b"), ("..", "_."), (".", "_"), ("", "_"), (".hidden", "_hidden"),
+    ("a..b", "a..b"), ("../../etc", "_._.._etc"),
+])
+def test_safe_name(name, want):
+    assert llm_bench.safe_name(name) == want
+
+
+def test_model_dirs_disambiguate_collisions():
+    dirs = llm_bench.model_dirs([".foo", "_foo", "a/b", "qwen/qwen3:8b"])
+    assert dirs["qwen/qwen3:8b"] == "qwen_qwen3_8b" and dirs["a/b"] == "a_b"   # no collision: plain safe name
+    assert dirs[".foo"] != dirs["_foo"]
+    assert all(d.startswith("_foo-") and len(d) == len("_foo-") + 8 for d in (dirs[".foo"], dirs["_foo"]))
+    assert llm_bench.model_dirs([".foo", "_foo"]) == {k: dirs[k] for k in (".foo", "_foo")}   # deterministic
+
+
+def test_model_dirs_unique_even_against_hashed_names():
+    import hashlib
+    h = hashlib.sha256(b"a/b").hexdigest()
+    tricky = "a_b-" + h[:8]   # equals the hashed name "a/b" gets
+    dirs = llm_bench.model_dirs(["a/b", "a_b", tricky])
+    assert len(set(dirs.values())) == 3, dirs
+    chain = ["a/b", "a_b", "a_b-" + h[:8], "a_b-" + h[:16], "a_b-" + h]   # collides on every hash length
+    for models in (chain, chain[::-1]):
+        assert len(set(llm_bench.model_dirs(models).values())) == len(chain)
+    assert llm_bench.model_dirs(["x", "x"]) == {"x": "x"}
+
+
+def test_extract_code_strips_think():
+    text = "<think>```python\nbad\n```</think>intro\n```python\nfirst\n```"
+    assert llm_bench.extract_code(text, "python") == "first\n"
+
+
+@pytest.mark.parametrize(("text", "want"), [
+    ("reasoning\n```python\nbad\n```\n</think>\n```python\ngood\n```", "good\n"),   # unpaired </think>
+    ("<think>never finished\n```python\nbad\n```", ""),                        # unclosed <think>
+    ("  \n<think>\n```python\nbad\n```\n", ""),
+    ("I removed the <think> tags.\n```python\ngood\n```", "good\n"),           # <think> in prose
+    ("plan\n</think>\n```python\ngood\n```\nIt drops </think> tags.", "good\n"),  # </think> in prose
+    ("```python\ngood\n```\nThe </think> tag is not used.", "good\n"),          # no reasoning at all
+    ("plan ```python\nbad\n```\n</think>\nok:\n```python\ngood\n```", "good\n"),
+    ("plan\n</think>\nx = 1\n", "\nx = 1\n"),                                   # no fence: after first
+])
+def test_extract_code_partial_think(text, want):
+    assert llm_bench.extract_code(text, "python") == want
+
+
+def test_extract_code_prefers_matching_language_tag():
+    text = "```bash\npip install nothing here at all\n```\n```py\ncode\n```\nUsage:\n```\nexample()\n```"
+    assert llm_bench.extract_code(text, "python") == "code\n"
+    assert llm_bench.extract_code(text, "rust") == "pip install nothing here at all\n"   # no rust block: longest
+
+
+def test_extract_code_takes_last_unless_much_shorter():
+    full = "func Solution() int {\n\treturn 42\n}\n"
+    # A short usage example after the solution loses to the solution.
+    assert llm_bench.extract_code(f"```go\n{full}```\n```go\nSolution()\n```", "go") == full
+    # Original first, then a slightly shorter fix: the fix (last) wins.
+    orig, fixed = "def f(rows, n=3, totals={}):\n    return totals\n", "def f(rows, n=3):\n    return {}\n"
+    assert llm_bench.extract_code(f"Original:\n```python\n{orig}```\nFixed:\n```python\n{fixed}```", "python") == fixed
+    # Equally long blocks: the last one; tags are case-insensitive.
+    assert llm_bench.extract_code("```c\na\n```\n```C\nb\n```", "c") == "b\n"
+
+
+def test_extract_code_tag_with_suffix():
+    text = "```python:solution.py\ncode\n```\n```bash\npython3 solution.py --help\n```"
+    assert llm_bench.extract_code(text, "python") == "code\n"
+    assert llm_bench.extract_code("```c++ title=x\nint x;\n```", "cpp") == "int x;\n"
+
+
+@pytest.mark.parametrize(("text", "want"), [
+    ("````python\nprint(1)\n````", "print(1)\n"),          # 4-backtick fence
+    ("```python\nx = 1```", "x = 1"),                       # closing fence glued to code
+    ("Here: ```python\nx = 1\n```", "x = 1\n"),             # opening fence mid-line
+])
+def test_extract_code_loose_fallback(text, want):
+    assert llm_bench.extract_code(text, "python") == want
+
+
+@pytest.mark.parametrize(("text", "want"), [
+    ("Wrap code in ``` fences.\n```python\ngood\n```", "good\n"),       # prose mention isn't a fence
+    ("Put it below ```\n```python\ngood\n```", "good\n"),                 # untagged mid-line fence isn't either
+    ("```python\nx = '``` inside'\n```", "x = '``` inside'\n"),        # backticks mid-line in code
+    ("````markdown\n```python\nnested\n```\n````", "```python\nnested\n```\n"),   # longer outer fence
+    ("```python\nx = 1\n```text\ny = 2\n```", "x = 1\n```text\ny = 2\n"),       # ```text doesn't close
+    ("```python\nprint(\"```\")\n```", "print(\"```\")\n"),                # nor a fence inside a string
+])
+def test_extract_code_fence_pairing(text, want):
+    assert llm_bench.extract_code(text) == want
+
+
+def test_extract_code_crlf_reply():
+    text = "<think>\r\nplan\r\n</think>\r\nHere: ```bash\r\necho hi\r\n```\r\nDone.\r\n"
+    assert llm_bench.extract_code(text, "bash") == "echo hi\n"
+    assert llm_bench.extract_code("```python\r\nx = 1\r\n```\r\n", "python") == "x = 1\n"
+
+
+def test_extract_code_mixes_loose_and_strict_blocks():
+    solution = "def solve():\n    return 42\n"
+    text = f"````python\n{solution}````\nUsage:\n```python\nsolve()\n```"
+    assert llm_bench.extract_code(text, "python") == solution
+    tagged = "Here: ```python\ns = '<think>x</think>'\n```"   # think tags inside a loose block stay
+    assert llm_bench.extract_code(tagged, "python") == "s = '<think>x</think>'\n"
+
+
+def test_extract_code_fence_details():
+    # Info strings after the tag, indented fences and backticks inside the code.
+    text = "  ```python title=solution.py\n  s = '```'\n  ```"
+    assert llm_bench.extract_code(text, "python") == "  s = '```'\n"
+    assert llm_bench.extract_code("```cpp\n```", "cpp") == ""
 
 
 def test_extract_code_without_fence_returns_text():
-    assert llm_bench.extract_code("<think>x</think>plain") == "plain"
+    assert llm_bench.extract_code("<think>x</think>plain", "python") == "plain"
+    assert llm_bench.extract_code("plain") == "plain"
+
+
+def test_extract_code_keeps_think_tags_inside_code():
+    text = "<think>plan</think>\n```python\ndef render():\n    return '</think>' + '<think>x</think>'\n```"
+    assert llm_bench.extract_code(text, "python") == "def render():\n    return '</think>' + '<think>x</think>'\n"
+
+
+def test_strip_think_is_linear(monkeypatch):
+    """Many tags inside code must not rescan the reply once per tag."""
+    scans = []
+    real = llm_bench._code_blocks
+    monkeypatch.setattr(llm_bench, "_code_blocks", lambda text: scans.append(1) or real(text))
+    reply = "```python\n" + "s = '<think></think>'\n" * 20000 + "```\n"
+    start = time.monotonic()
+    assert llm_bench.strip_think(reply) == reply
+    assert len(scans) <= 2
+    assert time.monotonic() - start < 2
+
+
+@pytest.mark.parametrize("reply", [
+    "`" * 200000, "```" + " " * 200000, "```py\n" + "`" * 200000, "x " * 100000 + "```" + "\t" * 100000 + "y",
+    "```py\na\n" * 50000, "Here: ```python\nx ```\n" * 50000, "````py\nx````\n" * 30000 + "```\n" * 30000,
+])
+def test_extract_code_degenerate_replies_are_fast(reply):
+    start = time.monotonic()
+    llm_bench.extract_code(reply, "python")
+    assert time.monotonic() - start < 2
+
+
+def test_strip_think_many_unclosed_tags_is_fast():
+    start = time.monotonic()
+    assert llm_bench.strip_think("<think>x " * 100000) == ""
+    assert llm_bench.strip_think("<think>a</think>b " + "<think>x " * 100000).startswith("b ")
+    assert time.monotonic() - start < 2
+
+
+def test_strip_think():
+    assert llm_bench.strip_think("<think>a</think>b<think>c</think>d") == "bd"
+    assert llm_bench.strip_think("no reasoning") == "no reasoning"
 
 
 def test_clip_keeps_head_and_tail():
