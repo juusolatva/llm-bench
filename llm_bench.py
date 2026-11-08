@@ -147,7 +147,7 @@ def load_tasks(roots):
 # --------------------------------------------------------------------------------------------
 
 FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "passed_on", "attempts",
-          "prompt_tokens", "completion_tokens", "reasoning_tokens", "seconds", "load_seconds", "finish_reason",
+          "prompt_tokens", "completion_tokens", "reasoning_tokens", "seconds", "usage_seconds", "load_seconds", "finish_reason",
           "fail_stage", "context", "params", "settings", "config"]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_CLOSE = "</think>"
@@ -704,7 +704,8 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         try:
             text, finish, usage, error = chat(label, base, payload, opts, stop)
         finally:
-            result["seconds"] += time.time() - t0
+            elapsed = time.time() - t0
+            result["seconds"] += elapsed
         result["attempts"] = attempt
         if error:
             result["finish_reason"], result["fail_stage"] = error, "request"
@@ -712,6 +713,8 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         result["finish_reason"] = finish
         result["prompt_tokens"] += usage.get("prompt_tokens") or 0
         result["completion_tokens"] += usage.get("completion_tokens") or 0
+        if usage.get("completion_tokens"):   # throughput is measured over the replies that report their tokens
+            result["usage_seconds"] += elapsed
         # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
         # the completion tokens of all replies, on another scale. None is an empty cell.
         reasoning = reasoning_tokens(usage)
@@ -742,6 +745,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             {"role": "user", "content": feedback(stage, fail_cmd, fail_out)},
         ]
     result["seconds"] = round(result["seconds"], 2)
+    result["usage_seconds"] = round(result["usage_seconds"], 2)
     return result
 
 
@@ -845,7 +849,8 @@ def config_hash(settings, task):
 def skipped_result(finish_reason, fail_stage):
     """The result fields of a trial that was skipped without sending a request (also a trial's starting point)."""
     return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
-            "reasoning_tokens": None, "seconds": 0.0, "finish_reason": finish_reason, "fail_stage": fail_stage}
+            "reasoning_tokens": None, "seconds": 0.0, "usage_seconds": 0.0, "finish_reason": finish_reason,
+            "fail_stage": fail_stage}
 
 
 INT_FIELDS = ("repeat", "passed", "passed_on", "attempts", "prompt_tokens", "completion_tokens")
@@ -875,6 +880,8 @@ def read_results(path):
                     row[k] = ""
             # Empty when the server didn't report it, so a missing count isn't read as zero.
             row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
+            # Empty in rows from before the column existed; summarize falls back to an estimate for them.
+            row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
             rows.append(row)
     return rows
 
@@ -999,8 +1006,9 @@ def summarize(rows):
     """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
     (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
     newest version is scored without that task. Several rows of a task are trials in different rounds.
-    Throughput ("tps") is completion tokens per request second over the trials that ended with a reply that
-    reported token usage (a reply has at least one token, so 0 means the server didn't say); None without any.
+    Throughput ("tps") is completion tokens per second of the replies that reported them (usage_seconds); None
+    without any. Rows from before usage_seconds existed count if they ended with a reply that reported usage
+    (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
     Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
     reported them (otherwise None: a partial count would be on another scale than completion tokens).
     Returns (groups, dropped row count)."""
@@ -1019,14 +1027,16 @@ def summarize(rows):
         g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
              "trials": [], "tasks": set(tasks), "context": "unchecked", "rt": None, "per_task": {}}
-        replied = [r for task_rows in tasks.values() for r in task_rows if ended_with_reply(r)]
-        counted = [r for r in replied if r["completion_tokens"] > 0]
-        reply_seconds = sum(r["seconds"] for r in counted)
-        g["tps"] = sum(r["completion_tokens"] for r in counted) / reply_seconds if reply_seconds else None
-        # Every trial with a reply needs a count, including one that got replies and then a request error: its
-        # completion tokens count, so its unknown reasoning tokens can't count as zero.
-        with_replies = [r for task_rows in tasks.values() for r in task_rows
-                        if ended_with_reply(r) or r["completion_tokens"] > 0]
+        trials = [r for task_rows in tasks.values() for r in task_rows]
+        measured = [(r["completion_tokens"], r["usage_seconds"]) for r in trials if r.get("usage_seconds") is not None]
+        measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
+                     and ended_with_reply(r) and r["completion_tokens"] > 0]
+        usage_seconds = sum(sec for _, sec in measured)
+        g["tps"] = sum(tokens for tokens, _ in measured) / usage_seconds if usage_seconds else None
+        # Every trial with a reply needs a count, including one that got replies and then a request error (a
+        # request error ends a trial, so every attempt before the last got a reply): its completion tokens count,
+        # so its unknown reasoning tokens can't count as zero.
+        with_replies = [r for r in trials if ended_with_reply(r) or (r.get("attempts") or 0) > 1]
         if with_replies and all(r.get("reasoning_tokens") is not None for r in with_replies):
             g["rt"] = sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
                           for task_rows in tasks.values())
@@ -1372,7 +1382,10 @@ def upgrade_results_file(path):
             for line, row in enumerate(csv.DictReader(src), start=2):
                 if None in row:   # DictReader's key for cells beyond the header
                     raise ValueError(f"line {line} has more cells than the header")
+                if None in row.values():   # DictReader's value for missing cells
+                    raise ValueError(f"line {line} has fewer cells than the header")
                 w.writerow(row)
+        shutil.copymode(path, tmp)   # mkstemp creates the file readable by its owner only
         os.replace(tmp, path)
     except BaseException:
         os.unlink(tmp)

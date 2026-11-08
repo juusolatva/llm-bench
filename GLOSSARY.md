@@ -115,5 +115,5 @@ The number of tasks in a round that a model passes within the allowed number of 
 The part of a reply's completion tokens a thinking model spends on reasoning before its answer, as reported by the server. Not every server reports them.
 
 **Throughput**:
-Completion tokens per second of reply time (`tok/s`), over the trials that ended with a reply and reported token usage. It includes prompt processing and queueing, so it's lower than the pure generation speed.
+Completion tokens per second of reply time (`tok/s`), counting only the replies that reported their completion tokens. It includes prompt processing and queueing, so it's lower than the pure generation speed.
 _Avoid_: Speed (ambiguous with generation speed)

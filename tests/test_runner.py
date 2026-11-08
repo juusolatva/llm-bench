@@ -633,6 +633,81 @@ def test_summarize_reasoning_tokens_unknown_when_an_error_ended_trial_had_replie
     # py_b got a 100-token reply without reasoning usage, then a request error: its completion tokens count, so
     # its unknown reasoning tokens can't count as zero.
     rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40),
-            row("py_b", 0, completion_tokens=100, reasoning_tokens=None, finish_reason="http_500")]
+            row("py_b", 0, completion_tokens=100, reasoning_tokens=None, attempts=2, finish_reason="http_500")]
     (g,) = llm_bench.summarize(rows)[0]
     assert (g["ct"], g["rt"]) == (200, None)
+
+
+def test_summarize_reasoning_tokens_unknown_when_an_error_followed_a_reply_without_usage():
+    # Attempt 1 got a reply without any usage (0 tokens), attempt 2 a request error: attempts > 1 shows the reply.
+    rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40),
+            row("py_b", 0, completion_tokens=0, reasoning_tokens=None, attempts=2, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["rt"] is None
+
+
+def test_summarize_reasoning_tokens_ignore_trials_without_any_reply():
+    rows = [row("py_a", 1, completion_tokens=100, reasoning_tokens=40, attempts=1),
+            row("py_b", 0, completion_tokens=0, reasoning_tokens=None, attempts=1, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["rt"] == pytest.approx(40.0)
+
+
+def test_upgrade_keeps_file_permissions(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1")
+    path.chmod(0o644)
+    llm_bench.check_results_file(path)
+    assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
+def test_check_results_file_refuses_upgrade_of_short_rows(tmp_path):
+    path = tmp_path / "results.csv"
+    write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python")
+    before = path.read_text()
+    with pytest.raises(SystemExit, match="fewer cells than the header"):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+NO_USAGE = json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}).encode()
+
+
+def test_usage_seconds_count_only_replies_that_report_usage(mock_server, tmp_path):
+    measured = usage_reply()
+    measured.sleep = 0.1
+    s = mock_server(replies=[Reply(body=NO_USAGE, sleep=0.5), measured])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert row["seconds"] >= 0.6
+    assert 0.1 <= row["usage_seconds"] < 0.5   # only the second, measured reply
+    assert float(read_csv(tmp_path / "results.csv")[0]["usage_seconds"]) == row["usage_seconds"]
+
+
+def test_usage_seconds_zero_without_usage_or_reply(mock_server, tmp_path):
+    s = mock_server(replies=[Reply(body=NO_USAGE), Reply(status=500, body=b"{}")])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
+    assert (row["finish_reason"], row["usage_seconds"]) == ("http_500", 0.0)
+
+
+def test_read_results_usage_seconds_empty_in_old_rows(tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on,usage_seconds\ne,m,py_a,python,1,1,2.5\ne,m,py_b,python,1,1,\n")
+    assert [r["usage_seconds"] for r in llm_bench.read_results(path)] == [2.5, None]
+
+
+def test_summarize_throughput_uses_usage_seconds():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=40.0, usage_seconds=10.0),   # 30 s reply without usage
+            row("py_b", 0, completion_tokens=50, seconds=1805.0, usage_seconds=5.0, attempts=2,
+                finish_reason="timeout"),   # a measured reply, then a timeout
+            row("py_c", 0, completion_tokens=0, seconds=2.0, usage_seconds=0.0, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["tps"] == pytest.approx(10.0)   # 150 tokens in 15 measured seconds
+
+
+def test_summarize_throughput_mixes_old_rows_without_usage_seconds():
+    rows = [row("py_a", 1, completion_tokens=100, seconds=10.0, usage_seconds=None),   # old row: falls back
+            row("py_b", 1, completion_tokens=100, seconds=40.0, usage_seconds=10.0)]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert g["tps"] == pytest.approx(10.0)
