@@ -1,9 +1,12 @@
 import hashlib
 import os
+import re
+import shlex
 import sys
 import time
 import urllib.error
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 from conftest import Reply
@@ -567,3 +570,209 @@ def test_cli_rejects_unknown_format(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         run_main(monkeypatch, "--summary", str(tmp_path / "r.csv"), "--format", "html")
     assert exc.value.code == 2
+
+
+# The sandbox's command line and run_cmd's process handling, checked without bwrap or systemd (the sandbox itself
+# is checked by tests/test_e2e.py on a host that has them).
+SANDBOX_TOOLS = {"bwrap": "/usr/bin/bwrap", "systemd-run": "/usr/bin/systemd-run", "systemctl": "/usr/bin/systemctl"}
+
+
+def sandbox_args(tmp_path, go_cache_rw=None, timeout=60):
+    command = llm_bench.sandbox_command(SANDBOX_TOOLS, "llm-bench-x.service", ["bash", "-ec", "echo hi"],
+                                        tmp_path, timeout, go_cache_rw)
+    bwrap = command.index("/usr/bin/bwrap")
+    return command[:bwrap], command[bwrap:]
+
+
+def bwrap_options(args, name, nargs):
+    """The values of every `name` option in bwrap args, as tuples of its nargs values."""
+    return [tuple(args[i + 1:i + 1 + nargs]) for i, a in enumerate(args[:args.index("--")]) if a == name]
+
+
+def test_sandbox_command_isolates_the_command(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_bench, "GO_CACHE", None)
+    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", None)
+    _, bwrap = sandbox_args(tmp_path)
+    for flag in ("--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
+                 "--clearenv"):
+        assert flag in bwrap
+    assert bwrap_options(bwrap, "--cap-drop", 1) == [("ALL",)]
+    assert "--share-net" not in bwrap
+    assert not bwrap_options(bwrap, "--bind", 2)   # nothing on the host is writable
+    allowed = {"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives", llm_bench.LD_SO_CACHE}
+    binds = bwrap_options(bwrap, "--ro-bind", 2)
+    assert (str(tmp_path.resolve()), "/input") in binds
+    assert {src for src, _ in binds} - {str(tmp_path.resolve())} <= allowed
+    env = dict(bwrap_options(bwrap, "--setenv", 2))
+    assert env["HOME"] == "/tmp"
+    assert env["GOPROXY"] == "off"
+    assert env["GOCACHE"] == "/tmp/go-cache"
+    assert env["PATH"].split(":")[0] == "/opt/rust/bin"
+    assert bwrap[-4:] == ["sandbox", "bash", "-ec", "echo hi"]   # cmd runs last, after the copy into /work
+
+
+def test_sandbox_command_limits_the_unit(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_bench, "GO_CACHE", None)
+    unit, bwrap = sandbox_args(tmp_path, timeout=7)
+    assert unit[:2] == ["/usr/bin/systemd-run", "--user"]
+    for prop in (f"MemoryMax={llm_bench.SANDBOX_MEMORY_BYTES}", "MemorySwapMax=0",
+                 f"TasksMax={llm_bench.SANDBOX_TASKS}", "RuntimeMaxSec=7s", "KillMode=control-group",
+                 "NoNewPrivileges=yes", f"LimitFSIZE={llm_bench.SANDBOX_FILE_BYTES}"):
+        assert f"--property={prop}" in unit
+    assert "--unit=llm-bench-x.service" in unit
+    # The cgroup guard runs first and checks the limits before exec'ing bwrap.
+    assert unit[-5:] == [sys.executable, "-c", llm_bench.CGROUP_GUARD, str(llm_bench.SANDBOX_MEMORY_BYTES),
+                         str(llm_bench.SANDBOX_TASKS)]
+
+
+def test_sandbox_command_go_cache(monkeypatch, tmp_path):
+    mount = llm_bench.GO_CACHE_MOUNT
+    monkeypatch.setattr(llm_bench, "GO_CACHE", tmp_path / "cache")
+    _, bwrap = sandbox_args(tmp_path)   # a warmed cache is an overlay: writes go to a private tmpfs
+    assert bwrap_options(bwrap, "--overlay-src", 1) == [(str(tmp_path / "cache"),)]
+    assert bwrap_options(bwrap, "--tmp-overlay", 1) == [(mount,)]
+    assert not bwrap_options(bwrap, "--bind", 2)
+    assert dict(bwrap_options(bwrap, "--setenv", 2))["GOCACHE"] == mount
+    _, bwrap = sandbox_args(tmp_path, go_cache_rw=tmp_path / "warm")   # only while warming it with trusted code
+    assert bwrap_options(bwrap, "--bind", 2) == [(str(tmp_path / "warm"), mount)]
+    assert not bwrap_options(bwrap, "--overlay-src", 1)
+
+
+def test_sandbox_command_mounts_the_rust_sysroot(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", tmp_path / "rust")
+    _, bwrap = sandbox_args(tmp_path)
+    assert (str(tmp_path / "rust"), "/opt/rust") in bwrap_options(bwrap, "--ro-bind", 2)
+
+
+@pytest.fixture
+def fake_sandbox(monkeypatch, tmp_path):
+    """Make run_cmd run `python3 -c CODE` instead of the sandbox; returns a function that sets CODE. A fake
+    systemctl records its arguments in tmp_path/systemctl."""
+    systemctl = tmp_path / "fake-systemctl"
+    systemctl.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(tmp_path / "systemctl"))}\n')
+    systemctl.chmod(0o755)
+    tools = {**SANDBOX_TOOLS, "systemctl": str(systemctl)}
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name: tools.get(name))
+    code = {"code": ""}
+    monkeypatch.setattr(llm_bench, "sandbox_command",
+                        lambda tools, unit, cmd, cwd, timeout, go_cache_rw: [sys.executable, "-c", code["code"]])
+    def set_code(c):
+        code["code"] = c
+    return set_code
+
+
+def test_run_cmd_returns_status_and_output(fake_sandbox, tmp_path):
+    fake_sandbox("import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)")
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (3, False)
+    assert set(out.split()) == {"out", "err"}
+    (stop,) = (tmp_path / "systemctl").read_text().splitlines()   # the unit is stopped afterwards
+    assert re.fullmatch(r"--user stop llm-bench-[0-9a-f]{32}\.service", stop)
+    assert not llm_bench.ACTIVE_UNITS
+
+
+def test_run_cmd_caps_output(fake_sandbox, tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_bench, "MAX_OUTPUT_BYTES", 10)
+    fake_sandbox("print('x' * 100)")
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (-1, False)
+    assert out == "x" * 10 + "\n[output limit exceeded]"
+
+
+def test_run_cmd_reports_the_time_limit(fake_sandbox, tmp_path):
+    fake_sandbox("import time, sys; time.sleep(1.2); sys.exit(1)")   # like a unit killed at RuntimeMaxSec
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=1)
+    assert (rc, timed_out) == (1, True)
+    assert llm_bench.TIME_LIMIT_MARKER.format(limit=1) in out
+
+
+def test_run_cmd_reports_a_failed_start(monkeypatch, fake_sandbox, tmp_path):
+    monkeypatch.setattr(llm_bench, "sandbox_command", lambda *args: [str(tmp_path / "missing")])
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (-1, False)
+    assert out.startswith("sandbox failed: ")
+    assert not llm_bench.ACTIVE_UNITS
+
+
+def test_run_cmd_refuses_without_the_sandbox_tools(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name: None if name == "bwrap" else f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench, "sandbox_command", lambda *args: pytest.fail("must not build a command"))
+    rc, out, _ = llm_bench.run_cmd(["x"], tmp_path)
+    assert rc == -1
+    assert "refusing host execution" in out
+
+
+def test_check_sandbox_exits_when_the_sandbox_fails(monkeypatch):
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(1, "no user namespaces", False))
+    with pytest.raises(SystemExit, match="refusing to run generated code:\nno user namespaces"):
+        llm_bench.check_sandbox()
+
+
+@pytest.mark.parametrize(("output", "rc", "timed_out", "stage", "index"), [
+    ("", 1, False, "build", 0),          # no marker printed yet: the first command is blamed
+    ("$ 0\nerror\n", 1, False, "build", 0),
+    ("$ 0\n$ 1\nFAIL\n", 1, False, "test", 1),
+    ("$ 0\n$ 1\n", -9, True, "time_limit", 1),
+])
+def test_run_task_failure_stage(monkeypatch, tmp_path, output, rc, timed_out, stage, index):
+    spec = llm_bench.LANGS["c"]
+    rendered = [llm_bench.shlex.join(c) for c in spec["cmds"]]
+    assert len(rendered) == 2
+    out = output.replace("$ 0", f"$ {rendered[0]}").replace("$ 1", f"$ {rendered[1]}")
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(rc, out, timed_out))
+    (tmp_path / "w").mkdir()
+    (tmp_path / "w" / "stale").write_text("from an earlier attempt")
+    ok, log, got_stage, cmd, fail_out = llm_bench.run_task({"lang": "c", "test": "harness"}, "code", tmp_path / "w")
+    assert (ok, got_stage, cmd, fail_out) == (False, stage, rendered[index], out)
+    assert log == f"{out}\n[exit {rc}]"
+    assert not (tmp_path / "w" / "stale").exists()   # the work directory starts empty
+
+
+def go_cache_run_cmd(results, cache_writes=False):
+    """A run_cmd stub for prepare_go_cache: answers the warm-up and the probe from `results` in order."""
+    calls = []
+    def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
+        calls.append(go_cache_rw)
+        if go_cache_rw is None and cache_writes:   # an overlay that doesn't work: the write reaches the cache
+            (cwd.parent / "cache" / "llm-bench-probe").touch()
+        return results[len(calls) - 1]
+    return run_cmd, calls
+
+
+@pytest.mark.parametrize(("results", "cache_writes", "ready", "message"), [
+    ([llm_bench.CmdResult(0, "", False)] * 2, False, True, "build cache ready"),
+    ([llm_bench.CmdResult(1, "no space", False)], False, False, "warming the build cache failed"),
+    ([llm_bench.CmdResult(0, "", False), llm_bench.CmdResult(1, "no overlay", False)], False, False,
+     "can't be mounted as a private overlay"),
+    ([llm_bench.CmdResult(0, "", False)] * 2, True, False, "can't be mounted as a private overlay"),
+])
+def test_prepare_go_cache(monkeypatch, tmp_path, capsys, results, cache_writes, ready, message):
+    monkeypatch.setattr(llm_bench, "GO_CACHE", None)
+    run_cmd, calls = go_cache_run_cmd(results, cache_writes)
+    monkeypatch.setattr(llm_bench, "run_cmd", run_cmd)
+    llm_bench.prepare_go_cache(tmp_path)
+    assert calls[0] == tmp_path / "cache"   # only the warm-up gets the writable cache
+    assert all(c is None for c in calls[1:])
+    assert (tmp_path / "cache" if ready else None) == llm_bench.GO_CACHE
+    assert message in capsys.readouterr().err
+
+
+def rustc_sysroot(monkeypatch, sysroot):
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench.subprocess, "run",
+                        lambda *a, **kw: SimpleNamespace(stdout=f"{sysroot}\n"))
+    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", None)
+
+
+def test_check_toolchains_resolves_the_rust_sysroot(monkeypatch, tmp_path):
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/rustc").touch()
+    rustc_sysroot(monkeypatch, tmp_path)
+    llm_bench.check_toolchains([{"lang": "rust"}])
+    assert tmp_path.resolve() == llm_bench.RUST_SYSROOT
+
+
+def test_check_toolchains_rejects_a_sysroot_without_rustc(monkeypatch, tmp_path):
+    rustc_sysroot(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit, match="does not contain bin/rustc"):
+        llm_bench.check_toolchains([{"lang": "rust"}])
