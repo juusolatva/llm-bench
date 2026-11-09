@@ -174,23 +174,52 @@ EARLY_EXITS = {   # task: a reply that ends the process with status 0 on the fir
 }
 
 
-@pytest.mark.parametrize("name", EARLY_EXITS)
-def test_early_exit_fails(name, tmp_path, request):
-    """A solution that ends the process with status 0 before the harness finishes fails at the test stage, and the
-    output names the missing final line. (Before the final line was required, all of these passed.)"""
+def builtin_task(name):
+    """The built-in task `name`; skips the test if its toolchain is missing."""
     (task,) = [t for t in llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR]) if t["name"] == name]
     try:
         llm_bench.check_toolchains([task])
     except SystemExit as exc:
         pytest.skip(str(exc))
-    if task["lang"] == "go":
-        request.getfixturevalue("go_cache")
-    code = llm_bench.extract_code(EARLY_EXITS[name], task["lang"])
+    return task
+
+
+@pytest.mark.parametrize("name", [n for n in EARLY_EXITS if not n.startswith("go_")])
+def test_early_exit_fails(name, tmp_path):
+    """A solution that ends the process with status 0 before the harness finishes fails at the test stage, and the
+    output names the missing final line. (Before the final line was required, all of these passed.)"""
+    check_early_exit(builtin_task(name), tmp_path)
+
+
+def test_go_early_exit_fails(tmp_path, go_cache):
+    """Like test_early_exit_fails, for Go (os.Exit(0) in init()), which needs the warmed build cache."""
+    check_early_exit(builtin_task("go_word_freq"), tmp_path)
+
+
+def check_early_exit(task, tmp_path):
+    code = llm_bench.extract_code(EARLY_EXITS[task["name"]], task["lang"])
     passed, log, stage, cmd, out = llm_bench.run_task(task, code, tmp_path / "w")
     last_cmd = llm_bench.shlex.join(llm_bench.LANGS[task["lang"]]["cmds"][-1])
     assert (passed, stage, cmd) == (False, "test", last_cmd), log
     assert log.endswith("[exit 0]"), log
     assert "exited with status 0 before it finished" in out
+
+
+UNTERMINATED = {   # task: a correct solution whose own output, without a final newline, precedes the final line
+    "py_parse_duration": GOOD.replace("import re\n", "import re\nimport sys\nsys.stderr.write('loading')\n"
+                                      "print('loaded', end='')\n"),
+    "c_join_path": "```c\n" + (llm_bench.DEFAULT_TASKS_DIR / "c/join_path/reference/solution.c").read_text()
+                   + '#include <stdio.h>\n__attribute__((constructor)) static void greet(void) { printf("hi"); }\n```',
+}
+
+
+@pytest.mark.parametrize("name", UNTERMINATED)
+def test_unterminated_solution_output_still_passes(name, tmp_path):
+    """The final line counts anywhere in a line, so a correct solution whose own output lacks a final newline passes."""
+    task = builtin_task(name)
+    passed, log, *_ = llm_bench.run_task(task, llm_bench.extract_code(UNTERMINATED[name], task["lang"]), tmp_path / "w")
+    assert passed, log
+    assert "harness: all checks passed" in log
 
 
 def test_early_exit_feedback(monkeypatch, tmp_path, mock_server):

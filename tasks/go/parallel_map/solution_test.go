@@ -153,17 +153,21 @@ func TestErrorCancelsAndStops(t *testing.T) {
 func TestErrorWithOneWorker(t *testing.T) {
 	const cs = "ParallelMap([0 1 2 3 4], workers 1) with f always failing"
 	boom := errors.New("boom")
-	var calls atomic.Int64
+	var h harnessTracker
 	got, err := ParallelMap(context.Background(), []int{0, 1, 2, 3, 4}, 1, func(ctx context.Context, x int) (int, error) {
-		calls.Add(1)
+		h.enter()
+		defer h.leave()
 		return 0, boom
 	})
 	if !errors.Is(err, boom) || got != nil {
 		t.Fatalf("%s: got %v, %v; want nil and boom", cs, got, err)
 	}
+	if a := h.active.Load(); a != 0 {
+		t.Fatalf("%s: returned while %d calls of f were still running", cs, a)
+	}
 	// The first call fails, so no other call may start. As above, one call that races with recording the
 	// error is tolerated.
-	if n := calls.Load(); n > 2 {
+	if n := h.started.Load(); n > 2 {
 		t.Fatalf("%s: f was called %d times, want at most 2 (the first call fails, and no new calls may start after an error)", cs, n)
 	}
 }

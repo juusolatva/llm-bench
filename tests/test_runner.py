@@ -168,7 +168,8 @@ def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
     run_endpoint(s, tmp_path, models=[".foo", "_foo"], tasks=TASKS[:1])
     dirs = sorted(p.name for p in (tmp_path / "runs").iterdir())
     assert dirs == sorted(llm_bench.model_dirs([".foo", "_foo"]).values())
-    assert dirs[0] == "_foo" and dirs[1].startswith("_foo~")
+    assert dirs[0] == "_foo"
+    assert dirs[1].startswith("_foo~")
     for d in dirs:
         assert (tmp_path / "runs" / d / "py_t0/cfg/repeat_1/attempt_1/response.md").is_file()
 

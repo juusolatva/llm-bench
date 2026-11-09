@@ -87,8 +87,8 @@ SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 # fails instead of skipping the remaining checks.
 HARNESS_FINAL_LINE = "harness: all checks passed"
 # Per language: task name prefix, solution file, harness file, code block language tags (preferred by
-# extract_code), extra files, build/test commands, and "final_line": the start of a line the last command must
-# print (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
+# extract_code), extra files, build/test commands, and "final_line": text the last command must print after its
+# last check (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
 # directory mode (no package argument) because package mode hides a passing test binary's output. A Rust harness
 # is its own crate that uses the solution's public API, and libtest's summary line is its final line.
 LANGS = {
@@ -185,18 +185,22 @@ def safe_name(name):
     return re.sub(r"^\.", "_", UNSAFE_NAME_RE.sub("_", name)) or "_"
 
 
+MODEL_DIR_BYTES = 200   # longest transcript directory name before "-2", "-3", ...: file systems allow 255 bytes
+
+
 def model_dirs(models):
     """Transcript directory names for model IDs, so no model can delete or overwrite another model's transcripts,
-    including models benchmarked in other runs. An ID that is already a safe name keeps it; any other ID gets
-    safe_name(ID) plus "~" and the first 16 hex digits of its SHA-256 ("a/b" becomes "a_b~<hash>"). The name doesn't
-    depend on which other models are selected, and "~" never occurs in a safe name, so a hashed name never equals a
-    plain one. Two IDs share a name only if their hashes collide; within one call the later one then gets "-2",
-    "-3", ... appended."""
+    including models benchmarked in other runs. An ID that is already a safe name of at most MODEL_DIR_BYTES bytes
+    keeps it; any other ID gets safe_name(ID), cut to fit, plus "~" and the first 16 hex digits of its SHA-256 ("a/b"
+    becomes "a_b~<hash>"). The name doesn't depend on which other models are selected, and "~" never occurs in a safe
+    name, so a hashed name never equals a plain one. Two IDs share a name only if their 64-bit hashes collide, which
+    practically never happens; within one call the later one then gets "-2", "-3", ... appended."""
     names, taken = {}, set()
     for m in dict.fromkeys(models):
         name = safe_name(m)
-        if name != m:
-            name = f"{name}~{hashlib.sha256(m.encode()).hexdigest()[:16]}"
+        if name != m or len(name.encode()) > MODEL_DIR_BYTES:
+            prefix = name.encode()[:MODEL_DIR_BYTES - 17].decode(errors="ignore")   # \w also matches non-ASCII
+            name = f"{prefix}~{hashlib.sha256(m.encode()).hexdigest()[:16]}"
         candidate, k = name, 2
         while name in taken:
             name, k = f"{candidate}-{k}", k + 1
@@ -583,11 +587,12 @@ EARLY_EXIT_NOTE = ('[the test harness exited with status 0 before it finished: i
 
 
 def finished(out, last_cmd, final_line):
-    """Whether a line of `out` after the last "$ <last_cmd>" line starts with `final_line`: the harness got through
-    all its checks instead of the process ending early."""
+    """Whether a line of `out` after the last "$ <last_cmd>" line contains `final_line`: the harness got through all
+    its checks instead of the process ending early. Anywhere in the line, not only at its start: the solution shares
+    the harness's output, so its own unterminated output (print("x", end="")) can come first on the same line."""
     lines = out.splitlines()
     start = max((i for i, line in enumerate(lines) if line == f"$ {last_cmd}"), default=None)
-    return start is not None and any(line.startswith(final_line) for line in lines[start + 1:])
+    return start is not None and any(final_line in line for line in lines[start + 1:])
 
 
 def run_task(task, code, workdir):

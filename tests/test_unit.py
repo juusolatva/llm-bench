@@ -64,6 +64,19 @@ def test_model_dirs_dont_depend_on_the_selection():
     assert llm_bench.model_dirs(["a_b", "a/b", hashed])["a/b"] == hashed
 
 
+def test_model_dirs_fit_the_file_name_limit():
+    """Names stay within MODEL_DIR_BYTES (file systems allow 255 bytes per name), also for long safe IDs and for
+    multi-byte characters, which are never cut in half."""
+    limit = llm_bench.MODEL_DIR_BYTES
+    unsafe, safe, wide = "a" * 240 + "/", "b" * (limit + 1), "é" * 150 + "/"
+    dirs = llm_bench.model_dirs([unsafe, safe, wide, "c" * limit])
+    assert dirs["c" * limit] == "c" * limit   # exactly at the limit: unchanged
+    assert dirs[unsafe] == "a" * (limit - 17) + "~" + sha16(unsafe)
+    assert dirs[safe] == "b" * (limit - 17) + "~" + sha16(safe)
+    assert dirs[wide] == "é" * ((limit - 17) // 2) + "~" + sha16(wide)
+    assert all(len(d.encode()) <= limit for d in dirs.values())
+
+
 def test_model_dirs_number_hash_collisions(monkeypatch):
     class FakeHash:
         def hexdigest(self):
@@ -78,7 +91,8 @@ def test_model_dirs_number_hash_collisions(monkeypatch):
     ("$ gcc x.c\n$ ./t\nstuff\nharness: all checks passed (3 checks)\nmore\n", True),   # a prefix match
     ("$ ./t\n", False),                                                  # ended early
     ("$ ./t\nall checks passed\n", False),
-    ("$ ./t\n  harness: all checks passed\n", False),                    # not at the start of the line
+    ("$ ./t\nloadedharness: all checks passed\n", True),                # after the solution's unterminated output
+    ("$ ./t\nall checks passed\nharness: all\n", False),
     ("harness: all checks passed\n$ ./t\n", False),                      # only before the last command
     ("$ gcc x.c\nharness: all checks passed\n", False),                  # the last command never started
     ("$ ./t\nharness: all checks passed\n$ ./t\n", False),               # the last "$ ./t" line counts
@@ -105,8 +119,7 @@ def test_run_task_needs_the_final_line(monkeypatch, tmp_path, lang, output, pass
     spec = llm_bench.LANGS[lang]
     rendered = [llm_bench.shlex.join(c) for c in spec["cmds"]]
     out = "".join(f"$ {r}\n" for r in rendered) + output
-    calls = []
-    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: calls.append(cwd) or llm_bench.CmdResult(0, out, False))
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(0, out, False))
     task = {"lang": lang, "test": "the harness"}
     ok, log, stage, cmd, fail_out = llm_bench.run_task(task, "the solution", tmp_path / "w")
     assert ok is passed
