@@ -124,35 +124,50 @@ DEFAULT_TASKS_DIR = Path(__file__).resolve().parent / "tasks"
 TASK_DIR_RE = re.compile(r"[a-z0-9][a-z0-9_]*")
 
 
+def _visible_dirs(path):
+    """The subdirectories of path that aren't hidden ("." or "_" prefix), sorted by name."""
+    return sorted(p for p in path.iterdir() if p.is_dir() and p.name[0] not in "._")
+
+
+def _check_lang_dirs(root):
+    """Raise ValueError if root is missing or has a visible subdirectory that isn't a LANGS key."""
+    if not root.is_dir():
+        raise ValueError(f"task directory not found: {root}")
+    for entry in _visible_dirs(root):
+        if entry.name not in LANGS:
+            raise ValueError(f"{entry}: unknown language directory (known: {', '.join(LANGS)})")
+
+
+def _load_task(taskdir, lang, seen):
+    """Read one task directory into a task dict and record its name in seen (name -> directory).
+    Raises ValueError for a bad directory name, missing or empty files, or a duplicate task name."""
+    spec = LANGS[lang]
+    if not TASK_DIR_RE.fullmatch(taskdir.name):
+        raise ValueError(f"{taskdir}: task directory names may contain only a-z, 0-9 and _")
+    prompt_file, test_file = taskdir / "prompt.md", taskdir / spec["test"]
+    for f in (prompt_file, test_file):
+        if not f.is_file():
+            raise ValueError(f"{taskdir}: missing {f.name}")
+    name = f"{spec['prefix']}_{taskdir.name}"
+    if name in seen:
+        raise ValueError(f"duplicate task {name}: {seen[name]} and {taskdir}")
+    seen[name] = taskdir
+    prompt = prompt_file.read_text().strip()
+    if not prompt:
+        raise ValueError(f"{prompt_file}: empty prompt")
+    return {"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text()}
+
+
 def load_tasks(roots):
     """Load the tasks under each root directory. Tasks are ordered by language (LANGS order), then by
     root, then by directory name. Raises ValueError for malformed layouts or duplicate task names."""
     tasks, seen = [], {}
     for root in map(Path, roots):
-        if not root.is_dir():
-            raise ValueError(f"task directory not found: {root}")
-        for entry in sorted(root.iterdir()):
-            if entry.is_dir() and entry.name[0] not in "._" and entry.name not in LANGS:
-                raise ValueError(f"{entry}: unknown language directory (known: {', '.join(LANGS)})")
-        for lang, spec in LANGS.items():
+        _check_lang_dirs(root)
+        for lang in LANGS:
             langdir = root / lang
-            if not langdir.is_dir():
-                continue
-            for taskdir in sorted(p for p in langdir.iterdir() if p.is_dir() and p.name[0] not in "._"):
-                if not TASK_DIR_RE.fullmatch(taskdir.name):
-                    raise ValueError(f"{taskdir}: task directory names may contain only a-z, 0-9 and _")
-                prompt_file, test_file = taskdir / "prompt.md", taskdir / spec["test"]
-                for f in (prompt_file, test_file):
-                    if not f.is_file():
-                        raise ValueError(f"{taskdir}: missing {f.name}")
-                name = f"{spec['prefix']}_{taskdir.name}"
-                if name in seen:
-                    raise ValueError(f"duplicate task {name}: {seen[name]} and {taskdir}")
-                seen[name] = taskdir
-                prompt = prompt_file.read_text().strip()
-                if not prompt:
-                    raise ValueError(f"{prompt_file}: empty prompt")
-                tasks.append({"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text()})
+            if langdir.is_dir():
+                tasks.extend(_load_task(taskdir, lang, seen) for taskdir in _visible_dirs(langdir))
     order = list(LANGS)
     return sorted(tasks, key=lambda t: order.index(t["lang"]))   # stable: keeps root and name order
 
@@ -689,6 +704,47 @@ def valid_counts(usage):
             if k not in ("prompt_tokens", "completion_tokens") or (type(v) is int and v >= 0)}
 
 
+def http_error_detail(e):
+    """The start of an HTTP error's body, or "" if it can't be read."""
+    try:
+        return e.read(500).decode("utf-8", errors="replace").strip()
+    except (OSError, http.client.HTTPException):
+        return ""
+
+
+def connection_lost(label, base, opts, e, delay, stop):
+    """Handle a refused, reset or dropped connection. Returns True if the server still answers (so the model
+    process, not the server, died); otherwise waits delay seconds for the server to come back and returns False.
+    Raises ServerDown when no retry is left (delay is None), Interrupted if the run is interrupted while waiting."""
+    if server_reachable(base, opts.api_key):
+        log(f"{label}: connection lost ({e}), server still reachable", err=True)
+        return True
+    if delay is None:
+        raise ServerDown(str(e)) from e
+    log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
+    if stop.wait(delay):
+        raise Interrupted from None
+    return False
+
+
+def parse_reply(label, resp, seconds):
+    """chat()'s result for a decoded chat completion reply: its text, finish reason and usage, or "bad_response"
+    if it doesn't have the expected shape."""
+    try:
+        choice = resp["choices"][0]
+        text = choice["message"].get("content") or ""
+        if not isinstance(text, str):
+            raise TypeError(f"content is {type(text).__name__}")
+        usage = resp.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise TypeError(f"usage is {type(usage).__name__}")
+        usage = valid_counts(usage)
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
+        return "", None, {}, "bad_response", seconds
+    return text, choice.get("finish_reason"), usage, None, seconds
+
+
 def chat(label, base, payload, opts, stop):
     """POST one chat completion. Returns (text, finish_reason, usage, error, seconds); seconds is the duration of
     the last HTTP request alone, without the waits for an unreachable server.
@@ -697,48 +753,23 @@ def chat(label, base, payload, opts, stop):
     or "disconnected". If the server itself is unreachable, wait and retry the same request; raise
     ServerDown when it stays down, Interrupted if the run is interrupted while waiting."""
     for delay in (*SERVER_RETRY_DELAYS_S, None):
+        t0 = time.monotonic()
         try:
-            t0 = time.monotonic()
             resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
         except urllib.error.HTTPError as e:   # the server answered: model failed to load, crashed, prompt too long
-            try:
-                detail = e.read(500).decode("utf-8", errors="replace").strip()
-            except (OSError, http.client.HTTPException):
-                detail = ""
-            log(f"{label}: HTTP {e.code}: {detail or e.reason}", err=True)
+            log(f"{label}: HTTP {e.code}: {http_error_detail(e) or e.reason}", err=True)
             return "", None, {}, f"http_{e.code}", time.monotonic() - t0
         except TimeoutError:   # raised directly only while waiting for the reply: the model was too slow
             log(f"{label}: no reply within {opts.timeout}s", err=True)
             return "", None, {}, "timeout", time.monotonic() - t0
         except (OSError, http.client.HTTPException) as e:
-            # Refused, reset or dropped connection. If the server still answers, the model process
-            # (not the server) died; otherwise wait for the server to come back.
-            if server_reachable(base, opts.api_key):
-                log(f"{label}: connection lost ({e}), server still reachable", err=True)
+            if connection_lost(label, base, opts, e, delay, stop):
                 return "", None, {}, "disconnected", time.monotonic() - t0
-            if delay is None:
-                raise ServerDown(str(e)) from e
-            log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
-            if stop.wait(delay):
-                raise Interrupted from None
             continue
         except ValueError as e:   # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
             log(f"{label}: bad response: {e}", err=True)
             return "", None, {}, "bad_response", time.monotonic() - t0
-        seconds = time.monotonic() - t0
-        try:
-            choice = resp["choices"][0]
-            text = choice["message"].get("content") or ""
-            if not isinstance(text, str):
-                raise TypeError(f"content is {type(text).__name__}")
-            usage = resp.get("usage") or {}
-            if not isinstance(usage, dict):
-                raise TypeError(f"usage is {type(usage).__name__}")
-            usage = valid_counts(usage)
-        except (KeyError, IndexError, TypeError, AttributeError) as e:
-            log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
-            return "", None, {}, "bad_response", seconds
-        return text, choice.get("finish_reason"), usage, None, seconds
+        return parse_reply(label, resp, time.monotonic() - t0)
     raise AssertionError("unreachable")
 
 
@@ -757,6 +788,36 @@ def reasoning_tokens(usage):
 def is_model_error(finish):
     """Whether a finish reason means the model or server failed the request (counts toward MAX_MODEL_ERRORS)."""
     return finish in MODEL_ERRORS or (finish or "").startswith("http_")
+
+
+def add_usage(result, usage, request_seconds, reasoning_complete):
+    """Add one reply's token counts (and, if it reports them, its request time) to the trial's result fields.
+    Returns whether every reply so far reported its reasoning tokens."""
+    result["prompt_tokens"] += usage.get("prompt_tokens") or 0
+    result["completion_tokens"] += usage.get("completion_tokens") or 0
+    if usage.get("completion_tokens") is not None:   # reported, even if 0: a measurement
+        # Throughput's time base: the requests of the replies that report their tokens, no server waits.
+        result["usage_seconds"] += request_seconds
+    # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
+    # the completion tokens of all replies, on another scale. None is an empty cell.
+    reasoning = reasoning_tokens(usage)
+    reasoning_complete = reasoning_complete and reasoning is not None
+    result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning if reasoning_complete else None
+    return reasoning_complete
+
+
+def check_reply(task, text, adir):
+    """Extract the code from a reply, build and test it in adir, and save the reply and the log there.
+    Returns (passed, stage, fail_cmd, fail_out) as run_task does."""
+    code = extract_code(text, task["lang"])
+    if code.strip():
+        passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
+    else:
+        adir.mkdir(parents=True)
+        passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
+    (adir / "response.md").write_text(text)
+    (adir / "log.txt").write_text(run_log)
+    return passed, stage, fail_cmd, fail_out
 
 
 def run_one_task(label, base, model, task, taskdir, opts, stop):
@@ -784,30 +845,12 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             result["finish_reason"], result["fail_stage"] = error, "request"
             break
         result["finish_reason"] = finish
-        result["prompt_tokens"] += usage.get("prompt_tokens") or 0
-        result["completion_tokens"] += usage.get("completion_tokens") or 0
-        if usage.get("completion_tokens") is not None:   # reported, even if 0: a measurement
-            # Throughput's time base: the requests of the replies that report their tokens, no server waits.
-            result["usage_seconds"] += request_seconds
-        # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
-        # the completion tokens of all replies, on another scale. None is an empty cell.
-        reasoning = reasoning_tokens(usage)
-        if reasoning is None:
-            reasoning_complete = False
-        result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning if reasoning_complete else None
+        reasoning_complete = add_usage(result, usage, request_seconds, reasoning_complete)
         if len(text) > MAX_CONTENT_CHARS:  # counted as failure, nothing written to disk
             log(f"{label}: response exceeds {MAX_CONTENT_CHARS} chars", err=True)
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
             break
-        adir = taskdir / f"attempt_{attempt}"
-        code = extract_code(text, task["lang"])
-        if code.strip():
-            passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
-        else:
-            adir.mkdir(parents=True)
-            passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
-        (adir / "response.md").write_text(text)
-        (adir / "log.txt").write_text(run_log)
+        passed, stage, fail_cmd, fail_out = check_reply(task, text, taskdir / f"attempt_{attempt}")
         result["fail_stage"] = stage
         if passed:
             result["passed"], result["passed_on"] = 1, attempt
@@ -947,31 +990,34 @@ FLOAT_FIELDS = ("seconds", "load_seconds")
 RETRY_FINISHES = ("bad_response", "disconnected", "skipped")
 
 
+def results_row(raw, path):
+    """One results CSV record as a row: numeric fields converted, defaults for columns of newer versions, and
+    an old "backend" column renamed to "endpoint". Raises ValueError if a required column is missing."""
+    row = {k: v for k, v in raw.items() if k is not None}
+    if "endpoint" not in row and "backend" in row:
+        row["endpoint"] = row.pop("backend")
+    missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
+    if missing:
+        raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
+    for k in INT_FIELDS:
+        row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
+    for k in FLOAT_FIELDS:
+        row[k] = float(row.get(k) or 0)
+    for k in FIELDS:
+        if row.get(k) is None:
+            row[k] = ""
+    # Empty when the server didn't report it, so a missing count isn't read as zero.
+    row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
+    # Empty in rows from before the column existed; summarize falls back to an estimate for them.
+    row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
+    return row
+
+
 def read_results(path):
     """Rows of a results CSV, numeric fields converted. Files from older versions are accepted: missing
     columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint"."""
-    rows = []
     with open(path, newline="") as f:
-        for raw in csv.DictReader(f):
-            row = {k: v for k, v in raw.items() if k is not None}
-            if "endpoint" not in row and "backend" in row:
-                row["endpoint"] = row.pop("backend")
-            missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
-            if missing:
-                raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
-            for k in INT_FIELDS:
-                row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
-            for k in FLOAT_FIELDS:
-                row[k] = float(row.get(k) or 0)
-            for k in FIELDS:
-                if row.get(k) is None:
-                    row[k] = ""
-            # Empty when the server didn't report it, so a missing count isn't read as zero.
-            row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
-            # Empty in rows from before the column existed; summarize falls back to an estimate for them.
-            row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
-            rows.append(row)
-    return rows
+        return [results_row(raw, path) for raw in csv.DictReader(f)]
 
 
 def is_finished(row):
@@ -980,81 +1026,102 @@ def is_finished(row):
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
 
+class EndpointRun:
+    """The state of one endpoint's trials: the results file writer, trial numbers and the rows recorded so far."""
+
+    def __init__(self, name, base, opts, f, out_path, runs_dir, existing, rows, stop):
+        self.name, self.base, self.opts, self.stop = name, base, opts, stop
+        self.f, self.out_path, self.runs_dir, self.rows = f, out_path, runs_dir, rows
+        self.w = csv.DictWriter(f, fieldnames=FIELDS)
+        # Trial numbers (the repeat column) continue after the rows already in the file, so transcripts are
+        # never overwritten.
+        self.numbered = Counter((r["model"], r["task"], r["config"]) for r in existing)
+        self.finished = Counter((r["model"], r["task"], r["config"]) for r in existing if is_finished(r))
+        self.params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
+
+    def record(self, model, task, result, model_info):
+        """Number the trial, then append its row to the results file and to rows."""
+        key = (model, task["name"], task["config"])
+        self.numbered[key] += 1
+        row = {"run_id": self.opts.run_id, "endpoint": self.name, "model": model, "task": task["name"],
+               "lang": task["lang"], "repeat": self.numbered[key], **result, **model_info, "params": self.params,
+               "settings": self.opts.settings_hash, "config": task["config"]}
+        self.rows.append(row)
+        self.w.writerow(row)
+        self.f.flush()
+        log(str(row))
+
+    def skip_rest(self, model, todo, why, finish_reason, fail_stage, model_info):
+        """Record the model's remaining trials as skipped with the given finish reason and fail stage."""
+        log(f"{self.name}/{model}: {why}; skipping its remaining {len(todo)} trial(s)", err=True)
+        for task in todo:
+            self.record(model, task, skipped_result(finish_reason, fail_stage), model_info)
+
+    def todo(self, model, tasks):
+        """The model's trials to run, in round-major order: one round (a trial of every task) finishes before
+        the next one starts. With --resume, trials already finished in the results file are left out."""
+        opts = self.opts
+        return [task for rep in range(opts.repeat) for task in tasks
+                if not opts.resume or self.finished[(model, task["name"], task["config"])] <= rep]
+
+    def run_model(self, model, model_dir, tasks):
+        """Load the model and run its remaining trials, stopping early after too many request errors in a row
+        or replies that hit --max-tokens."""
+        name, opts = self.name, self.opts
+        todo, total = self.todo(model, tasks), opts.repeat * len(tasks)
+        if not todo:
+            log(f"{name}/{model}: all {total} trial(s) already in {self.out_path}; skipping", err=True)
+            return
+        if len(todo) < total:
+            log(f"{name}/{model}: resuming, {len(todo)} of {total} trial(s) to go", err=True)
+        load_seconds, context, error = prepare_model(f"{name}/{model}", self.base, model, opts, self.stop)
+        model_info = {"load_seconds": load_seconds, "context": context}
+        if error:
+            self.skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
+            return
+        model_errors = 0     # consecutive trials that ended in a request error
+        length_finishes = 0  # trials whose last reply hit --max-tokens
+        for i, task in enumerate(todo):
+            if model_errors >= MAX_MODEL_ERRORS:
+                self.skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
+                               model_info)
+                return
+            if opts.max_length_finishes and length_finishes >= opts.max_length_finishes:
+                self.skip_rest(model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped",
+                               "budget", model_info)
+                return
+            result = self.run_trial(model, model_dir, task)
+            model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
+            length_finishes += result["finish_reason"] == "length"
+            self.record(model, task, result, model_info)
+
+    def run_trial(self, model, model_dir, task):
+        """Run one trial of task, keeping its transcript under the trial's own directory."""
+        repeat = self.numbered[(model, task["name"], task["config"])] + 1
+        label = f"{self.name}/{model}/{task['name']}" + (f"#{repeat}" if self.opts.repeat > 1 else "")
+        # Trial numbers restart for each config, so it's part of the path: no trial can replace the transcript
+        # of another config's trial.
+        taskdir = self.runs_dir / model_dir / task["name"] / task["config"] / f"repeat_{repeat}"
+        return run_one_task(label, self.base, model, task, taskdir, self.opts, self.stop)
+
+
 def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop):
     """Run opts.repeat rounds of trials for each model of one endpoint (with opts.resume, only the trials not
     yet finished in out_path). Appends each row to out_path (and to rows) as it completes."""
     existing = []
     if out_path.exists() and out_path.stat().st_size > 0:
         existing = [r for r in read_results(out_path) if r["endpoint"] == name]
-    # Trial numbers (the repeat column) continue after the rows already in the file, so transcripts are never
-    # overwritten.
-    numbered = Counter((r["model"], r["task"], r["config"]) for r in existing)
-    finished = Counter((r["model"], r["task"], r["config"]) for r in existing if is_finished(r))
     new_file = not existing and (not out_path.exists() or out_path.stat().st_size == 0)
     # Rows are written as they complete, so an aborted run keeps every finished trial.
     with open(out_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
+        run = EndpointRun(name, base, opts, f, out_path, runs_dir, existing, rows, stop)
         if new_file:
-            w.writeheader()
+            run.w.writeheader()
             f.flush()
-
-        params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
         dirs = model_dirs(models)
-
-        def record(model, task, result, model_info):
-            """Number the trial, then append its row to the results file and to rows."""
-            key = (model, task["name"], task["config"])
-            numbered[key] += 1
-            row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
-                   "lang": task["lang"], "repeat": numbered[key], **result, **model_info, "params": params,
-                   "settings": opts.settings_hash, "config": task["config"]}
-            rows.append(row)
-            w.writerow(row)
-            f.flush()
-            log(str(row))
-
-        def skip_rest(model, todo, why, finish_reason, fail_stage, model_info):
-            """Record the model's remaining trials as skipped with the given finish reason and fail stage."""
-            log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} trial(s)", err=True)
-            for task in todo:
-                record(model, task, skipped_result(finish_reason, fail_stage), model_info)
-
         try:
             for model in models:
-                # Round-major order: one round (a trial of every task) finishes before the next one starts.
-                todo = [task for rep in range(opts.repeat) for task in tasks
-                        if not opts.resume or finished[(model, task["name"], task["config"])] <= rep]
-                total = opts.repeat * len(tasks)
-                if not todo:
-                    log(f"{name}/{model}: all {total} trial(s) already in {out_path}; skipping", err=True)
-                    continue
-                if len(todo) < total:
-                    log(f"{name}/{model}: resuming, {len(todo)} of {total} trial(s) to go", err=True)
-                load_seconds, context, error = prepare_model(f"{name}/{model}", base, model, opts, stop)
-                model_info = {"load_seconds": load_seconds, "context": context}
-                if error:
-                    skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
-                    continue
-                model_errors = 0     # consecutive trials that ended in a request error
-                length_finishes = 0  # trials whose last reply hit --max-tokens
-                for i, task in enumerate(todo):
-                    if model_errors >= MAX_MODEL_ERRORS:
-                        skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
-                                  model_info)
-                        break
-                    if opts.max_length_finishes and length_finishes >= opts.max_length_finishes:
-                        skip_rest(model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped",
-                                  "budget", model_info)
-                        break
-                    repeat = numbered[(model, task["name"], task["config"])] + 1
-                    label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    # Trial numbers restart for each config, so it's part of the path: no trial can replace
-                    # the transcript of another config's trial.
-                    taskdir = runs_dir / dirs[model] / task["name"] / task["config"] / f"repeat_{repeat}"
-                    result = run_one_task(label, base, model, task, taskdir, opts, stop)
-                    model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
-                    length_finishes += result["finish_reason"] == "length"
-                    record(model, task, result, model_info)
+                run.run_model(model, dirs[model], tasks)
         except ServerDown as e:
             log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
         except Interrupted:
@@ -1090,16 +1157,9 @@ def ended_with_reply(row):
     return not (is_model_error(finish) or finish in ("timeout", "skipped"))
 
 
-def summarize(rows):
-    """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
-    (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
-    newest version is scored without that task. Several rows of a task are trials in different rounds.
-    Throughput ("tps") is completion tokens per second of the replies that reported them (usage_seconds); None
-    without any. Rows from before usage_seconds existed count if they ended with a reply that reported usage
-    (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
-    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
-    reported them (otherwise None: a partial count would be on another scale than completion tokens).
-    Returns (groups, dropped row count)."""
+def newest_rows(rows):
+    """{(endpoint, model, settings): {task: rows}} of the rows of each task's newest version, and the number of
+    rows of other versions that were dropped."""
     newest = newest_configs(rows)
     tasks_by_group = {}
     dropped = 0
@@ -1110,48 +1170,79 @@ def summarize(rows):
             continue
         group = tasks_by_group.setdefault((r["endpoint"], r["model"], settings), {})
         group.setdefault(r["task"], []).append(r)
+    return tasks_by_group, dropped
+
+
+def throughput(trials):
+    """Completion tokens per second of the replies that reported them, or None without any (see summarize)."""
+    measured = [(r["completion_tokens"], r["usage_seconds"]) for r in trials if r.get("usage_seconds") is not None]
+    measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
+                 and ended_with_reply(r) and r["completion_tokens"] > 0]
+    usage_seconds = sum(sec for _, sec in measured)
+    tokens = sum(tokens for tokens, _ in measured)
+    return tokens / usage_seconds if usage_seconds and tokens else None
+
+
+def mean_reasoning_tokens(tasks):
+    """Reasoning tokens per round, summed over tasks ({task: rows}), or None unless every trial with a reply
+    reported them (see summarize)."""
+    trials = [r for task_rows in tasks.values() for r in task_rows]
+    # Every trial with a reply needs a count, including one that got replies and then a request error (a
+    # request error ends a trial, so every attempt before the last got a reply): its completion tokens count,
+    # so its unknown reasoning tokens can't count as zero.
+    with_replies = [r for r in trials if ended_with_reply(r) or (r.get("attempts") or 0) > 1]
+    if not with_replies or any(r.get("reasoning_tokens") is None for r in with_replies):
+        return None
+    return sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
+               for task_rows in tasks.values())
+
+
+def add_task_scores(g, task, task_rows):
+    """Add one task's trials (rows from different rounds) to the group's scores, means and per-task counts."""
+    n = len(task_rows)
+    p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
+    p = sum(r["passed"] for r in task_rows) / n
+    g["p1"] += p1
+    g["pass"] += p
+    # Variance of one round's score: a sum of per-task Bernoulli variables (unbiased estimate).
+    correction = n / (n - 1) if n > 1 else 0.0
+    g["var1"] += p1 * (1 - p1) * correction
+    g["var"] += p * (1 - p) * correction
+    g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
+    g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
+    g["s"] += sum(r["seconds"] for r in task_rows) / n
+    g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
+                           "passed": sum(r["passed"] for r in task_rows),
+                           "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
+    g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
+    lang = g["langs"][task_rows[0]["lang"]]
+    lang[0] += p
+    lang[1] += 1
+    g["trials"].append(n)
+    if task_rows[-1].get("context"):
+        g["context"] = task_rows[-1]["context"]
+
+
+def summarize(rows):
+    """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
+    (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
+    newest version is scored without that task. Several rows of a task are trials in different rounds.
+    Throughput ("tps") is completion tokens per second of the replies that reported them (usage_seconds); None
+    without any. Rows from before usage_seconds existed count if they ended with a reply that reported usage
+    (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
+    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
+    reported them (otherwise None: a partial count would be on another scale than completion tokens).
+    Returns (groups, dropped row count)."""
+    tasks_by_group, dropped = newest_rows(rows)
     groups = []
     for (endpoint, model, settings), tasks in tasks_by_group.items():
         g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
-             "trials": [], "tasks": set(tasks), "context": "unchecked", "rt": None, "per_task": {}}
-        trials = [r for task_rows in tasks.values() for r in task_rows]
-        measured = [(r["completion_tokens"], r["usage_seconds"]) for r in trials if r.get("usage_seconds") is not None]
-        measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
-                     and ended_with_reply(r) and r["completion_tokens"] > 0]
-        usage_seconds = sum(sec for _, sec in measured)
-        tokens = sum(tokens for tokens, _ in measured)
-        g["tps"] = tokens / usage_seconds if usage_seconds and tokens else None
-        # Every trial with a reply needs a count, including one that got replies and then a request error (a
-        # request error ends a trial, so every attempt before the last got a reply): its completion tokens count,
-        # so its unknown reasoning tokens can't count as zero.
-        with_replies = [r for r in trials if ended_with_reply(r) or (r.get("attempts") or 0) > 1]
-        if with_replies and all(r.get("reasoning_tokens") is not None for r in with_replies):
-            g["rt"] = sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
-                          for task_rows in tasks.values())
+             "trials": [], "tasks": set(tasks), "context": "unchecked", "per_task": {},
+             "tps": throughput([r for task_rows in tasks.values() for r in task_rows]),
+             "rt": mean_reasoning_tokens(tasks)}
         for task, task_rows in tasks.items():
-            n = len(task_rows)
-            p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
-            p = sum(r["passed"] for r in task_rows) / n
-            g["p1"] += p1
-            g["pass"] += p
-            # Variance of one round's score: a sum of per-task Bernoulli variables (unbiased estimate).
-            correction = n / (n - 1) if n > 1 else 0.0
-            g["var1"] += p1 * (1 - p1) * correction
-            g["var"] += p * (1 - p) * correction
-            g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
-            g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
-            g["s"] += sum(r["seconds"] for r in task_rows) / n
-            g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
-                                   "passed": sum(r["passed"] for r in task_rows),
-                                   "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
-            g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
-            lang = g["langs"][task_rows[0]["lang"]]
-            lang[0] += p
-            lang[1] += 1
-            g["trials"].append(n)
-            if task_rows[-1].get("context"):
-                g["context"] = task_rows[-1]["context"]
+            add_task_scores(g, task, task_rows)
         groups.append(g)
     return groups, dropped
 
@@ -1184,36 +1275,39 @@ def group_label(g, layout):
     return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if layout["show_settings"] else "")
 
 
+def score_cell(value, var, n, repeated):
+    """A pass count: mean±sd/n with several rounds, otherwise count/n."""
+    return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
+
+
+def lang_cell(lang_counts, repeated):
+    """A per-language pass count: the mean with several rounds, otherwise the count, out of n."""
+    value, n = lang_counts
+    return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
+
+
+def summary_row(g, layout):
+    """One model's row of the summary table as display strings."""
+    repeated = layout["repeated"]
+    cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
+    if repeated:
+        lo, hi = min(g["trials"]), max(g["trials"])
+        cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
+    cells += [score_cell(g["p1"], g["var1"], g["n"], repeated), score_cell(g["pass"], g["var"], g["n"], repeated)]
+    cells += [lang_cell(g["langs"][lang], repeated) if lang in g["langs"] else "-" for lang in layout["langs"]]
+    cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
+    if layout["reasoning"]:
+        cells.append("-" if g["rt"] is None else f"{g['rt']:.0f}")
+    cells += [f"{g['s']:.1f}", "-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
+    return cells
+
+
 def summary_cells(groups, layout):
     """The summary as display strings: (header, rows, number of leading text columns)."""
-    repeated, langs = layout["repeated"], layout["langs"]
-
-    def score(value, var, n):
-        """A pass count: mean±sd/n with several rounds, otherwise count/n."""
-        return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
-
-    def lang_cell(lang_counts):
-        """A per-language pass count: the mean with several rounds, otherwise the count, out of n."""
-        value, n = lang_counts
-        return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
-
     text = ["endpoint", "model"] + (["settings"] if layout["show_settings"] else [])
-    header = (text + (["rounds"] if repeated else []) + ["pass@1", "passed", *langs, "prompt_tok", "compl_tok"]
-              + (["reason_tok"] if layout["reasoning"] else []) + ["sec", "tok/s", "load"])
-    body = []
-    for g in groups:
-        cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
-        if repeated:
-            lo, hi = min(g["trials"]), max(g["trials"])
-            cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
-        cells += [score(g["p1"], g["var1"], g["n"]), score(g["pass"], g["var"], g["n"])]
-        cells += [lang_cell(g["langs"][lang]) if lang in g["langs"] else "-" for lang in langs]
-        cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
-        if layout["reasoning"]:
-            cells.append("-" if g["rt"] is None else f"{g['rt']:.0f}")
-        cells += [f"{g['s']:.1f}", "-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
-        body.append(cells)
-    return header, body, len(text)
+    header = (text + (["rounds"] if layout["repeated"] else []) + ["pass@1", "passed", *layout["langs"],
+              "prompt_tok", "compl_tok"] + (["reason_tok"] if layout["reasoning"] else []) + ["sec", "tok/s", "load"])
+    return header, [summary_row(g, layout) for g in groups], len(text)
 
 
 def summary_records(groups, layout):
@@ -1482,33 +1576,33 @@ def upgrade_results_file(path):
     log(f"upgraded {path} to the current columns (new ones are empty in its existing rows)", err=True)
 
 
-def main():
-    """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
-    args = parse_args()
-    if args.summary:
-        try:
-            rows = [r for path in args.summary for r in read_results(path)]
-        except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
-            sys.exit(f"cannot read results: {e}")
-        print_summary(rows, args.format, args.per_task)
-        return
+def show_summary(paths, fmt, per_task):
+    """--summary mode: print the summary of the given results files."""
+    try:
+        rows = [r for path in paths for r in read_results(path)]
+    except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
+        sys.exit(f"cannot read results: {e}")
+    print_summary(rows, fmt, per_task)
+
+
+def select_tasks(args):
+    """Load the tasks and keep the ones matching --task; warn about patterns that match no task."""
     try:
         all_tasks = load_tasks(args.tasks_dir or [DEFAULT_TASKS_DIR])
     except (OSError, ValueError) as e:   # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot load tasks: {e}")
     tasks = [t for t in all_tasks if not args.task or any(fnmatchcase(t["name"], p) for p in args.task)]
-    if args.list_tasks:
-        for t in tasks:
-            print(f"{t['name']:24} {t['lang']}")
-        return
-    for p in args.task:
-        if not any(fnmatchcase(t["name"], p) for t in all_tasks):
-            log(f"warning: task pattern {p!r} matched no task (see --list-tasks)", err=True)
-    if not tasks:
-        sys.exit("no tasks selected")
+    if not args.list_tasks:
+        for p in args.task:
+            if not any(fnmatchcase(t["name"], p) for t in all_tasks):
+                log(f"warning: task pattern {p!r} matched no task (see --list-tasks)", err=True)
+    return tasks
 
+
+def parse_endpoints(specs):
+    """Map endpoint name -> base URL for the endpoint arguments; exit on a bad or duplicate one."""
     endpoints = {}
-    for spec in args.endpoints:
+    for spec in specs:
         try:
             name, base = parse_endpoint(spec)
         except ValueError as e:
@@ -1516,6 +1610,56 @@ def main():
         if name in endpoints:
             sys.exit(f"duplicate endpoint name {name!r}; label them with NAME=URL")
         endpoints[name] = base
+    return endpoints
+
+
+def select_models(ids, patterns):
+    """The model IDs matching any of the --model patterns, or passing the default filter without patterns."""
+    if patterns:
+        return [m for m in ids if any(fnmatchcase(m, p) for p in patterns)]
+    return [m for m in ids if default_model_filter(m)]
+
+
+def plan_models(args, endpoints):
+    """Map endpoint name -> models to benchmark (--model patterns, or the default filter); endpoints
+    with no selected model are left out. Warns about --model patterns that match no model."""
+    plan = {}
+    for name, base in endpoints.items():
+        models = select_models(list_models(name, base, args.api_key), args.model)
+        if models:
+            plan[name] = models
+            log(f"{name} ({base}): {len(models)} model(s): {', '.join(models)}", err=True)
+    for p in args.model:
+        if not any(fnmatchcase(m, p) for models in plan.values() for m in models):
+            log(f"warning: pattern {p!r} matched no model", err=True)
+    return plan
+
+
+def output_paths(args, plan):
+    """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV."""
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_{args.tag}" if args.tag else ""
+    outputs = {name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
+               for name in plan}
+    for csv_path, _ in outputs.values():
+        check_results_file(csv_path)
+    return outputs
+
+
+def main():
+    """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
+    args = parse_args()
+    if args.summary:
+        show_summary(args.summary, args.format, args.per_task)
+        return
+    tasks = select_tasks(args)
+    if args.list_tasks:
+        for t in tasks:
+            print(f"{t['name']:24} {t['lang']}")
+        return
+    if not tasks:
+        sys.exit("no tasks selected")
+    endpoints = parse_endpoints(args.endpoints)
 
     check_toolchains(tasks)
     check_sandbox()
@@ -1524,28 +1668,10 @@ def main():
     args.settings_hash = settings_hash(settings)
     tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
 
-    plan = {}
-    for name, base in endpoints.items():
-        ids = list_models(name, base, args.api_key)
-        if args.model:
-            models = [m for m in ids if any(fnmatchcase(m, p) for p in args.model)]
-        else:
-            models = [m for m in ids if default_model_filter(m)]
-        if models:
-            plan[name] = models
-            log(f"{name} ({base}): {len(models)} model(s): {', '.join(models)}", err=True)
-    for p in args.model:
-        if not any(fnmatchcase(m, p) for models in plan.values() for m in models):
-            log(f"warning: pattern {p!r} matched no model", err=True)
+    plan = plan_models(args, endpoints)
     if not plan:
         sys.exit("no models selected")
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"_{args.tag}" if args.tag else ""
-    outputs = {name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
-               for name in plan}
-    for csv_path, _ in outputs.values():
-        check_results_file(csv_path)
+    outputs = output_paths(args, plan)
     go_tmp = None
     if any(t["lang"] == "go" for t in tasks):
         go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
