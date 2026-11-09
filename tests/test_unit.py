@@ -816,3 +816,93 @@ def test_check_toolchains_rejects_a_sysroot_without_rustc(monkeypatch, tmp_path)
     rustc_sysroot(monkeypatch, tmp_path)
     with pytest.raises(SystemExit, match="does not contain bin/rustc"):
         llm_bench.check_toolchains([{"lang": "rust"}])
+
+
+def fake_ts_toolchain(monkeypatch, tmp_path, ts_version="6.0.3", node_version="24.22.1", name="typescript",
+                      node_stdout=None):
+    """tmp_path/install/{bin/node, lib/node_modules/typescript}; tsc on PATH is tmp_path/shims/tsc, a symlink to
+    install/bin/tsc, itself a relative symlink into the package (as with fnm). Returns (node, package)."""
+    install = tmp_path / "install"
+    pkg = install / "lib/node_modules/typescript"
+    (pkg / "bin").mkdir(parents=True)
+    (pkg / "bin/tsc").write_text("#!/usr/bin/env node\n")
+    (pkg / "package.json").write_text(json.dumps({"name": name, "version": ts_version}))
+    (install / "bin").mkdir()
+    (install / "bin/node").write_text("")
+    (install / "bin/tsc").symlink_to("../lib/node_modules/typescript/bin/tsc")
+    (tmp_path / "shims").mkdir()
+    (tmp_path / "shims/tsc").symlink_to(install / "bin/tsc")
+    stdout = node_stdout if node_stdout is not None else json.dumps([str(install / "bin/node"), node_version]) + "\n"
+    paths = {"tsc": str(tmp_path / "shims/tsc"), "node": "/home/someone/.fnm/node"}
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name, path=None: paths.get(name, f"/usr/bin/{name}"))
+    monkeypatch.setattr(llm_bench.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout=stdout))
+    monkeypatch.setattr(llm_bench, "NODE_BIN", None)
+    monkeypatch.setattr(llm_bench, "TS_PACKAGE", None)
+    return (install / "bin/node").resolve(), pkg.resolve()
+
+
+def test_check_toolchains_resolves_node_and_typescript(monkeypatch, tmp_path):
+    node, pkg = fake_ts_toolchain(monkeypatch, tmp_path)
+    llm_bench.check_toolchains([{"lang": "ts"}])
+    assert (node, pkg) == (llm_bench.NODE_BIN, llm_bench.TS_PACKAGE)
+
+
+def test_check_toolchains_ignores_node_noise(monkeypatch, tmp_path):
+    """Lines before node's answer (e.g. warnings caused by NODE_OPTIONS) are ignored."""
+    install = tmp_path / "install"
+    noise = "(node:1) Warning: something\n\n" + json.dumps([str(install / "bin/node"), "22.0.0"]) + "\n"
+    node, _ = fake_ts_toolchain(monkeypatch, tmp_path, node_stdout=noise)
+    llm_bench.check_toolchains([{"lang": "ts"}])
+    assert node == llm_bench.NODE_BIN
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"ts_version": "5.4.5"}, r"TypeScript 5\.4\.5 at .* is too old \(need 5\.5\+\)"),
+    ({"node_version": "21.7.3"}, r"Node 21\.7\.3 at .* is too old \(need 22\+\)"),
+    ({"name": "not-typescript"}, r"tsc at .* isn't inside a typescript package"),
+    ({"node_stdout": "not json\n"}, r"cannot use the TypeScript toolchain"),
+])
+def test_check_toolchains_rejects_unusable_ts_toolchains(monkeypatch, tmp_path, kwargs, message):
+    fake_ts_toolchain(monkeypatch, tmp_path, **kwargs)
+    with pytest.raises(SystemExit, match=message):
+        llm_bench.check_toolchains([{"lang": "ts"}])
+
+
+@pytest.mark.parametrize("kwargs", [{"ts_version": "5.5.0"}, {"ts_version": "5.5.0-beta"}, {"node_version": "22.0.0"}])
+def test_check_toolchains_accepts_the_minimum_versions(monkeypatch, tmp_path, kwargs):
+    fake_ts_toolchain(monkeypatch, tmp_path, **kwargs)
+    llm_bench.check_toolchains([{"lang": "ts"}])
+
+
+def test_check_toolchains_reports_missing_node_and_tsc(monkeypatch):
+    monkeypatch.setattr(llm_bench.shutil, "which",
+                        lambda name, path=None: None if name in ("node", "tsc") else f"/usr/bin/{name}")
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: node, tsc\n"):
+        llm_bench.check_toolchains([{"lang": "ts"}])
+
+
+def test_check_toolchains_leaves_node_alone_without_ts_tasks(monkeypatch):
+    monkeypatch.setattr(llm_bench.shutil, "which",
+                        lambda name, path=None: None if name in ("node", "tsc") else f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench.subprocess, "run", lambda *a, **kw: pytest.fail("must not run node"))
+    llm_bench.check_toolchains([{"lang": "python"}, {"lang": "c"}])
+
+
+def test_check_toolchains_resolves_rust_and_ts_together(monkeypatch, tmp_path):
+    """Neither language's resolution ends the check before the other's."""
+    node, pkg = fake_ts_toolchain(monkeypatch, tmp_path)
+    sysroot = tmp_path / "rust"
+    (sysroot / "bin").mkdir(parents=True)
+    (sysroot / "bin/rustc").touch()
+    answers = {"rustc": f"{sysroot}\n"}
+    ts_answer = json.dumps([str(node), "24.22.1"]) + "\n"
+    monkeypatch.setattr(llm_bench.subprocess, "run",
+                        lambda cmd, **kw: SimpleNamespace(stdout=answers.get(cmd[0], ts_answer)))
+    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", None)
+    llm_bench.check_toolchains([{"lang": "rust"}, {"lang": "ts"}])
+    assert (sysroot.resolve(), node, pkg) == (llm_bench.RUST_SYSROOT, llm_bench.NODE_BIN, llm_bench.TS_PACKAGE)
+
+
+@pytest.mark.parametrize(("text", "want"), [("24.22.1", (24, 22, 1)), ("5.5.0-beta", (5, 5, 0)), ("v22.0.0", (22, 0, 0))])
+def test_version_tuple(text, want):
+    assert llm_bench.version_tuple(text) == want

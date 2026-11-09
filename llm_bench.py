@@ -70,6 +70,12 @@ MAX_RESPONSE_BYTES = 8 * 1024**2  # API reply body cap, enforced before JSON par
 MAX_CONTENT_CHARS = 1024**2        # completion text cap, enforced before anything is written under runs/
 # Only the resolved Rust toolchain is exposed, never ~/.cargo or all of ~/.rustup.
 RUST_SYSROOT = None
+# Likewise only the resolved Node binary and TypeScript package (set by check_toolchains for TypeScript tasks),
+# never the rest of a Node installation (global packages) or the home directory around it.
+NODE_BIN = None
+TS_PACKAGE = None
+NODE_MIN = (22, 0)   # oldest supported Node (major, minor)
+TS_MIN = (5, 5)      # oldest TypeScript that accepts "target": "es2023"
 BASH = "/bin/bash"
 LD_SO_CACHE = "/etc/ld.so.cache"
 GO_CACHE_MOUNT = "/opt/go-cache"   # where sandboxes see the Go build cache
@@ -703,33 +709,99 @@ def clip(text, limit=FEEDBACK_CHARS):
     return text[:head] + "\n[... truncated ...]\n" + text[-(limit - head):]
 
 
+def version_tuple(text):
+    """The numeric parts of a version string: "24.22.1" -> (24, 22, 1), "5.5.0-beta" -> (5, 5, 0), "v22.0.0" ->
+    (22, 0, 0). Raises ValueError without a numeric major and minor version."""
+    parts = []
+    for part in text.strip().removeprefix("v").split("."):
+        match = re.match(r"\d+", part)
+        if not match:
+            break
+        parts.append(int(match.group()))
+        if match.end() < len(part):   # a pre-release or build suffix ends the version
+            break
+    if len(parts) < 2:
+        raise ValueError(f"unrecognized version {text!r}")
+    return tuple(parts)
+
+
+def resolve_rust_sysroot():
+    """The resolved Rust toolchain directory. rustc may be a rustup proxy under ~/.cargo, so the sandbox gets the
+    actual compiler installation instead of the proxy, user home or rustup configuration."""
+    result = subprocess.run(["rustc", "--print", "sysroot"], check=True,
+                            capture_output=True, text=True, timeout=10)
+    sysroot = Path(result.stdout.strip()).resolve(strict=True)
+    if not (sysroot / "bin/rustc").is_file():
+        raise ValueError("Rust sysroot does not contain bin/rustc")
+    return sysroot
+
+
+def resolve_node_bin():
+    """The resolved binary of the `node` on the host PATH, asked from node itself, so version manager shims that
+    dispatch to the real binary work too. Only the last non-empty output line counts: NODE_OPTIONS can make node
+    print warnings first."""
+    result = subprocess.run(["node", "-e", "console.log(JSON.stringify([process.execPath, process.versions.node]))"],
+                            check=True, capture_output=True, text=True, timeout=10)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    try:
+        exec_path, version = json.loads(lines[-1])
+    except (IndexError, ValueError, TypeError) as exc:
+        raise ValueError(f"unexpected output from node: {result.stdout[-200:]!r}") from exc
+    node = Path(exec_path).resolve(strict=True)
+    if not node.is_file():
+        raise ValueError(f"node binary {node} is not a file")
+    if version_tuple(version)[:2] < NODE_MIN:
+        raise ValueError(f"Node {version} at {node} is too old (need {NODE_MIN[0]}+)")
+    return node
+
+
+def resolve_ts_package():
+    """The directory of the typescript package whose bin/tsc is the `tsc` on the host PATH (symlinks followed)."""
+    tsc = Path(shutil.which("tsc")).resolve(strict=True)
+    package = tsc.parent.parent
+    try:
+        meta = json.loads((package / "package.json").read_text())
+    except (OSError, ValueError):
+        meta = None
+    if tsc.name != "tsc" or tsc.parent.name != "bin" or not isinstance(meta, dict) or meta.get("name") != "typescript":
+        raise ValueError(f"tsc at {tsc} isn't inside a typescript package; put a real tsc first on PATH "
+                         "(Volta and asdf shims aren't supported)")
+    version = str(meta.get("version", ""))
+    if version_tuple(version)[:2] < TS_MIN:
+        raise ValueError(f"TypeScript {version} at {package} is too old (need {TS_MIN[0]}.{TS_MIN[1]}+)")
+    return package
+
+
+# Commands looked up on the host PATH, not only the sandbox's: they may live under a home directory (rustup, fnm,
+# nvm), and check_toolchains resolves the parts the sandbox mounts.
+HOST_RESOLVED = {"rustc", "node", "tsc"}
+
+
 def check_toolchains(tasks):
     """Verify the toolchains needed by the selected tasks only."""
-    global RUST_SYSROOT
+    global RUST_SYSROOT, NODE_BIN, TS_PACKAGE
     langs = {t["lang"] for t in tasks}
     needed = {cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"] if not cmd[0].startswith("./")}
     needed |= {tool for lang in langs for tool in LANGS[lang].get("tools", ())}
-    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count. rustc is
-    # looked up on the host PATH (it may be a rustup proxy): the sandbox gets the resolved toolchain below.
+    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count, except for
+    # HOST_RESOLVED commands: the sandbox gets their resolved toolchain below.
     path = os.pathsep.join(sandbox_path_dirs())
     missing = sorted(name for name in needed
-                     if shutil.which(name, path=None if name == "rustc" else path) is None)
+                     if shutil.which(name, path=None if name in HOST_RESOLVED else path) is None)
     if missing:
         sys.exit(f"missing toolchains on PATH: {', '.join(missing)}\n"
-                 f"install them under /usr (the sandbox's PATH has only {path} and the Rust toolchain) "
-                 f"or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
-    if "rust" not in langs:
-        return
-    # rustc may be a rustup proxy under ~/.cargo. Expose the actual compiler
-    # installation instead of the proxy, user home or rustup configuration.
-    try:
-        result = subprocess.run(["rustc", "--print", "sysroot"], check=True,
-                                capture_output=True, text=True, timeout=10)
-        RUST_SYSROOT = Path(result.stdout.strip()).resolve(strict=True)
-        if not (RUST_SYSROOT / "bin/rustc").is_file():
-            raise ValueError("Rust sysroot does not contain bin/rustc")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        sys.exit(f"cannot resolve isolated Rust toolchain: {exc}")
+                 f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
+                 f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
+    if "rust" in langs:
+        try:
+            RUST_SYSROOT = resolve_rust_sysroot()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            sys.exit(f"cannot resolve isolated Rust toolchain: {exc}")
+    if "ts" in langs:
+        try:
+            NODE_BIN, TS_PACKAGE = resolve_node_bin(), resolve_ts_package()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            sys.exit(f"cannot use the TypeScript toolchain: {exc}")
 
 
 class ServerDown(Exception):
