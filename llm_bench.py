@@ -790,6 +790,36 @@ def is_model_error(finish):
     return finish in MODEL_ERRORS or (finish or "").startswith("http_")
 
 
+def add_usage(result, usage, request_seconds, reasoning_complete):
+    """Add one reply's token counts (and, if it reports them, its request time) to the trial's result fields.
+    Returns whether every reply so far reported its reasoning tokens."""
+    result["prompt_tokens"] += usage.get("prompt_tokens") or 0
+    result["completion_tokens"] += usage.get("completion_tokens") or 0
+    if usage.get("completion_tokens") is not None:   # reported, even if 0: a measurement
+        # Throughput's time base: the requests of the replies that report their tokens, no server waits.
+        result["usage_seconds"] += request_seconds
+    # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
+    # the completion tokens of all replies, on another scale. None is an empty cell.
+    reasoning = reasoning_tokens(usage)
+    reasoning_complete = reasoning_complete and reasoning is not None
+    result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning if reasoning_complete else None
+    return reasoning_complete
+
+
+def check_reply(task, text, adir):
+    """Extract the code from a reply, build and test it in adir, and save the reply and the log there.
+    Returns (passed, stage, fail_cmd, fail_out) as run_task does."""
+    code = extract_code(text, task["lang"])
+    if code.strip():
+        passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
+    else:
+        adir.mkdir(parents=True)
+        passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
+    (adir / "response.md").write_text(text)
+    (adir / "log.txt").write_text(run_log)
+    return passed, stage, fail_cmd, fail_out
+
+
 def run_one_task(label, base, model, task, taskdir, opts, stop):
     """Run one trial: all attempts of one task. Returns the result fields of its CSV row."""
     if taskdir.exists():
@@ -815,30 +845,12 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             result["finish_reason"], result["fail_stage"] = error, "request"
             break
         result["finish_reason"] = finish
-        result["prompt_tokens"] += usage.get("prompt_tokens") or 0
-        result["completion_tokens"] += usage.get("completion_tokens") or 0
-        if usage.get("completion_tokens") is not None:   # reported, even if 0: a measurement
-            # Throughput's time base: the requests of the replies that report their tokens, no server waits.
-            result["usage_seconds"] += request_seconds
-        # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
-        # the completion tokens of all replies, on another scale. None is an empty cell.
-        reasoning = reasoning_tokens(usage)
-        if reasoning is None:
-            reasoning_complete = False
-        result["reasoning_tokens"] = (result["reasoning_tokens"] or 0) + reasoning if reasoning_complete else None
+        reasoning_complete = add_usage(result, usage, request_seconds, reasoning_complete)
         if len(text) > MAX_CONTENT_CHARS:  # counted as failure, nothing written to disk
             log(f"{label}: response exceeds {MAX_CONTENT_CHARS} chars", err=True)
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
             break
-        adir = taskdir / f"attempt_{attempt}"
-        code = extract_code(text, task["lang"])
-        if code.strip():
-            passed, run_log, stage, fail_cmd, fail_out = run_task(task, code, adir)
-        else:
-            adir.mkdir(parents=True)
-            passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
-        (adir / "response.md").write_text(text)
-        (adir / "log.txt").write_text(run_log)
+        passed, stage, fail_cmd, fail_out = check_reply(task, text, taskdir / f"attempt_{attempt}")
         result["fail_stage"] = stage
         if passed:
             result["passed"], result["passed_on"] = 1, attempt
