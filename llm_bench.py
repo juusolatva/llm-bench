@@ -206,18 +206,15 @@ def log(msg, err=False):
 
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):
-    """Refuse HTTP redirects. urllib's default handler reads the whole redirect body, without the
-    MAX_RESPONSE_BYTES cap, and sends the Authorization header on to the new location, even on another host
-    (and a redirected POST arrives as a GET without its body anyway)."""
+    """Replaces urllib's redirect handler, which follows redirects: it reads the whole redirect body, without
+    the MAX_RESPONSE_BYTES cap, and sends the Authorization header on to the new location, even on another
+    host (and a redirected POST arrives as a GET without its body anyway). Declining here, before any of
+    that, leaves every 3xx to urllib's default error handler, which raises it as an HTTPError."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        """Raise instead of following, before the default handler reads the body. The caller gets the 3xx
-        status as an HTTPError, like any other HTTP error, but with an empty body: the server's body (often a
-        short HTML page) would replace the reason in chat()'s log, and a stalled one would hold it until the
-        timeout."""
-        fp.close()
-        raise urllib.error.HTTPError(req.full_url, code, f"{msg}; redirect to {newurl[:200]!r} not followed "
-                                     "(use the final URL as the endpoint)", headers, None)
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 HTTP_OPENER = urllib.request.build_opener(NoRedirects)
@@ -232,9 +229,20 @@ def http_json(url, payload=None, timeout=60, api_key=None):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers)
-    with HTTP_OPENER.open(req, timeout=timeout) as r:
-        # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
-        body = r.read(MAX_RESPONSE_BYTES + 1)
+    try:
+        with HTTP_OPENER.open(req, timeout=timeout) as r:
+            # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
+            body = r.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        if not 300 <= e.code < 400:
+            raise
+        # Raise a redirect without its body: the server's body (often a short HTML page) would replace the
+        # reason in chat()'s log, and a stalled one would hold it until the timeout.
+        e.close()
+        location = e.headers.get("Location")
+        target = f"redirect to {urllib.parse.urljoin(url, location)[:200]!r}" if location else "redirect"
+        raise urllib.error.HTTPError(url, e.code, f"{e.reason}; {target} not followed (use the final URL as the "
+                                     "endpoint)", e.headers, None) from None
     if len(body) > MAX_RESPONSE_BYTES:
         raise ValueError(f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes")
     return json.loads(body)

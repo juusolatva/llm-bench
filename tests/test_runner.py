@@ -41,9 +41,9 @@ def test_chat_classifies_failures(mock_server, reply, error):
     assert chat(s)[:4] == ("", None, {}, error)
 
 
-@pytest.mark.parametrize("length", [None, 10**9])   # 10**9: the body stalls
-def test_chat_refuses_redirect(mock_server, capsys, length):
-    s = mock_server(replies=[Reply(status=307, body=b"<html>Moved</html>", length=length,
+@pytest.mark.parametrize(("length", "hold"), [(None, 0), (10**9, 10)])   # a complete body and a stalled one
+def test_chat_refuses_redirect(mock_server, capsys, length, hold):
+    s = mock_server(replies=[Reply(status=307, body=b"<html>Moved</html>", length=length, hold=hold,
                                    headers={"Location": "http://127.0.0.1:9/v1/chat"})])
     t0 = time.monotonic()
     assert chat(s, timeout=5)[:4] == ("", None, {}, "http_307")

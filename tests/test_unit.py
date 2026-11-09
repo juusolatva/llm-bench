@@ -297,15 +297,25 @@ def test_http_json_enforces_size_cap(mock_server, monkeypatch):
         llm_bench.http_json(f"{s.url}/models")
 
 
-@pytest.mark.parametrize("length", [None, 10**9])   # a body that's sent in full, and one that never ends
-def test_http_json_refuses_redirects(mock_server, length):
+@pytest.mark.parametrize(("status", "location", "target"), [
+    (302, "http://127.0.0.1:9/v1/models", "redirect to 'http://127.0.0.1:9/v1/models'"),
+    (308, "https://example.com/v1/models", "redirect to 'https://example.com/v1/models'"),
+    (302, "file:///etc/passwd", "redirect to 'file:///etc/passwd'"),   # urllib refuses this one itself
+    (302, None, "redirect"),
+    (300, "/v1/models/a", "redirect to '{base}/v1/models/a'"),       # urllib has no handler for 300
+])
+def test_http_json_refuses_redirects(mock_server, status, location, target):
     # urllib's default handler would read the whole redirect body (no size cap; here it would wait for the
-    # missing bytes) and send the API key to the new location.
-    s = mock_server(api_key="sekrit", models_reply=Reply(status=302, body=b"x" * 1000, length=length,
-                                                         headers={"Location": "http://127.0.0.1:9/v1/models"}))
-    with pytest.raises(urllib.error.HTTPError, match="not followed") as e:
+    # rest until the timeout) and send the API key to the new location. The error has an empty body.
+    s = mock_server(api_key="sekrit", models_reply=Reply(status=status, body=b"<html>Moved</html>", length=10**9,
+                                                         hold=10, headers={"Location": location} if location else {}))
+    t0 = time.monotonic()
+    with pytest.raises(urllib.error.HTTPError) as e:
         llm_bench.http_json(f"{s.url}/models", timeout=5, api_key="sekrit")
-    assert e.value.code == 302
+    assert time.monotonic() - t0 < 3
+    assert e.value.code == status
+    assert f"; {target.format(base=s.url.removesuffix('/v1'))} not followed (use the final URL" in e.value.reason
+    assert e.value.read() == b""
     assert s.gets == ["/v1/models"]
 
 

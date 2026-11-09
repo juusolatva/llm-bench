@@ -21,6 +21,7 @@ class Reply:
     close: bool = False       # drop the connection without a response
     sleep: float = 0          # delay before answering
     headers: dict | None = None  # with body: extra response headers (e.g. Location for a redirect)
+    hold: float = 0           # with body: keep the connection open this long after the body (a stalled reply)
 
 
 class MockServer:
@@ -45,6 +46,7 @@ class MockServer:
         self.gets = []
         self.requests = []
         self.probes = []
+        self.stopping = threading.Event()   # ends held replies
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -80,6 +82,9 @@ class MockServer:
                 self.send_header("Content-Length", str(reply.length or len(reply.body)))
                 self.end_headers()
                 self.wfile.write(reply.body)
+                if reply.hold:
+                    self.wfile.flush()
+                    server.stopping.wait(reply.hold)
                 return True
 
             def do_GET(self):
@@ -131,6 +136,7 @@ class MockServer:
         return self
 
     def __exit__(self, *exc):
+        self.stopping.set()
         self.httpd.shutdown()
         self.httpd.server_close()
 
