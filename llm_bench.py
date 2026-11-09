@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, Bash and terminal tasks.
+"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, TypeScript, Bash and terminal
+tasks.
 
 Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM Studio,
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
@@ -7,8 +8,8 @@ Tasks are loaded from tasks/<lang>/<task>/ next to this script (see load_tasks).
 Output: results_<endpoint>.csv (one row per trial: one model on one task) and
 runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
-toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils; GNU diffutils, grep, sed and
-gawk for terminal tasks).
+toolchains on PATH: python3, gcc, g++, rustc, go, node + tsc, bash (+ coreutils/findutils; GNU diffutils, grep, sed
+and gawk for terminal tasks).
 Run with --help for usage.
 """
 import argparse
@@ -69,6 +70,13 @@ MAX_RESPONSE_BYTES = 8 * 1024**2  # API reply body cap, enforced before JSON par
 MAX_CONTENT_CHARS = 1024**2        # completion text cap, enforced before anything is written under runs/
 # Only the resolved Rust toolchain is exposed, never ~/.cargo or all of ~/.rustup.
 RUST_SYSROOT = None
+# Likewise only the resolved Node binary and TypeScript package (set by check_toolchains for TypeScript tasks),
+# never the rest of a Node installation (global packages) or the home directory around it.
+NODE_BIN = None
+TS_PACKAGE = None
+NODE_MIN = (22, 0)   # oldest supported Node (major, minor)
+TS_MIN = (5, 5)      # oldest TypeScript that accepts "target": "es2023"
+TS_MAX_MAJOR = 6     # TypeScript 7 runs a native compiler from separate platform packages the sandbox doesn't mount
 BASH = "/bin/bash"
 LD_SO_CACHE = "/etc/ld.so.cache"
 GO_CACHE_MOUNT = "/opt/go-cache"   # where sandboxes see the Go build cache
@@ -94,6 +102,23 @@ SH_HARNESS = "test.sh"   # the harness file of the Bash and terminal tasks
 # last check (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
 # directory mode (no package argument) because package mode hides a passing test binary's output. A Rust harness
 # is its own crate that uses the solution's public API, and libtest's summary line is its final line.
+# TypeScript compiles solution and harness with a fixed tsconfig.json (strict, ES2023 + DOM libraries, no @types)
+# and runs the output on Node; "strip_ansi" removes the color codes of tsc's "pretty" output, which also shows
+# the failing source line.
+TS_CONFIG = """\
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2023",
+    "lib": ["es2023", "dom"],
+    "module": "nodenext",
+    "types": [],
+    "outDir": "out",
+    "pretty": true
+  },
+  "files": ["solution.ts", "test.ts"]
+}
+"""
 LANGS = {
     "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py", "tags": ("python", "py", "python3"),
                "cmds": [["python3", "test_solution.py"]], "final_line": HARNESS_FINAL_LINE},
@@ -112,6 +137,10 @@ LANGS = {
     "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
            "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
+    "ts": {"prefix": "ts", "sol": "solution.ts", "test": "test.ts", "tags": ("typescript", "ts"),
+           "extra": {"package.json": '{"type": "module"}\n', "tsconfig.json": TS_CONFIG},
+           "cmds": [["tsc", "--project", "tsconfig.json"], ["node", "out/test.js"]],
+           "final_line": HARNESS_FINAL_LINE, "strip_ansi": True},
     "bash": {"prefix": "bash", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
              "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE},
     # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
@@ -199,6 +228,7 @@ FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")   # terminal color/style sequences (CSI)
 
 
 def safe_name(name):
@@ -448,9 +478,10 @@ def stop_active_units():
 
 
 def sandbox_path_dirs():
-    """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT): the host PATH
-    entries under /usr, such as /usr/local/go/bin, then /usr/bin and /bin. Home, project and relative entries are
-    left out because the sandbox doesn't expose them."""
+    """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT) and Node with
+    tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
+    then /usr/bin and /bin. Home, project and relative entries are left out because the sandbox doesn't expose
+    them."""
     system_path = [path for path in os.get_exec_path()
                    if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")]
     return [*system_path, "/usr/bin", "/bin"]
@@ -469,6 +500,12 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
         sandbox += ["--ro-bind", LD_SO_CACHE, LD_SO_CACHE]
     if RUST_SYSROOT is not None:
         sandbox += ["--ro-bind", str(RUST_SYSROOT), "/opt/rust"]
+    # Node and TypeScript: the binary and the package only (see check_toolchains), with tsc next to node.
+    if NODE_BIN is not None:
+        sandbox += ["--ro-bind", str(NODE_BIN), "/opt/node/bin/node"]
+    if TS_PACKAGE is not None:
+        sandbox += ["--ro-bind", str(TS_PACKAGE), "/opt/typescript",
+                    "--symlink", "/opt/typescript/bin/tsc", "/opt/node/bin/tsc"]
     sandbox += ["--proc", "/proc", "--dev", "/dev",
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/tmp",
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/work",
@@ -477,7 +514,7 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
         sandbox += ["--bind", str(go_cache_rw), GO_CACHE_MOUNT]
     elif GO_CACHE is not None:
         sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", GO_CACHE_MOUNT]
-    sandbox_path = ":".join(["/opt/rust/bin", *sandbox_path_dirs()])
+    sandbox_path = ":".join(["/opt/rust/bin", "/opt/node/bin", *sandbox_path_dirs()])
     for key, value in {
         "PATH": sandbox_path, "HOME": "/tmp", "TMPDIR": "/tmp", "LC_ALL": "C",
         "GOCACHE": GO_CACHE_MOUNT if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
@@ -558,6 +595,18 @@ def check_sandbox():
         rc, out, _ = run_cmd(["/usr/bin/true"], Path(directory))
     if rc != 0:
         sys.exit(f"sandbox unavailable; refusing to run generated code:\n{out}")
+
+
+def check_ts_sandbox(tasks):
+    """With TypeScript tasks, check that tsc starts inside the sandbox, so a toolchain the two mounts can't carry
+    (a compiler that needs files outside the typescript package) stops the run instead of failing every build."""
+    if not any(t["lang"] == "ts" for t in tasks):
+        return
+    with tempfile.TemporaryDirectory(prefix="llm-sandbox-check-") as directory:
+        rc, out, _ = run_cmd(["tsc", "--version"], Path(directory))
+    if rc != 0:
+        sys.exit("tsc doesn't run inside the sandbox, which sees only the Node binary and the typescript package "
+                 f"(TypeScript builds that need other files aren't supported):\n{out}")
 
 
 GO_WARM_TEST = """package solution
@@ -652,6 +701,8 @@ def run_task(task, code, workdir):
     # Build and execute in one sandbox so private compiler outputs persist only
     # for this attempt. Parent-owned source/transcript files are read-only inputs.
     rc, out, timed_out = run_cmd([BASH, "-ec", "\n".join(script)], workdir)
+    if lang.get("strip_ansi"):
+        out = ANSI_RE.sub("", out)
     if rc == 0:
         if finished(out, rendered[-1], lang["final_line"]):
             return True, f"{out}\n[exit {rc}]", None, None, None
@@ -678,33 +729,104 @@ def clip(text, limit=FEEDBACK_CHARS):
     return text[:head] + "\n[... truncated ...]\n" + text[-(limit - head):]
 
 
+def version_tuple(text):
+    """The numeric parts of a version string: "24.22.1" -> (24, 22, 1), "5.5.0-beta" -> (5, 5, 0), "v22.0.0" ->
+    (22, 0, 0). Raises ValueError without a numeric major and minor version."""
+    parts = []
+    for part in text.strip().removeprefix("v").split("."):
+        match = re.match(r"\d+", part)
+        if not match:
+            break
+        parts.append(int(match.group()))
+        if match.end() < len(part):   # a pre-release or build suffix ends the version
+            break
+    if len(parts) < 2:
+        raise ValueError(f"unrecognized version {text!r}")
+    return tuple(parts)
+
+
+def resolve_rust_sysroot():
+    """The resolved Rust toolchain directory. rustc may be a rustup proxy under ~/.cargo, so the sandbox gets the
+    actual compiler installation instead of the proxy, user home or rustup configuration."""
+    result = subprocess.run(["rustc", "--print", "sysroot"], check=True,
+                            capture_output=True, text=True, timeout=10)
+    sysroot = Path(result.stdout.strip()).resolve(strict=True)
+    if not (sysroot / "bin/rustc").is_file():
+        raise ValueError("Rust sysroot does not contain bin/rustc")
+    return sysroot
+
+
+def resolve_node_bin():
+    """The resolved binary of the `node` on the host PATH, asked from node itself, so version manager shims that
+    dispatch to the real binary work too. Only the last non-empty output line counts: NODE_OPTIONS can make node
+    print warnings first."""
+    result = subprocess.run(["node", "-e", "console.log(JSON.stringify([process.execPath, process.versions.node]))"],
+                            check=True, capture_output=True, text=True, timeout=10)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    try:
+        exec_path, version = json.loads(lines[-1])
+    except (IndexError, ValueError, TypeError) as exc:
+        raise ValueError(f"unexpected output from node: {result.stdout[-200:]!r}") from exc
+    node = Path(exec_path).resolve(strict=True)
+    if not node.is_file():
+        raise ValueError(f"node binary {node} is not a file")
+    if version_tuple(version)[:2] < NODE_MIN:
+        raise ValueError(f"Node {version} at {node} is too old (need {NODE_MIN[0]}+)")
+    return node
+
+
+def resolve_ts_package():
+    """The directory of the typescript package whose bin/tsc is the `tsc` on the host PATH (symlinks followed)."""
+    tsc = Path(shutil.which("tsc")).resolve(strict=True)
+    package = tsc.parent.parent
+    try:
+        meta = json.loads((package / "package.json").read_text())
+    except (OSError, ValueError):
+        meta = None
+    if tsc.name != "tsc" or tsc.parent.name != "bin" or not isinstance(meta, dict) or meta.get("name") != "typescript":
+        raise ValueError(f"tsc at {tsc} isn't inside a typescript package; put a real tsc first on PATH "
+                         "(wrappers such as Volta, asdf or pnpm shims aren't supported)")
+    version = str(meta.get("version", ""))
+    parsed = version_tuple(version)
+    if parsed[:2] < TS_MIN:
+        raise ValueError(f"TypeScript {version} at {package} is too old (need {TS_MIN[0]}.{TS_MIN[1]}+)")
+    if parsed[0] > TS_MAX_MAJOR:
+        raise ValueError(f"TypeScript {version} at {package} isn't supported (need {TS_MIN[0]}.{TS_MIN[1]} to "
+                         f"{TS_MAX_MAJOR}.x; its native compiler lives outside the typescript package): "
+                         f"npm install -g typescript@{TS_MAX_MAJOR}")
+    return package
+
+
+# Commands looked up on the host PATH, not only the sandbox's: they may live under a home directory (rustup, fnm,
+# nvm), and check_toolchains resolves the parts the sandbox mounts.
+HOST_RESOLVED = {"rustc", "node", "tsc"}
+
+
 def check_toolchains(tasks):
     """Verify the toolchains needed by the selected tasks only."""
-    global RUST_SYSROOT
+    global RUST_SYSROOT, NODE_BIN, TS_PACKAGE
     langs = {t["lang"] for t in tasks}
     needed = {cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"] if not cmd[0].startswith("./")}
     needed |= {tool for lang in langs for tool in LANGS[lang].get("tools", ())}
-    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count. rustc is
-    # looked up on the host PATH (it may be a rustup proxy): the sandbox gets the resolved toolchain below.
+    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count, except for
+    # HOST_RESOLVED commands: the sandbox gets their resolved toolchain below.
     path = os.pathsep.join(sandbox_path_dirs())
     missing = sorted(name for name in needed
-                     if shutil.which(name, path=None if name == "rustc" else path) is None)
+                     if shutil.which(name, path=None if name in HOST_RESOLVED else path) is None)
     if missing:
         sys.exit(f"missing toolchains on PATH: {', '.join(missing)}\n"
-                 f"install them under /usr (the sandbox's PATH has only {path} and the Rust toolchain) "
-                 f"or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
-    if "rust" not in langs:
-        return
-    # rustc may be a rustup proxy under ~/.cargo. Expose the actual compiler
-    # installation instead of the proxy, user home or rustup configuration.
-    try:
-        result = subprocess.run(["rustc", "--print", "sysroot"], check=True,
-                                capture_output=True, text=True, timeout=10)
-        RUST_SYSROOT = Path(result.stdout.strip()).resolve(strict=True)
-        if not (RUST_SYSROOT / "bin/rustc").is_file():
-            raise ValueError("Rust sysroot does not contain bin/rustc")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        sys.exit(f"cannot resolve isolated Rust toolchain: {exc}")
+                 f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
+                 f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
+    if "rust" in langs:
+        try:
+            RUST_SYSROOT = resolve_rust_sysroot()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            sys.exit(f"cannot resolve isolated Rust toolchain: {exc}")
+    if "ts" in langs:
+        try:
+            NODE_BIN, TS_PACKAGE = resolve_node_bin(), resolve_ts_package()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            sys.exit(f"cannot use the TypeScript toolchain: {exc}")
 
 
 class ServerDown(Exception):
@@ -1690,6 +1812,7 @@ def main():
 
     check_toolchains(tasks)
     check_sandbox()
+    check_ts_sandbox(tasks)
     args.run_id = new_run_id()
     settings = settings_fingerprint(args)
     args.settings_hash = settings_hash(settings)

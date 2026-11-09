@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -331,6 +332,10 @@ def test_builtin_tasks_are_consistent():
     assert all(n == 4 for n in per_lang.values())
     assert all(sum(t["lang"] == lang and "_fix_" in t["name"] for t in BUILTIN_TASKS) == 1
                for lang in llm_bench.LANGS)
+    # TypeScript prompts end with the same rules paragraph (no Node modules or globals, solution.ts, no tests).
+    ts_rules = {t["prompt"].rsplit("\n\n", 1)[-1] for t in BUILTIN_TASKS if t["lang"] == "ts"}
+    assert len(ts_rules) == 1
+    assert next(iter(ts_rules)).startswith("Write the code in `solution.ts`.")
 
 
 @pytest.mark.parametrize("task", BUILTIN_TASKS, ids=[t["name"] for t in BUILTIN_TASKS])
@@ -349,6 +354,15 @@ def test_builtin_harnesses_print_the_final_line(task):
         assert test.count(done) == 1
     if task["lang"] == "go":
         assert "func TestMain(m *testing.M)" in test
+    if task["lang"] == "ts":
+        # Named imports from the compiled solution module only, so a missing export is a compile error naming it.
+        assert re.search(r'^import \{[^}]+\} from "\./solution\.js";$', test, re.MULTILINE)
+        assert "import *" not in test
+        assert "node:" not in test
+        # Module-scope declarations carry the harness_ prefix (AGENTS.md), even though imports are named.
+        unprefixed = re.findall(r"^(?:const|let|var|function|class|type|interface|async function) (?!harness_)(\w+)",
+                                test, re.MULTILINE)
+        assert not unprefixed, f"unprefixed harness declarations: {unprefixed}"
 
 
 def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):
@@ -590,8 +604,8 @@ def bwrap_options(args, name, nargs):
 
 
 def test_sandbox_command_isolates_the_command(monkeypatch, tmp_path):
-    monkeypatch.setattr(llm_bench, "GO_CACHE", None)
-    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", None)
+    for name in ("GO_CACHE", "RUST_SYSROOT", "NODE_BIN", "TS_PACKAGE"):   # set by check_toolchains in earlier tests
+        monkeypatch.setattr(llm_bench, name, None)
     _, bwrap = sandbox_args(tmp_path)
     for flag in ("--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
                  "--clearenv"):
@@ -642,6 +656,28 @@ def test_sandbox_command_mounts_the_rust_sysroot(monkeypatch, tmp_path):
     monkeypatch.setattr(llm_bench, "RUST_SYSROOT", tmp_path / "rust")
     _, bwrap = sandbox_args(tmp_path)
     assert (str(tmp_path / "rust"), "/opt/rust") in bwrap_options(bwrap, "--ro-bind", 2)
+
+
+def test_sandbox_command_mounts_node_and_typescript(monkeypatch, tmp_path):
+    """Only the Node binary and the typescript package are exposed, independently of each other (here a system
+    Node and a tsc from an npm prefix), with tsc on the sandbox's PATH next to node."""
+    monkeypatch.setattr(llm_bench, "NODE_BIN", tmp_path / "usr/bin/node-24")
+    monkeypatch.setattr(llm_bench, "TS_PACKAGE", tmp_path / "prefix/lib/node_modules/typescript")
+    _, bwrap = sandbox_args(tmp_path)
+    binds = bwrap_options(bwrap, "--ro-bind", 2)
+    assert (str(tmp_path / "usr/bin/node-24"), "/opt/node/bin/node") in binds
+    assert (str(tmp_path / "prefix/lib/node_modules/typescript"), "/opt/typescript") in binds
+    assert bwrap_options(bwrap, "--symlink", 2) == [("/opt/typescript/bin/tsc", "/opt/node/bin/tsc")]
+    assert bwrap.index("--symlink") > bwrap.index("/opt/node/bin/node")   # after the bind that creates the dir
+    assert dict(bwrap_options(bwrap, "--setenv", 2))["PATH"].startswith("/opt/rust/bin:/opt/node/bin:")
+
+
+def test_sandbox_command_without_node(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_bench, "NODE_BIN", None)
+    monkeypatch.setattr(llm_bench, "TS_PACKAGE", None)
+    _, bwrap = sandbox_args(tmp_path)
+    assert not any(dest.startswith(("/opt/node", "/opt/typescript")) for _, dest in bwrap_options(bwrap, "--ro-bind", 2))
+    assert not bwrap_options(bwrap, "--symlink", 2)
 
 
 @pytest.fixture
@@ -728,6 +764,45 @@ def test_run_task_failure_stage(monkeypatch, tmp_path, output, rc, timed_out, st
     assert not (tmp_path / "w" / "stale").exists()   # the work directory starts empty
 
 
+def test_ts_tsconfig_extra():
+    cfg = json.loads(llm_bench.LANGS["ts"]["extra"]["tsconfig.json"])
+    assert cfg["compilerOptions"] == {"strict": True, "target": "es2023", "lib": ["es2023", "dom"],
+                                      "module": "nodenext", "types": [], "outDir": "out", "pretty": True}
+    assert cfg["files"] == ["solution.ts", "test.ts"]
+    assert json.loads(llm_bench.LANGS["ts"]["extra"]["package.json"]) == {"type": "module"}
+
+
+def test_run_task_strips_ansi_for_ts(monkeypatch, tmp_path):
+    """tsc's pretty output is colored; the model gets it without escape sequences."""
+    rendered = [llm_bench.shlex.join(c) for c in llm_bench.LANGS["ts"]["cmds"]]
+    out = f"$ {rendered[0]}\n$ {rendered[1]}\n\x1b[96mok\x1b[0m\n\x1b[1m{llm_bench.HARNESS_FINAL_LINE}\x1b[0m\n"
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(0, out, False))
+    ok, log, *_ = llm_bench.run_task({"lang": "ts", "test": "harness"}, "code", tmp_path / "w")
+    assert ok
+    assert "\x1b" not in log
+    assert (tmp_path / "w" / "tsconfig.json").is_file()
+    assert (tmp_path / "w" / "package.json").is_file()
+    fail = f"$ {rendered[0]}\ntest.ts:2:7 - \x1b[91merror\x1b[0m TS2322\n"
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(2, fail, False))
+    ok, _, stage, cmd, fail_out = llm_bench.run_task({"lang": "ts", "test": "harness"}, "code", tmp_path / "w")
+    assert (ok, stage, cmd) == (False, "build", rendered[0])
+    assert fail_out == f"$ {rendered[0]}\ntest.ts:2:7 - error TS2322\n"
+
+
+def test_run_task_keeps_ansi_for_other_languages(monkeypatch, tmp_path):
+    rendered = [llm_bench.shlex.join(c) for c in llm_bench.LANGS["c"]["cmds"]]
+    out = f"$ {rendered[0]}\n$ {rendered[1]}\n\x1b[1mFAIL\x1b[0m\n"
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(1, out, False))
+    assert llm_bench.run_task({"lang": "c", "test": "h"}, "code", tmp_path / "w")[4] == out
+
+
+def test_extract_code_prefers_the_ts_block():
+    reply = 'Input:\n```json\n{"name": "a"}\n```\nSolution:\n```ts\nexport const a = 1;\n```\n'
+    assert llm_bench.extract_code(reply, "ts").strip() == "export const a = 1;"
+    reply = 'Run:\n```bash\nnode x\n```\n```typescript\nexport const b = 2;\n```\n'
+    assert llm_bench.extract_code(reply, "ts").strip() == "export const b = 2;"
+
+
 def go_cache_run_cmd(results, cache_writes=False):
     """A run_cmd stub for prepare_go_cache: answers the warm-up and the probe from `results` in order."""
     calls = []
@@ -776,3 +851,118 @@ def test_check_toolchains_rejects_a_sysroot_without_rustc(monkeypatch, tmp_path)
     rustc_sysroot(monkeypatch, tmp_path)
     with pytest.raises(SystemExit, match="does not contain bin/rustc"):
         llm_bench.check_toolchains([{"lang": "rust"}])
+
+
+def fake_ts_toolchain(monkeypatch, tmp_path, ts_version="6.0.3", node_version="24.22.1", name="typescript",
+                      node_stdout=None):
+    """tmp_path/install/{bin/node, lib/node_modules/typescript}; tsc on PATH is tmp_path/shims/tsc, a symlink to
+    install/bin/tsc, itself a relative symlink into the package (as with fnm). Returns (node, package)."""
+    install = tmp_path / "install"
+    pkg = install / "lib/node_modules/typescript"
+    (pkg / "bin").mkdir(parents=True)
+    (pkg / "bin/tsc").write_text("#!/usr/bin/env node\n")
+    (pkg / "package.json").write_text(json.dumps({"name": name, "version": ts_version}))
+    (install / "bin").mkdir()
+    (install / "bin/node").write_text("")
+    (install / "bin/tsc").symlink_to("../lib/node_modules/typescript/bin/tsc")
+    (tmp_path / "shims").mkdir()
+    (tmp_path / "shims/tsc").symlink_to(install / "bin/tsc")
+    stdout = node_stdout if node_stdout is not None else json.dumps([str(install / "bin/node"), node_version]) + "\n"
+    paths = {"tsc": str(tmp_path / "shims/tsc"), "node": "/home/someone/.fnm/node"}
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name, path=None: paths.get(name, f"/usr/bin/{name}"))
+    monkeypatch.setattr(llm_bench.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout=stdout))
+    monkeypatch.setattr(llm_bench, "NODE_BIN", None)
+    monkeypatch.setattr(llm_bench, "TS_PACKAGE", None)
+    return (install / "bin/node").resolve(), pkg.resolve()
+
+
+def test_check_toolchains_resolves_node_and_typescript(monkeypatch, tmp_path):
+    node, pkg = fake_ts_toolchain(monkeypatch, tmp_path)
+    llm_bench.check_toolchains([{"lang": "ts"}])
+    assert (node, pkg) == (llm_bench.NODE_BIN, llm_bench.TS_PACKAGE)
+
+
+def test_check_toolchains_ignores_node_noise(monkeypatch, tmp_path):
+    """Lines before node's answer (e.g. warnings caused by NODE_OPTIONS) are ignored."""
+    install = tmp_path / "install"
+    noise = "(node:1) Warning: something\n\n" + json.dumps([str(install / "bin/node"), "22.0.0"]) + "\n"
+    node, _ = fake_ts_toolchain(monkeypatch, tmp_path, node_stdout=noise)
+    llm_bench.check_toolchains([{"lang": "ts"}])
+    assert node == llm_bench.NODE_BIN
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"ts_version": "5.4.5"}, r"TypeScript 5\.4\.5 at .* is too old \(need 5\.5\+\)"),
+    ({"node_version": "21.7.3"}, r"Node 21\.7\.3 at .* is too old \(need 22\+\)"),
+    ({"name": "not-typescript"}, r"tsc at .* isn't inside a typescript package; .*pnpm"),
+    ({"ts_version": "7.0.2"}, r"TypeScript 7\.0\.2 at .* isn't supported \(need 5\.5 to 6\.x.*typescript@6"),
+    ({"node_stdout": "not json\n"}, r"cannot use the TypeScript toolchain"),
+])
+def test_check_toolchains_rejects_unusable_ts_toolchains(monkeypatch, tmp_path, kwargs, message):
+    fake_ts_toolchain(monkeypatch, tmp_path, **kwargs)
+    with pytest.raises(SystemExit, match=message):
+        llm_bench.check_toolchains([{"lang": "ts"}])
+
+
+@pytest.mark.parametrize("kwargs", [{"ts_version": "5.5.0"}, {"ts_version": "5.5.0-beta"}, {"ts_version": "6.9.9"},
+                                    {"node_version": "22.0.0"}])
+def test_check_toolchains_accepts_the_minimum_versions(monkeypatch, tmp_path, kwargs):
+    fake_ts_toolchain(monkeypatch, tmp_path, **kwargs)
+    llm_bench.check_toolchains([{"lang": "ts"}])
+
+
+def test_check_toolchains_reports_missing_node_and_tsc(monkeypatch):
+    monkeypatch.setattr(llm_bench.shutil, "which",
+                        lambda name, path=None: None if name in ("node", "tsc") else f"/usr/bin/{name}")
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: node, tsc\n"):
+        llm_bench.check_toolchains([{"lang": "ts"}])
+
+
+def test_check_toolchains_leaves_node_alone_without_ts_tasks(monkeypatch):
+    monkeypatch.setattr(llm_bench.shutil, "which",
+                        lambda name, path=None: None if name in ("node", "tsc") else f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench.subprocess, "run", lambda *a, **kw: pytest.fail("must not run node"))
+    llm_bench.check_toolchains([{"lang": "python"}, {"lang": "c"}])
+
+
+def test_check_toolchains_resolves_rust_and_ts_together(monkeypatch, tmp_path):
+    """Neither language's resolution ends the check before the other's."""
+    node, pkg = fake_ts_toolchain(monkeypatch, tmp_path)
+    sysroot = tmp_path / "rust"
+    (sysroot / "bin").mkdir(parents=True)
+    (sysroot / "bin/rustc").touch()
+    answers = {"rustc": f"{sysroot}\n"}
+    ts_answer = json.dumps([str(node), "24.22.1"]) + "\n"
+    monkeypatch.setattr(llm_bench.subprocess, "run",
+                        lambda cmd, **kw: SimpleNamespace(stdout=answers.get(cmd[0], ts_answer)))
+    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", None)
+    llm_bench.check_toolchains([{"lang": "rust"}, {"lang": "ts"}])
+    assert (sysroot.resolve(), node, pkg) == (llm_bench.RUST_SYSROOT, llm_bench.NODE_BIN, llm_bench.TS_PACKAGE)
+
+
+@pytest.mark.parametrize(("text", "want"), [("24.22.1", (24, 22, 1)), ("5.5.0-beta", (5, 5, 0)), ("v22.0.0", (22, 0, 0))])
+def test_version_tuple(text, want):
+    assert llm_bench.version_tuple(text) == want
+
+
+def test_check_ts_sandbox_runs_tsc_in_the_sandbox(monkeypatch):
+    """tsc must start inside the sandbox, so a toolchain the mounts can't carry (e.g. a compiler that needs files
+    outside the typescript package) fails at startup instead of failing every solution's build."""
+    calls = []
+    monkeypatch.setattr(llm_bench, "run_cmd",
+                        lambda cmd, cwd: calls.append(cmd) or llm_bench.CmdResult(0, "Version 6.0.3\n", False))
+    llm_bench.check_ts_sandbox([{"lang": "ts"}])
+    assert calls == [["tsc", "--version"]]
+
+
+def test_check_ts_sandbox_exits_when_tsc_fails(monkeypatch):
+    monkeypatch.setattr(llm_bench, "run_cmd",
+                        lambda cmd, cwd: llm_bench.CmdResult(1, "Error: Cannot find module '@typescript/native'", False))
+    with pytest.raises(SystemExit, match=r"(?s)tsc doesn't run inside the sandbox.*Cannot find module"):
+        llm_bench.check_ts_sandbox([{"lang": "ts"}])
+
+
+def test_check_ts_sandbox_skips_without_ts_tasks(monkeypatch):
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: pytest.fail("must not run the sandbox"))
+    llm_bench.check_ts_sandbox([{"lang": "python"}])
+
