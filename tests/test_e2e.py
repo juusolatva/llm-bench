@@ -1,5 +1,6 @@
 """End-to-end tests against a mock server. They run model "output" in the real sandbox."""
 import csv
+import shlex
 import signal
 import socket
 import subprocess
@@ -86,6 +87,36 @@ def test_unreachable_endpoint_is_skipped(monkeypatch, tmp_path, mock_server):
 def test_sandbox_hides_home(tmp_path):
     out = llm_bench.run_cmd(["/bin/bash", "-c", f"ls {Path.home()} || echo HIDDEN"], tmp_path).out
     assert "HIDDEN" in out
+
+
+def test_sandbox_exposes_only_node_and_typescript(tmp_path, monkeypatch):
+    """With TypeScript tasks, the sandbox sees the Node binary and the typescript package read-only, and nothing
+    else of the Node installation (npm and global packages next to them) or the home directory around it. (The
+    directories bwrap creates for the mounts are on the sandbox's private root tmpfs, like /opt itself.)"""
+    for name in ("NODE_BIN", "TS_PACKAGE"):
+        monkeypatch.setattr(llm_bench, name, getattr(llm_bench, name))   # restored after the test
+    try:
+        llm_bench.check_toolchains([{"lang": "ts"}])
+    except SystemExit as exc:
+        pytest.skip(str(exc))
+    install = llm_bench.NODE_BIN.parent.parent
+    script = f"""
+ls -A /opt/node/bin | tr '\\n' ' '; echo
+test -e {shlex.quote(str(install))} && echo INSTALL-VISIBLE
+test -e /opt/typescript/package.json && echo PACKAGE-OK
+touch /opt/typescript/x 2>/dev/null && echo PACKAGE-WRITABLE
+[ -w /opt/typescript/package.json ] && echo PACKAGE-WRITABLE
+[ -w /opt/node/bin/node ] && echo NODE-WRITABLE
+ls {shlex.quote(str(Path.home()))} >/dev/null 2>&1 && echo HOME-VISIBLE
+tsc --version
+"""
+    out = llm_bench.run_cmd(["/bin/bash", "-c", script], tmp_path).out
+    lines = out.splitlines()
+    assert lines[0].split() == ["node", "tsc"]
+    assert "PACKAGE-OK" in lines
+    for leak in ("INSTALL-VISIBLE", "PACKAGE-WRITABLE", "NODE-WRITABLE", "HOME-VISIBLE"):
+        assert leak not in lines
+    assert any(line.startswith("Version ") for line in lines)
 
 
 def test_sandbox_has_no_network(tmp_path):

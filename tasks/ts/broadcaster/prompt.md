@@ -33,7 +33,7 @@ Times (`now`) are in milliseconds. All chunks are ASCII, so a chunk's size in by
 
 Writing a chunk to a registered client: if `client.bufferedBytes + chunk.length > maxBufferedBytes`, destroy the client instead (call `client.destroy()` and unregister it). Otherwise call `client.write(chunk)`; if it returns `false`, the client is blocked since `now`.
 
-- `add(client, snapshot, now)` registers the client and writes `snapshot` to it. Adding a client that is already registered does nothing: no snapshot, and its state doesn't change. A client that was removed or destroyed can be added again as a new client.
+- `add(client, snapshot, now)` registers the client and then writes `snapshot` to it, so a client whose snapshot breaks the writing rule is counted and then destroyed. Adding a client that is already registered does nothing: no snapshot, and its state doesn't change. A client that was removed or destroyed can be added again as a new client.
 - `broadcast(update, now)` writes `update` to every registered client that isn't blocked. A blocked client gets nothing, but remembers that it missed an update.
 - `ping(now)` writes `": ping\n\n"` to every registered client that isn't blocked. Blocked clients skip it, and it isn't remembered.
 - `drained(client, now)` unblocks a blocked client. If the client missed an update while blocked, the latest update passed to `broadcast` is written to it once, following the writing rule above (so the client can be destroyed or blocked again). For a client that isn't registered or isn't blocked, it does nothing.

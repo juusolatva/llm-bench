@@ -121,7 +121,7 @@ class harness_Run {
   }
 }
 
-const PING = ": ping\n\n";
+const harness_PING = ": ping\n\n";
 
 function harness_basics(): void {
   const r = new harness_Run();
@@ -137,8 +137,8 @@ function harness_basics(): void {
   r.expectWritten(c1, ["S", "U1"]);
   r.expectWritten(c2, ["S", "U1"]);
   r.ping(2);
-  r.expectWritten(c1, ["S", "U1", PING]);
-  r.expectWritten(c2, ["S", "U1", PING]);
+  r.expectWritten(c1, ["S", "U1", harness_PING]);
+  r.expectWritten(c2, ["S", "U1", harness_PING]);
   r.expectDestroyed(c1, 0);
   r.expectDestroyed(c2, 0);
 }

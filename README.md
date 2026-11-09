@@ -165,7 +165,7 @@ If the server itself becomes unreachable, the benchmark retries the request afte
 
 ## TypeScript tasks
 
-The solution and harness are compiled with a fixed `tsconfig.json` (`strict`, target ES2023, the ES2023 and DOM libraries, `"types": []`) and run with `node` as ES modules. There is no `@types/node`, so solutions can use the ECMAScript standard library and the web-standard globals Node also provides (`console`, `URL`, `setTimeout`, ...), but no Node modules or globals such as `process`; the prompts say so. `tsc` prints its errors with the offending source line, and the benchmark removes the color codes from that output before sending it back to the model.
+The solution and harness are compiled with a fixed `tsconfig.json` (`strict`, target ES2023, the ES2023 and DOM libraries, `"types": []`) and run with `node` as ES modules. There is no `@types/node`, so solutions can use the ECMAScript standard library and the web-standard globals Node also provides (`console`, `URL`, `setTimeout`, ...), but no Node modules or globals such as `process`; the prompts say so. `tsc` prints its errors with the offending source line, and the benchmark removes the color codes from that output before sending it back to the model. At startup the benchmark checks that `tsc` runs inside the sandbox, so a TypeScript install that needs files outside its own package stops the run instead of failing every solution.
 
 ## Sandbox
 

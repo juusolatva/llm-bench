@@ -355,6 +355,10 @@ def test_builtin_harnesses_print_the_final_line(task):
         assert re.search(r'^import \{[^}]+\} from "\./solution\.js";$', test, re.MULTILINE)
         assert "import *" not in test
         assert "node:" not in test
+        # Module-scope declarations carry the harness_ prefix (AGENTS.md), even though imports are named.
+        unprefixed = re.findall(r"^(?:const|let|var|function|class|type|interface|async function) (?!harness_)(\w+)",
+                                test, re.MULTILINE)
+        assert not unprefixed, f"unprefixed harness declarations: {unprefixed}"
 
 
 def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):
@@ -933,3 +937,26 @@ def test_check_toolchains_resolves_rust_and_ts_together(monkeypatch, tmp_path):
 @pytest.mark.parametrize(("text", "want"), [("24.22.1", (24, 22, 1)), ("5.5.0-beta", (5, 5, 0)), ("v22.0.0", (22, 0, 0))])
 def test_version_tuple(text, want):
     assert llm_bench.version_tuple(text) == want
+
+
+def test_check_ts_sandbox_runs_tsc_in_the_sandbox(monkeypatch):
+    """tsc must start inside the sandbox, so a toolchain the mounts can't carry (e.g. a compiler that needs files
+    outside the typescript package) fails at startup instead of failing every solution's build."""
+    calls = []
+    monkeypatch.setattr(llm_bench, "run_cmd",
+                        lambda cmd, cwd: calls.append(cmd) or llm_bench.CmdResult(0, "Version 6.0.3\n", False))
+    llm_bench.check_ts_sandbox([{"lang": "ts"}])
+    assert calls == [["tsc", "--version"]]
+
+
+def test_check_ts_sandbox_exits_when_tsc_fails(monkeypatch):
+    monkeypatch.setattr(llm_bench, "run_cmd",
+                        lambda cmd, cwd: llm_bench.CmdResult(1, "Error: Cannot find module '@typescript/native'", False))
+    with pytest.raises(SystemExit, match=r"(?s)tsc doesn't run inside the sandbox.*Cannot find module"):
+        llm_bench.check_ts_sandbox([{"lang": "ts"}])
+
+
+def test_check_ts_sandbox_skips_without_ts_tasks(monkeypatch):
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: pytest.fail("must not run the sandbox"))
+    llm_bench.check_ts_sandbox([{"lang": "python"}])
+

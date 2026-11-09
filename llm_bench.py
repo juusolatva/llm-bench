@@ -596,6 +596,18 @@ def check_sandbox():
         sys.exit(f"sandbox unavailable; refusing to run generated code:\n{out}")
 
 
+def check_ts_sandbox(tasks):
+    """With TypeScript tasks, check that tsc starts inside the sandbox, so a toolchain the two mounts can't carry
+    (a compiler that needs files outside the typescript package) stops the run instead of failing every build."""
+    if not any(t["lang"] == "ts" for t in tasks):
+        return
+    with tempfile.TemporaryDirectory(prefix="llm-sandbox-check-") as directory:
+        rc, out, _ = run_cmd(["tsc", "--version"], Path(directory))
+    if rc != 0:
+        sys.exit("tsc doesn't run inside the sandbox, which sees only the Node binary and the typescript package "
+                 f"(TypeScript builds that need other files aren't supported):\n{out}")
+
+
 GO_WARM_TEST = """package solution
 
 import (
@@ -1794,6 +1806,7 @@ def main():
 
     check_toolchains(tasks)
     check_sandbox()
+    check_ts_sandbox(tasks)
     args.run_id = new_run_id()
     settings = settings_fingerprint(args)
     args.settings_hash = settings_hash(settings)
