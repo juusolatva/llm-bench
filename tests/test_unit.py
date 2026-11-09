@@ -645,6 +645,28 @@ def test_sandbox_command_mounts_the_rust_sysroot(monkeypatch, tmp_path):
     assert (str(tmp_path / "rust"), "/opt/rust") in bwrap_options(bwrap, "--ro-bind", 2)
 
 
+def test_sandbox_command_mounts_node_and_typescript(monkeypatch, tmp_path):
+    """Only the Node binary and the typescript package are exposed, independently of each other (here a system
+    Node and a tsc from an npm prefix), with tsc on the sandbox's PATH next to node."""
+    monkeypatch.setattr(llm_bench, "NODE_BIN", tmp_path / "usr/bin/node-24")
+    monkeypatch.setattr(llm_bench, "TS_PACKAGE", tmp_path / "prefix/lib/node_modules/typescript")
+    _, bwrap = sandbox_args(tmp_path)
+    binds = bwrap_options(bwrap, "--ro-bind", 2)
+    assert (str(tmp_path / "usr/bin/node-24"), "/opt/node/bin/node") in binds
+    assert (str(tmp_path / "prefix/lib/node_modules/typescript"), "/opt/typescript") in binds
+    assert bwrap_options(bwrap, "--symlink", 2) == [("/opt/typescript/bin/tsc", "/opt/node/bin/tsc")]
+    assert bwrap.index("--symlink") > bwrap.index("/opt/node/bin/node")   # after the bind that creates the dir
+    assert dict(bwrap_options(bwrap, "--setenv", 2))["PATH"].startswith("/opt/rust/bin:/opt/node/bin:")
+
+
+def test_sandbox_command_without_node(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm_bench, "NODE_BIN", None)
+    monkeypatch.setattr(llm_bench, "TS_PACKAGE", None)
+    _, bwrap = sandbox_args(tmp_path)
+    assert not any(dest.startswith(("/opt/node", "/opt/typescript")) for _, dest in bwrap_options(bwrap, "--ro-bind", 2))
+    assert not bwrap_options(bwrap, "--symlink", 2)
+
+
 @pytest.fixture
 def fake_sandbox(monkeypatch, tmp_path):
     """Make run_cmd run `python3 -c CODE` instead of the sandbox; returns a function that sets CODE. A fake

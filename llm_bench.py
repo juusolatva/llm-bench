@@ -477,9 +477,10 @@ def stop_active_units():
 
 
 def sandbox_path_dirs():
-    """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT): the host PATH
-    entries under /usr, such as /usr/local/go/bin, then /usr/bin and /bin. Home, project and relative entries are
-    left out because the sandbox doesn't expose them."""
+    """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT) and Node with
+    tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
+    then /usr/bin and /bin. Home, project and relative entries are left out because the sandbox doesn't expose
+    them."""
     system_path = [path for path in os.get_exec_path()
                    if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")]
     return [*system_path, "/usr/bin", "/bin"]
@@ -498,6 +499,12 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
         sandbox += ["--ro-bind", LD_SO_CACHE, LD_SO_CACHE]
     if RUST_SYSROOT is not None:
         sandbox += ["--ro-bind", str(RUST_SYSROOT), "/opt/rust"]
+    # Node and TypeScript: the binary and the package only (see check_toolchains), with tsc next to node.
+    if NODE_BIN is not None:
+        sandbox += ["--ro-bind", str(NODE_BIN), "/opt/node/bin/node"]
+    if TS_PACKAGE is not None:
+        sandbox += ["--ro-bind", str(TS_PACKAGE), "/opt/typescript",
+                    "--symlink", "/opt/typescript/bin/tsc", "/opt/node/bin/tsc"]
     sandbox += ["--proc", "/proc", "--dev", "/dev",
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/tmp",
                 "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/work",
@@ -506,7 +513,7 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
         sandbox += ["--bind", str(go_cache_rw), GO_CACHE_MOUNT]
     elif GO_CACHE is not None:
         sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", GO_CACHE_MOUNT]
-    sandbox_path = ":".join(["/opt/rust/bin", *sandbox_path_dirs()])
+    sandbox_path = ":".join(["/opt/rust/bin", "/opt/node/bin", *sandbox_path_dirs()])
     for key, value in {
         "PATH": sandbox_path, "HOME": "/tmp", "TMPDIR": "/tmp", "LC_ALL": "C",
         "GOCACHE": GO_CACHE_MOUNT if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
