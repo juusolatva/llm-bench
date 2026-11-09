@@ -704,6 +704,47 @@ def valid_counts(usage):
             if k not in ("prompt_tokens", "completion_tokens") or (type(v) is int and v >= 0)}
 
 
+def http_error_detail(e):
+    """The start of an HTTP error's body, or "" if it can't be read."""
+    try:
+        return e.read(500).decode("utf-8", errors="replace").strip()
+    except (OSError, http.client.HTTPException):
+        return ""
+
+
+def connection_lost(label, base, opts, e, delay, stop):
+    """Handle a refused, reset or dropped connection. Returns True if the server still answers (so the model
+    process, not the server, died); otherwise waits delay seconds for the server to come back and returns False.
+    Raises ServerDown when no retry is left (delay is None), Interrupted if the run is interrupted while waiting."""
+    if server_reachable(base, opts.api_key):
+        log(f"{label}: connection lost ({e}), server still reachable", err=True)
+        return True
+    if delay is None:
+        raise ServerDown(str(e)) from e
+    log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
+    if stop.wait(delay):
+        raise Interrupted from None
+    return False
+
+
+def parse_reply(label, resp, seconds):
+    """chat()'s result for a decoded chat completion reply: its text, finish reason and usage, or "bad_response"
+    if it doesn't have the expected shape."""
+    try:
+        choice = resp["choices"][0]
+        text = choice["message"].get("content") or ""
+        if not isinstance(text, str):
+            raise TypeError(f"content is {type(text).__name__}")
+        usage = resp.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise TypeError(f"usage is {type(usage).__name__}")
+        usage = valid_counts(usage)
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
+        return "", None, {}, "bad_response", seconds
+    return text, choice.get("finish_reason"), usage, None, seconds
+
+
 def chat(label, base, payload, opts, stop):
     """POST one chat completion. Returns (text, finish_reason, usage, error, seconds); seconds is the duration of
     the last HTTP request alone, without the waits for an unreachable server.
@@ -712,48 +753,23 @@ def chat(label, base, payload, opts, stop):
     or "disconnected". If the server itself is unreachable, wait and retry the same request; raise
     ServerDown when it stays down, Interrupted if the run is interrupted while waiting."""
     for delay in (*SERVER_RETRY_DELAYS_S, None):
+        t0 = time.monotonic()
         try:
-            t0 = time.monotonic()
             resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
         except urllib.error.HTTPError as e:   # the server answered: model failed to load, crashed, prompt too long
-            try:
-                detail = e.read(500).decode("utf-8", errors="replace").strip()
-            except (OSError, http.client.HTTPException):
-                detail = ""
-            log(f"{label}: HTTP {e.code}: {detail or e.reason}", err=True)
+            log(f"{label}: HTTP {e.code}: {http_error_detail(e) or e.reason}", err=True)
             return "", None, {}, f"http_{e.code}", time.monotonic() - t0
         except TimeoutError:   # raised directly only while waiting for the reply: the model was too slow
             log(f"{label}: no reply within {opts.timeout}s", err=True)
             return "", None, {}, "timeout", time.monotonic() - t0
         except (OSError, http.client.HTTPException) as e:
-            # Refused, reset or dropped connection. If the server still answers, the model process
-            # (not the server) died; otherwise wait for the server to come back.
-            if server_reachable(base, opts.api_key):
-                log(f"{label}: connection lost ({e}), server still reachable", err=True)
+            if connection_lost(label, base, opts, e, delay, stop):
                 return "", None, {}, "disconnected", time.monotonic() - t0
-            if delay is None:
-                raise ServerDown(str(e)) from e
-            log(f"{label}: server unreachable ({e}); retrying in {delay}s", err=True)
-            if stop.wait(delay):
-                raise Interrupted from None
             continue
         except ValueError as e:   # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
             log(f"{label}: bad response: {e}", err=True)
             return "", None, {}, "bad_response", time.monotonic() - t0
-        seconds = time.monotonic() - t0
-        try:
-            choice = resp["choices"][0]
-            text = choice["message"].get("content") or ""
-            if not isinstance(text, str):
-                raise TypeError(f"content is {type(text).__name__}")
-            usage = resp.get("usage") or {}
-            if not isinstance(usage, dict):
-                raise TypeError(f"usage is {type(usage).__name__}")
-            usage = valid_counts(usage)
-        except (KeyError, IndexError, TypeError, AttributeError) as e:
-            log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
-            return "", None, {}, "bad_response", seconds
-        return text, choice.get("finish_reason"), usage, None, seconds
+        return parse_reply(label, resp, time.monotonic() - t0)
     raise AssertionError("unreachable")
 
 
