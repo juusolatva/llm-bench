@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go and Bash tasks.
+"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, Bash and terminal tasks.
 
 Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM Studio,
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
@@ -7,7 +7,8 @@ Tasks are loaded from tasks/<lang>/<task>/ next to this script (see load_tasks).
 Output: results_<endpoint>.csv (one row per trial: one model on one task) and
 runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
-toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils).
+toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils; GNU diffutils, grep, sed and
+gawk for terminal tasks).
 Run with --help for usage.
 """
 import argparse
@@ -86,8 +87,10 @@ SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 # printed it, so a solution that ends the process early with status 0 (sys.exit(0) at import, exit(0) in C)
 # fails instead of skipping the remaining checks.
 HARNESS_FINAL_LINE = "harness: all checks passed"
+SH_HARNESS = "test.sh"   # the harness file of the Bash and terminal tasks
 # Per language: task name prefix, solution file, harness file, code block language tags (preferred by
-# extract_code), extra files, build/test commands, and "final_line": text the last command must print after its
+# extract_code), extra files, build/test commands, other tools the tasks rely on ("tools", checked by
+# check_toolchains like the commands), and "final_line": text the last command must print after its
 # last check (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
 # directory mode (no package argument) because package mode hides a passing test binary's output. A Rust harness
 # is its own crate that uses the solution's public API, and libtest's summary line is its final line.
@@ -109,8 +112,12 @@ LANGS = {
     "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
            "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
-    "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
-             "cmds": [["bash", "test.sh"]], "final_line": HARNESS_FINAL_LINE},
+    "bash": {"prefix": "bash", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
+             "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE},
+    # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
+    "term": {"prefix": "term", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
+             "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE,
+             "tools": ("gawk", "grep", "sed", "find", "xargs", "sort", "comm", "diff", "cmp")},
 }
 
 # --------------------------------------------------------------------------------------------
@@ -440,6 +447,15 @@ def stop_active_units():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
 
 
+def sandbox_path_dirs():
+    """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT): the host PATH
+    entries under /usr, such as /usr/local/go/bin, then /usr/bin and /bin. Home, project and relative entries are
+    left out because the sandbox doesn't expose them."""
+    system_path = [path for path in os.get_exec_path()
+                   if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")]
+    return [*system_path, "/usr/bin", "/bin"]
+
+
 def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     """Run only inside a mandatory namespace sandbox and bounded systemd unit.
     timeout: run time limit (default CMD_TIMEOUT_S). go_cache_rw: host directory mounted writable as the Go
@@ -468,11 +484,7 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
         sandbox += ["--bind", str(go_cache_rw), GO_CACHE_MOUNT]
     elif GO_CACHE is not None:
         sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", GO_CACHE_MOUNT]
-    # Preserve system installations such as /usr/local/go/bin, while excluding
-    # home/project/relative PATH entries that are not exposed inside the sandbox.
-    system_path = [path for path in os.get_exec_path()
-                   if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")]
-    sandbox_path = ":".join(["/opt/rust/bin", *system_path, "/usr/bin", "/bin"])
+    sandbox_path = ":".join(["/opt/rust/bin", *sandbox_path_dirs()])
     for key, value in {
         "PATH": sandbox_path, "HOME": "/tmp", "TMPDIR": "/tmp", "LC_ALL": "C",
         "GOCACHE": GO_CACHE_MOUNT if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
@@ -661,11 +673,17 @@ def check_toolchains(tasks):
     """Verify the toolchains needed by the selected tasks only."""
     global RUST_SYSROOT
     langs = {t["lang"] for t in tasks}
-    missing = sorted({cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"]
-                      if not cmd[0].startswith("./") and shutil.which(cmd[0]) is None})
+    needed = {cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"] if not cmd[0].startswith("./")}
+    needed |= {tool for lang in langs for tool in LANGS[lang].get("tools", ())}
+    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count. rustc is
+    # looked up on the host PATH (it may be a rustup proxy): the sandbox gets the resolved toolchain below.
+    path = os.pathsep.join(sandbox_path_dirs())
+    missing = sorted(name for name in needed
+                     if shutil.which(name, path=None if name == "rustc" else path) is None)
     if missing:
         sys.exit(f"missing toolchains on PATH: {', '.join(missing)}\n"
-                 f"install them or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
+                 f"install them under /usr (the sandbox's PATH has only {path} and the Rust toolchain) "
+                 f"or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
     if "rust" not in langs:
         return
     # rustc may be a rustup proxy under ~/.cargo. Expose the actual compiler
