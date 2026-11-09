@@ -212,9 +212,12 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         """Raise instead of following, before the default handler reads the body. The caller gets the 3xx
-        status as an HTTPError, like any other HTTP error."""
+        status as an HTTPError, like any other HTTP error, but with an empty body: the server's body (often a
+        short HTML page) would replace the reason in chat()'s log, and a stalled one would hold it until the
+        timeout."""
+        fp.close()
         raise urllib.error.HTTPError(req.full_url, code, f"{msg}; redirect to {newurl[:200]!r} not followed "
-                                     "(use the final URL as the endpoint)", headers, fp)
+                                     "(use the final URL as the endpoint)", headers, None)
 
 
 HTTP_OPENER = urllib.request.build_opener(NoRedirects)

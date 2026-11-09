@@ -41,10 +41,16 @@ def test_chat_classifies_failures(mock_server, reply, error):
     assert chat(s)[:4] == ("", None, {}, error)
 
 
-def test_chat_refuses_redirect(mock_server, capsys):
-    s = mock_server(replies=[Reply(status=307, body=b"", headers={"Location": "http://127.0.0.1:9/v1/chat"})])
-    assert chat(s)[:4] == ("", None, {}, "http_307")
-    assert "not followed" in capsys.readouterr().err
+@pytest.mark.parametrize("length", [None, 10**9])   # 10**9: the body stalls
+def test_chat_refuses_redirect(mock_server, capsys, length):
+    s = mock_server(replies=[Reply(status=307, body=b"<html>Moved</html>", length=length,
+                                   headers={"Location": "http://127.0.0.1:9/v1/chat"})])
+    t0 = time.monotonic()
+    assert chat(s, timeout=5)[:4] == ("", None, {}, "http_307")
+    assert time.monotonic() - t0 < 4
+    err = capsys.readouterr().err
+    assert "redirect to 'http://127.0.0.1:9/v1/chat' not followed" in err
+    assert "Moved</html>" not in err
     assert len(s.requests) == 1
     assert s.gets == []
 
