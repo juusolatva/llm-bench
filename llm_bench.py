@@ -1613,16 +1613,19 @@ def parse_endpoints(specs):
     return endpoints
 
 
+def select_models(ids, patterns):
+    """The model IDs matching any of the --model patterns, or passing the default filter without patterns."""
+    if patterns:
+        return [m for m in ids if any(fnmatchcase(m, p) for p in patterns)]
+    return [m for m in ids if default_model_filter(m)]
+
+
 def plan_models(args, endpoints):
     """Map endpoint name -> models to benchmark (--model patterns, or the default filter); endpoints
     with no selected model are left out. Warns about --model patterns that match no model."""
     plan = {}
     for name, base in endpoints.items():
-        ids = list_models(name, base, args.api_key)
-        if args.model:
-            models = [m for m in ids if any(fnmatchcase(m, p) for p in args.model)]
-        else:
-            models = [m for m in ids if default_model_filter(m)]
+        models = select_models(list_models(name, base, args.api_key), args.model)
         if models:
             plan[name] = models
             log(f"{name} ({base}): {len(models)} model(s): {', '.join(models)}", err=True)
