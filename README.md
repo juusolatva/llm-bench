@@ -71,7 +71,7 @@ sudo apt install bubblewrap build-essential golang rustc
 ./llm_bench.py --summary results_*.csv --format markdown --per-task   # for a README or an issue
 ```
 
-Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files (default: `HOST_PORT`). If no endpoint is given on the command line, they are read from the space-separated `LLM_BENCH_ENDPOINTS` environment variable.
+Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files (default: `HOST_PORT`). If no endpoint is given on the command line, they are read from the space-separated `LLM_BENCH_ENDPOINTS` environment variable. HTTP redirects are never followed (a redirect would send the API key to another location), so give the final URL.
 
 | Option | Default | Description |
 |---|---|---|
@@ -98,7 +98,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 ### Server setup tips
 
 - **Context length.** With the defaults a retry request can need about 25k tokens of context (roughly 1k + 4k per retry + `--max-tokens`). Configure the server for at least 32k. Many servers default to much less and silently truncate the prompt. For example, Ollama uses `OLLAMA_CONTEXT_LENGTH=32768`, and LM Studio sets the context length in the model's load settings. If you can't, lower `--max-tokens` or `--attempts` so the need fits.
-- **Context check.** Before each model's first task, the benchmark loads it with a tiny request (its time goes into `load_seconds`, not the first task) and then checks the context: it measures the model's tokens per word with a short filler prompt, sends a filler prompt of the needed size, and compares the prompt tokens the server reports. A server that truncates reports too few; one that refuses answers with an error. The result is recorded in the `context` column and a failed check is repeated under the summary. It costs one long prompt per model; `--no-context-check` skips it.
+- **Context check.** Before each model's first task, the benchmark loads it with a tiny request (its time goes into `load_seconds`, not the first task) and then checks the context: it measures the model's tokens per word with a short filler prompt, sends a filler prompt of the needed size, and compares the prompt tokens the server reports. A server that truncates reports too few; one that refuses answers with an error. Token counts that aren't plausible (not whole numbers, or under 0.5 or over 10 tokens per word) are never used to size the prompt: too few tokens per word means even the calibration prompt was cut off (`short`), and anything else leaves the context `unchecked`. The result is recorded in the `context` column and a failed check is repeated under the summary. It costs one long prompt per model; `--no-context-check` skips it.
 - **One model at a time.** Models are benchmarked one after another. If the server keeps earlier models loaded, the next model may not fit in VRAM and run partly on the CPU, which only affects timing. Let the server evict old models: Ollama with `OLLAMA_MAX_LOADED_MODELS=1`, LM Studio with the auto-evict option for JIT-loaded models.
 - **Thinking models.** `<think>…</think>` blocks are removed before code extraction, as is everything before a `</think>` without an opening tag (some chat templates put the opening tag in the prompt). Tags inside a fenced code block are left alone, as part of the code. A reply that is only unfinished reasoning (an opening `<think>` that never closes, typically cut off at `--max-tokens`) counts as containing no code. Reasoning returned in a separate field is ignored, but its token count is recorded in `reasoning_tokens` when the server reports it. Reasoning tokens still count toward `--max-tokens`, so raise it if replies end with `finish_reason=length`.
 - **Code extraction.** The system prompt asks for exactly one fenced code block. If a reply has several, the blocks tagged with the task's language (for example ` ```python ` or ` ```py `) are the candidates, or all blocks if none is tagged that way. The last candidate is used, which is the fix when a reply quotes the original code first, unless it is less than half as long as the longest one (a usage example or a snippet after the full file); then the longest is used. A reply without a fenced block is used as is.
@@ -113,7 +113,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
   | `endpoint`, `model`, `task`, `lang` | What was run. |
   | `repeat` | Number of this trial of the task for this model and `config` (1, 2, …), continuing after the rows already in the file. |
   | `passed`, `passed_on`, `attempts` | 1 if any attempt passed; which attempt passed (0 = none); attempts made. |
-  | `prompt_tokens`, `completion_tokens` | Token usage summed over all attempts, as reported by the server. |
+  | `prompt_tokens`, `completion_tokens` | Token usage summed over all attempts, as reported by the server (counts that aren't non-negative integers are ignored). |
   | `reasoning_tokens` | The part of `completion_tokens` spent on reasoning, summed over all attempts (`usage.completion_tokens_details.reasoning_tokens`). Empty unless every reply reported it. |
   | `seconds` | Time spent waiting for replies (not building and testing). |
   | `usage_seconds` | Request time of the replies that reported their completion tokens (even 0), without waits for an unreachable server: the throughput's time base. Empty in rows from older versions. |
@@ -137,7 +137,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | Value | Meaning |
 |---|---|
 | `timeout` | No reply within `--timeout`. |
-| `http_<code>` | The server returned an HTTP error, e.g. the model failed to load or crashed, or the prompt didn't fit its context. |
+| `http_<code>` | The server returned an HTTP error, e.g. the model failed to load or crashed, or the prompt didn't fit its context, or a redirect (`http_3xx`), which isn't followed. |
 | `bad_response` | The reply wasn't a valid chat completion (invalid or truncated JSON, no `choices`, a body over 8 MiB, …). |
 | `disconnected` | The connection dropped while the server itself stayed reachable (typically a crashed model process). |
 | `oversized` | The reply text exceeded 1,048,576 characters. Nothing is written to disk for it. |

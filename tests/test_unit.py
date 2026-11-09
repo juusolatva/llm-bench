@@ -1,8 +1,10 @@
 import sys
 import time
+import urllib.error
 from collections import Counter
 
 import pytest
+from conftest import Reply
 
 import llm_bench
 
@@ -293,6 +295,26 @@ def test_http_json_enforces_size_cap(mock_server, monkeypatch):
     monkeypatch.setattr(llm_bench, "MAX_RESPONSE_BYTES", 100)
     with pytest.raises(ValueError, match="exceeds"):
         llm_bench.http_json(f"{s.url}/models")
+
+
+@pytest.mark.parametrize("length", [None, 10**9])   # a body that's sent in full, and one that never ends
+def test_http_json_refuses_redirects(mock_server, length):
+    # urllib's default handler would read the whole redirect body (no size cap; here it would wait for the
+    # missing bytes) and send the API key to the new location.
+    s = mock_server(api_key="sekrit", models_reply=Reply(status=302, body=b"x" * 1000, length=length,
+                                                         headers={"Location": "http://127.0.0.1:9/v1/models"}))
+    with pytest.raises(urllib.error.HTTPError, match="not followed") as e:
+        llm_bench.http_json(f"{s.url}/models", timeout=5, api_key="sekrit")
+    assert e.value.code == 302
+    assert s.gets == ["/v1/models"]
+
+
+def test_list_models_reports_redirect(mock_server, capsys):
+    s = mock_server(models_reply=Reply(status=301, body=b"", headers={"Location": "/v2/models"}))
+    assert llm_bench.list_models("m", s.url, None) == []
+    err = capsys.readouterr().err
+    assert f"HTTP Error 301: Moved Permanently; redirect to '{s.url.removesuffix('/v1')}/v2/models' not followed" in err
+    assert s.gets == ["/v1/models"]
 
 
 def test_list_models_unreachable(capsys):
