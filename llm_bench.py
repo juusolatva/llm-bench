@@ -995,81 +995,102 @@ def is_finished(row):
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
 
+class EndpointRun:
+    """The state of one endpoint's trials: the results file writer, trial numbers and the rows recorded so far."""
+
+    def __init__(self, name, base, opts, f, out_path, runs_dir, existing, rows, stop):
+        self.name, self.base, self.opts, self.stop = name, base, opts, stop
+        self.f, self.out_path, self.runs_dir, self.rows = f, out_path, runs_dir, rows
+        self.w = csv.DictWriter(f, fieldnames=FIELDS)
+        # Trial numbers (the repeat column) continue after the rows already in the file, so transcripts are
+        # never overwritten.
+        self.numbered = Counter((r["model"], r["task"], r["config"]) for r in existing)
+        self.finished = Counter((r["model"], r["task"], r["config"]) for r in existing if is_finished(r))
+        self.params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
+
+    def record(self, model, task, result, model_info):
+        """Number the trial, then append its row to the results file and to rows."""
+        key = (model, task["name"], task["config"])
+        self.numbered[key] += 1
+        row = {"run_id": self.opts.run_id, "endpoint": self.name, "model": model, "task": task["name"],
+               "lang": task["lang"], "repeat": self.numbered[key], **result, **model_info, "params": self.params,
+               "settings": self.opts.settings_hash, "config": task["config"]}
+        self.rows.append(row)
+        self.w.writerow(row)
+        self.f.flush()
+        log(str(row))
+
+    def skip_rest(self, model, todo, why, finish_reason, fail_stage, model_info):
+        """Record the model's remaining trials as skipped with the given finish reason and fail stage."""
+        log(f"{self.name}/{model}: {why}; skipping its remaining {len(todo)} trial(s)", err=True)
+        for task in todo:
+            self.record(model, task, skipped_result(finish_reason, fail_stage), model_info)
+
+    def todo(self, model, tasks):
+        """The model's trials to run, in round-major order: one round (a trial of every task) finishes before
+        the next one starts. With --resume, trials already finished in the results file are left out."""
+        opts = self.opts
+        return [task for rep in range(opts.repeat) for task in tasks
+                if not opts.resume or self.finished[(model, task["name"], task["config"])] <= rep]
+
+    def run_model(self, model, model_dir, tasks):
+        """Load the model and run its remaining trials, stopping early after too many request errors in a row
+        or replies that hit --max-tokens."""
+        name, opts = self.name, self.opts
+        todo, total = self.todo(model, tasks), opts.repeat * len(tasks)
+        if not todo:
+            log(f"{name}/{model}: all {total} trial(s) already in {self.out_path}; skipping", err=True)
+            return
+        if len(todo) < total:
+            log(f"{name}/{model}: resuming, {len(todo)} of {total} trial(s) to go", err=True)
+        load_seconds, context, error = prepare_model(f"{name}/{model}", self.base, model, opts, self.stop)
+        model_info = {"load_seconds": load_seconds, "context": context}
+        if error:
+            self.skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
+            return
+        model_errors = 0     # consecutive trials that ended in a request error
+        length_finishes = 0  # trials whose last reply hit --max-tokens
+        for i, task in enumerate(todo):
+            if model_errors >= MAX_MODEL_ERRORS:
+                self.skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
+                               model_info)
+                return
+            if opts.max_length_finishes and length_finishes >= opts.max_length_finishes:
+                self.skip_rest(model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped",
+                               "budget", model_info)
+                return
+            result = self.run_trial(model, model_dir, task)
+            model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
+            length_finishes += result["finish_reason"] == "length"
+            self.record(model, task, result, model_info)
+
+    def run_trial(self, model, model_dir, task):
+        """Run one trial of task, keeping its transcript under the trial's own directory."""
+        repeat = self.numbered[(model, task["name"], task["config"])] + 1
+        label = f"{self.name}/{model}/{task['name']}" + (f"#{repeat}" if self.opts.repeat > 1 else "")
+        # Trial numbers restart for each config, so it's part of the path: no trial can replace the transcript
+        # of another config's trial.
+        taskdir = self.runs_dir / model_dir / task["name"] / task["config"] / f"repeat_{repeat}"
+        return run_one_task(label, self.base, model, task, taskdir, self.opts, self.stop)
+
+
 def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop):
     """Run opts.repeat rounds of trials for each model of one endpoint (with opts.resume, only the trials not
     yet finished in out_path). Appends each row to out_path (and to rows) as it completes."""
     existing = []
     if out_path.exists() and out_path.stat().st_size > 0:
         existing = [r for r in read_results(out_path) if r["endpoint"] == name]
-    # Trial numbers (the repeat column) continue after the rows already in the file, so transcripts are never
-    # overwritten.
-    numbered = Counter((r["model"], r["task"], r["config"]) for r in existing)
-    finished = Counter((r["model"], r["task"], r["config"]) for r in existing if is_finished(r))
     new_file = not existing and (not out_path.exists() or out_path.stat().st_size == 0)
     # Rows are written as they complete, so an aborted run keeps every finished trial.
     with open(out_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
+        run = EndpointRun(name, base, opts, f, out_path, runs_dir, existing, rows, stop)
         if new_file:
-            w.writeheader()
+            run.w.writeheader()
             f.flush()
-
-        params = json.dumps(opts.params, sort_keys=True, separators=(",", ":"))
         dirs = model_dirs(models)
-
-        def record(model, task, result, model_info):
-            """Number the trial, then append its row to the results file and to rows."""
-            key = (model, task["name"], task["config"])
-            numbered[key] += 1
-            row = {"run_id": opts.run_id, "endpoint": name, "model": model, "task": task["name"],
-                   "lang": task["lang"], "repeat": numbered[key], **result, **model_info, "params": params,
-                   "settings": opts.settings_hash, "config": task["config"]}
-            rows.append(row)
-            w.writerow(row)
-            f.flush()
-            log(str(row))
-
-        def skip_rest(model, todo, why, finish_reason, fail_stage, model_info):
-            """Record the model's remaining trials as skipped with the given finish reason and fail stage."""
-            log(f"{name}/{model}: {why}; skipping its remaining {len(todo)} trial(s)", err=True)
-            for task in todo:
-                record(model, task, skipped_result(finish_reason, fail_stage), model_info)
-
         try:
             for model in models:
-                # Round-major order: one round (a trial of every task) finishes before the next one starts.
-                todo = [task for rep in range(opts.repeat) for task in tasks
-                        if not opts.resume or finished[(model, task["name"], task["config"])] <= rep]
-                total = opts.repeat * len(tasks)
-                if not todo:
-                    log(f"{name}/{model}: all {total} trial(s) already in {out_path}; skipping", err=True)
-                    continue
-                if len(todo) < total:
-                    log(f"{name}/{model}: resuming, {len(todo)} of {total} trial(s) to go", err=True)
-                load_seconds, context, error = prepare_model(f"{name}/{model}", base, model, opts, stop)
-                model_info = {"load_seconds": load_seconds, "context": context}
-                if error:
-                    skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
-                    continue
-                model_errors = 0     # consecutive trials that ended in a request error
-                length_finishes = 0  # trials whose last reply hit --max-tokens
-                for i, task in enumerate(todo):
-                    if model_errors >= MAX_MODEL_ERRORS:
-                        skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
-                                  model_info)
-                        break
-                    if opts.max_length_finishes and length_finishes >= opts.max_length_finishes:
-                        skip_rest(model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped",
-                                  "budget", model_info)
-                        break
-                    repeat = numbered[(model, task["name"], task["config"])] + 1
-                    label = f"{name}/{model}/{task['name']}" + (f"#{repeat}" if opts.repeat > 1 else "")
-                    # Trial numbers restart for each config, so it's part of the path: no trial can replace
-                    # the transcript of another config's trial.
-                    taskdir = runs_dir / dirs[model] / task["name"] / task["config"] / f"repeat_{repeat}"
-                    result = run_one_task(label, base, model, task, taskdir, opts, stop)
-                    model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
-                    length_finishes += result["finish_reason"] == "length"
-                    record(model, task, result, model_info)
+                run.run_model(model, dirs[model], tasks)
         except ServerDown as e:
             log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
         except Interrupted:
