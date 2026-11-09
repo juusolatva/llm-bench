@@ -44,12 +44,16 @@ describe() {
 }
 
 put logs/app.log 'user=bob password=hunter2 ok\npassword=a1 password=b2\nno secrets here\n'
-put 'logs/web server.log' "$(for i in 1 2 3 4 5 6 7 8; do printf 'GET /index.html 200\\n'; done)password=letmein (retry)\\n"
+put "logs/web server's.log" "$(for i in 1 2 3 4 5 6 7 8; do printf 'GET /index.html 200\\n'; done)password=letmein (retry)\\n"
 put logs/sub/deep.log 'password=zzz\n'
+put logs/-v.log 'password=dash ok\n'
+put 'logs/say "hi".log' 'hi password=q1\n'
 put logs/app.log.1 'old\n'
 put 'logs/old runs/app.log.12' 'old\n'
 put logs/.app.log.2 'old\n'
 put logs/.archive/app.log.6 'old\n'
+put logs/-n.log.7 'old\n'
+put "logs/it's \"old\".log.8" 'old\n'
 put logs/app.log.3 'recent\n'
 put logs/app.log.4 '7.5 days old\n'
 put logs/app.log.5 '6.5 days old\n'
@@ -58,7 +62,7 @@ put logs/app.log.1.gz 'old\n'
 put notes.txt 'password=keep\n'
 old=$(date -d '30 days ago' +%F)
 recent=$(date -d '1 day ago' +%F)
-for f in logs/app.log.1 'logs/old runs/app.log.12' logs/.app.log.2 logs/.archive/app.log.6 logs/app.log.bak logs/app.log.1.gz; do touch -d "$old" "$f"; done
+for f in logs/app.log.1 'logs/old runs/app.log.12' logs/.app.log.2 logs/.archive/app.log.6 logs/-n.log.7 "logs/it's \"old\".log.8" logs/app.log.bak logs/app.log.1.gz; do touch -d "$old" "$f"; done
 touch -d "$recent" logs/app.log.3
 touch -d '180 hours ago' logs/app.log.4
 touch -d '156 hours ago' logs/app.log.5
@@ -68,10 +72,12 @@ cp -a "$W" "$T/want" || exit 1
 (
     cd "$T/want" || exit 1
     put logs/app.log 'user=bob password=*** ok\npassword=*** password=***\nno secrets here\n'
-    put 'logs/web server.log' "$(for i in 1 2 3 4 5 6 7 8; do printf 'GET /index.html 200\\n'; done)password=*** (retry)\\n"
-    rm -f logs/app.log.1 logs/app.log.4 'logs/old runs/app.log.12' logs/.app.log.2 logs/.archive/app.log.6
+    put "logs/web server's.log" "$(for i in 1 2 3 4 5 6 7 8; do printf 'GET /index.html 200\\n'; done)password=*** (retry)\\n"
+    put logs/-v.log 'password=*** ok\n'
+    put 'logs/say "hi".log' 'hi password=***\n'
+    rm -f logs/app.log.1 logs/app.log.4 'logs/old runs/app.log.12' logs/.app.log.2 logs/.archive/app.log.6 logs/-n.log.7 "logs/it's \"old\".log.8"
 ) || exit 1
-want_out="$(wc -c < "$T/want/logs/web server.log") logs/web server.log"
+want_out="$(wc -c < "$T/want/logs/web server's.log") logs/web server's.log"
 bash "$SOL" > "$T/out" 2> "$T/err" < /dev/null
 rc=$?
 ran_interpreter "$case1"
