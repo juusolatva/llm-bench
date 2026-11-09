@@ -1497,33 +1497,33 @@ def upgrade_results_file(path):
     log(f"upgraded {path} to the current columns (new ones are empty in its existing rows)", err=True)
 
 
-def main():
-    """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
-    args = parse_args()
-    if args.summary:
-        try:
-            rows = [r for path in args.summary for r in read_results(path)]
-        except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
-            sys.exit(f"cannot read results: {e}")
-        print_summary(rows, args.format, args.per_task)
-        return
+def show_summary(paths, fmt, per_task):
+    """--summary mode: print the summary of the given results files."""
+    try:
+        rows = [r for path in paths for r in read_results(path)]
+    except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
+        sys.exit(f"cannot read results: {e}")
+    print_summary(rows, fmt, per_task)
+
+
+def select_tasks(args):
+    """Load the tasks and keep the ones matching --task; warn about patterns that match no task."""
     try:
         all_tasks = load_tasks(args.tasks_dir or [DEFAULT_TASKS_DIR])
     except (OSError, ValueError) as e:   # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot load tasks: {e}")
     tasks = [t for t in all_tasks if not args.task or any(fnmatchcase(t["name"], p) for p in args.task)]
-    if args.list_tasks:
-        for t in tasks:
-            print(f"{t['name']:24} {t['lang']}")
-        return
-    for p in args.task:
-        if not any(fnmatchcase(t["name"], p) for t in all_tasks):
-            log(f"warning: task pattern {p!r} matched no task (see --list-tasks)", err=True)
-    if not tasks:
-        sys.exit("no tasks selected")
+    if not args.list_tasks:
+        for p in args.task:
+            if not any(fnmatchcase(t["name"], p) for t in all_tasks):
+                log(f"warning: task pattern {p!r} matched no task (see --list-tasks)", err=True)
+    return tasks
 
+
+def parse_endpoints(specs):
+    """Map endpoint name -> base URL for the endpoint arguments; exit on a bad or duplicate one."""
     endpoints = {}
-    for spec in args.endpoints:
+    for spec in specs:
         try:
             name, base = parse_endpoint(spec)
         except ValueError as e:
@@ -1531,14 +1531,12 @@ def main():
         if name in endpoints:
             sys.exit(f"duplicate endpoint name {name!r}; label them with NAME=URL")
         endpoints[name] = base
+    return endpoints
 
-    check_toolchains(tasks)
-    check_sandbox()
-    args.run_id = new_run_id()
-    settings = settings_fingerprint(args)
-    args.settings_hash = settings_hash(settings)
-    tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
 
+def plan_models(args, endpoints):
+    """Map endpoint name -> models to benchmark (--model patterns, or the default filter); endpoints
+    with no selected model are left out. Warns about --model patterns that match no model."""
     plan = {}
     for name, base in endpoints.items():
         ids = list_models(name, base, args.api_key)
@@ -1552,15 +1550,46 @@ def main():
     for p in args.model:
         if not any(fnmatchcase(m, p) for models in plan.values() for m in models):
             log(f"warning: pattern {p!r} matched no model", err=True)
-    if not plan:
-        sys.exit("no models selected")
+    return plan
 
+
+def output_paths(args, plan):
+    """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{args.tag}" if args.tag else ""
     outputs = {name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
                for name in plan}
     for csv_path, _ in outputs.values():
         check_results_file(csv_path)
+    return outputs
+
+
+def main():
+    """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
+    args = parse_args()
+    if args.summary:
+        show_summary(args.summary, args.format, args.per_task)
+        return
+    tasks = select_tasks(args)
+    if args.list_tasks:
+        for t in tasks:
+            print(f"{t['name']:24} {t['lang']}")
+        return
+    if not tasks:
+        sys.exit("no tasks selected")
+    endpoints = parse_endpoints(args.endpoints)
+
+    check_toolchains(tasks)
+    check_sandbox()
+    args.run_id = new_run_id()
+    settings = settings_fingerprint(args)
+    args.settings_hash = settings_hash(settings)
+    tasks = [{**t, "config": config_hash(settings, t)} for t in tasks]
+
+    plan = plan_models(args, endpoints)
+    if not plan:
+        sys.exit("no models selected")
+    outputs = output_paths(args, plan)
     go_tmp = None
     if any(t["lang"] == "go" for t in tasks):
         go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
