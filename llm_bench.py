@@ -76,6 +76,7 @@ NODE_BIN = None
 TS_PACKAGE = None
 NODE_MIN = (22, 0)   # oldest supported Node (major, minor)
 TS_MIN = (5, 5)      # oldest TypeScript that accepts "target": "es2023"
+TS_MAX_MAJOR = 6     # TypeScript 7 runs a native compiler from separate platform packages the sandbox doesn't mount
 BASH = "/bin/bash"
 LD_SO_CACHE = "/etc/ld.so.cache"
 GO_CACHE_MOUNT = "/opt/go-cache"   # where sandboxes see the Go build cache
@@ -784,10 +785,15 @@ def resolve_ts_package():
         meta = None
     if tsc.name != "tsc" or tsc.parent.name != "bin" or not isinstance(meta, dict) or meta.get("name") != "typescript":
         raise ValueError(f"tsc at {tsc} isn't inside a typescript package; put a real tsc first on PATH "
-                         "(Volta and asdf shims aren't supported)")
+                         "(wrappers such as Volta, asdf or pnpm shims aren't supported)")
     version = str(meta.get("version", ""))
-    if version_tuple(version)[:2] < TS_MIN:
+    parsed = version_tuple(version)
+    if parsed[:2] < TS_MIN:
         raise ValueError(f"TypeScript {version} at {package} is too old (need {TS_MIN[0]}.{TS_MIN[1]}+)")
+    if parsed[0] > TS_MAX_MAJOR:
+        raise ValueError(f"TypeScript {version} at {package} isn't supported (need {TS_MIN[0]}.{TS_MIN[1]} to "
+                         f"{TS_MAX_MAJOR}.x; its native compiler lives outside the typescript package): "
+                         f"npm install -g typescript@{TS_MAX_MAJOR}")
     return package
 
 

@@ -63,6 +63,10 @@ function harness_check(input: string, expected: harness_Expected): void {
     return;
   }
   const got = JSON.stringify(result);
+  if (typeof result !== "object" || result === null) {
+    harness_failures.push(`${call} returned ${String(got)}, expected ${want}`);
+    return;
+  }
   if ("error" in expected) {
     if (result.ok) {
       harness_failures.push(`${call} returned ${got}, expected ${want}`);

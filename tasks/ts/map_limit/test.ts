@@ -183,8 +183,8 @@ async function harness_empty(): Promise<void> {
   }
 }
 
-async function harness_badLimit(limit: number): Promise<void> {
-  const s = new harness_Scenario<number, number>(`mapLimit([1,2], ${limit}, fn)`, [1, 2], limit);
+async function harness_badLimit(items: number[], limit: number): Promise<void> {
+  const s = new harness_Scenario<number, number>(`mapLimit(${JSON.stringify(items)}, ${limit}, fn)`, items, limit);
   await harness_flush();
   if (s.outcome.state !== "rejected" || !(s.outcome.error instanceof RangeError)) {
     throw new Error(`${s.call}: the promise is ${s.show()}, expected rejected with a RangeError`);
@@ -198,7 +198,8 @@ const harness_scenarios: (() => Promise<void>)[] = [
   harness_sequential,
   harness_rejection,
   harness_empty,
-  ...[0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY].map((limit) => () => harness_badLimit(limit)),
+  ...[0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY].map((limit) => () => harness_badLimit([1, 2], limit)),
+  () => harness_badLimit([], 0),
 ];
 
 for (const scenario of harness_scenarios) {

@@ -332,6 +332,10 @@ def test_builtin_tasks_are_consistent():
     assert all(n == 4 for n in per_lang.values())
     assert all(sum(t["lang"] == lang and "_fix_" in t["name"] for t in BUILTIN_TASKS) == 1
                for lang in llm_bench.LANGS)
+    # TypeScript prompts end with the same rules paragraph (no Node modules or globals, solution.ts, no tests).
+    ts_rules = {t["prompt"].rsplit("\n\n", 1)[-1] for t in BUILTIN_TASKS if t["lang"] == "ts"}
+    assert len(ts_rules) == 1
+    assert next(iter(ts_rules)).startswith("Write the code in `solution.ts`.")
 
 
 @pytest.mark.parametrize("task", BUILTIN_TASKS, ids=[t["name"] for t in BUILTIN_TASKS])
@@ -890,7 +894,8 @@ def test_check_toolchains_ignores_node_noise(monkeypatch, tmp_path):
 @pytest.mark.parametrize(("kwargs", "message"), [
     ({"ts_version": "5.4.5"}, r"TypeScript 5\.4\.5 at .* is too old \(need 5\.5\+\)"),
     ({"node_version": "21.7.3"}, r"Node 21\.7\.3 at .* is too old \(need 22\+\)"),
-    ({"name": "not-typescript"}, r"tsc at .* isn't inside a typescript package"),
+    ({"name": "not-typescript"}, r"tsc at .* isn't inside a typescript package; .*pnpm"),
+    ({"ts_version": "7.0.2"}, r"TypeScript 7\.0\.2 at .* isn't supported \(need 5\.5 to 6\.x.*typescript@6"),
     ({"node_stdout": "not json\n"}, r"cannot use the TypeScript toolchain"),
 ])
 def test_check_toolchains_rejects_unusable_ts_toolchains(monkeypatch, tmp_path, kwargs, message):
@@ -899,7 +904,8 @@ def test_check_toolchains_rejects_unusable_ts_toolchains(monkeypatch, tmp_path, 
         llm_bench.check_toolchains([{"lang": "ts"}])
 
 
-@pytest.mark.parametrize("kwargs", [{"ts_version": "5.5.0"}, {"ts_version": "5.5.0-beta"}, {"node_version": "22.0.0"}])
+@pytest.mark.parametrize("kwargs", [{"ts_version": "5.5.0"}, {"ts_version": "5.5.0-beta"}, {"ts_version": "6.9.9"},
+                                    {"node_version": "22.0.0"}])
 def test_check_toolchains_accepts_the_minimum_versions(monkeypatch, tmp_path, kwargs):
     fake_ts_toolchain(monkeypatch, tmp_path, **kwargs)
     llm_bench.check_toolchains([{"lang": "ts"}])

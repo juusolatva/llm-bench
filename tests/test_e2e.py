@@ -89,6 +89,30 @@ def test_sandbox_hides_home(tmp_path):
     assert "HIDDEN" in out
 
 
+def install_must_be_hidden(install, tmp_path):
+    """Whether the sandbox must hide a Node installation root: not if it lies under a system path the sandbox
+    mounts anyway (/usr for /usr/bin/node or /usr/local/bin/node). The system paths come from sandbox_command's
+    binds with the toolchain mounts off, so a toolchain mount that leaks the installation can't excuse itself."""
+    tools = {"bwrap": "/usr/bin/bwrap", "systemd-run": "/usr/bin/systemd-run"}
+    with pytest.MonkeyPatch.context() as mp:
+        for name in ("NODE_BIN", "TS_PACKAGE", "RUST_SYSROOT"):
+            mp.setattr(llm_bench, name, None)
+        cmd = llm_bench.sandbox_command(tools, "llm-bench-x.service", ["true"], tmp_path, 60, None)
+    args = cmd[cmd.index("/usr/bin/bwrap"):cmd.index("--")]
+    exposed = [args[i + 1] for i, a in enumerate(args) if a == "--ro-bind" and args[i + 2] == args[i + 1]]
+    return not any(install.is_relative_to(path) for path in exposed)
+
+
+@pytest.mark.parametrize(("install", "hidden"), [
+    ("/usr", False),                                    # /usr/bin/node: the sandbox mounts /usr anyway
+    ("/usr/local", False),                              # /usr/local/bin/node
+    ("/home/someone/.local/share/fnm/node-versions/v24.22.1/installation", True),
+    ("/opt/node-v24", True),
+])
+def test_install_must_be_hidden(tmp_path, install, hidden):
+    assert install_must_be_hidden(Path(install), tmp_path) is hidden
+
+
 def test_sandbox_exposes_only_node_and_typescript(tmp_path, monkeypatch):
     """With TypeScript tasks, the sandbox sees the Node binary and the typescript package read-only, and nothing
     else of the Node installation (npm and global packages next to them) or the home directory around it. (The
@@ -100,9 +124,11 @@ def test_sandbox_exposes_only_node_and_typescript(tmp_path, monkeypatch):
     except SystemExit as exc:
         pytest.skip(str(exc))
     install = llm_bench.NODE_BIN.parent.parent
+    # A system Node's prefix (/usr) is visible by design; a version manager's installation must not be.
+    install_check = f"test -e {shlex.quote(str(install))} && echo INSTALL-VISIBLE" if install_must_be_hidden(install, tmp_path) else ""
     script = f"""
 ls -A /opt/node/bin | tr '\\n' ' '; echo
-test -e {shlex.quote(str(install))} && echo INSTALL-VISIBLE
+{install_check}
 test -e /opt/typescript/package.json && echo PACKAGE-OK
 touch /opt/typescript/x 2>/dev/null && echo PACKAGE-WRITABLE
 [ -w /opt/typescript/package.json ] && echo PACKAGE-WRITABLE

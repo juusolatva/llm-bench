@@ -15,7 +15,7 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 | C++ | `cpp_top_words`, `cpp_lru_cache`, `cpp_fix_buffer`, `cpp_interval_set` (built with ASan + UBSan) |
 | Rust | `rust_version`, `rust_csv_line`, `rust_fix_inventory`, `rust_topo_order` |
 | Go | `go_word_freq`, `go_kv_http`, `go_fix_count_lengths`, `go_parallel_map` (run with `-race`) |
-| TypeScript | `ts_parse_config`, `ts_map_limit`, `ts_broadcaster`, `ts_fix_route` (checked with `tsc --strict`) |
+| TypeScript | `ts_parse_config`, `ts_map_limit`, `ts_fix_route`, `ts_broadcaster` (checked with `tsc --strict`) |
 | Bash | `bash_top_words`, `bash_rotate_backups`, `bash_fix_rename`, `bash_access_log` |
 | Terminal | `term_find_refs`, `term_set_port`, `term_fix_portable`, `term_compare_dirs` |
 
@@ -53,7 +53,7 @@ Their harnesses must print the final line too (Rust harnesses import the solutio
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`); 0.11 or newer for the Go build cache (see [Go tasks](#go-tasks)).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
-- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5+), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks. You only need the toolchains for the tasks you select with `--task`.
+- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5 to 6.x), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
 
@@ -66,7 +66,7 @@ sudo apt install bubblewrap build-essential golang rustc gawk
 
 `rustc` installed via rustup also works: the sandbox exposes only the resolved toolchain directory, not `~/.cargo` or `~/.rustup`.
 
-Node and TypeScript can come from a version manager such as fnm or nvm, or from a system-wide install: the benchmark uses the `node` and `tsc` that come first on `PATH` (for example after `npm install -g typescript` in the Node installation you use) and exposes only the Node binary and the `typescript` package directory to the sandbox, not the rest of the installation, its global packages or your home directory. Version manager shims that replace `tsc` with a binary of their own (Volta, asdf) aren't supported. Tested with Node 24.22.1 and TypeScript 6.0.3; TypeScript results can differ between `tsc` versions, whose checks and error messages change.
+Node and TypeScript can come from a version manager such as fnm or nvm, or from a system-wide install: the benchmark uses the `node` and `tsc` that come first on `PATH` (for example after `npm install -g typescript@6` in the Node installation you use) and exposes only the Node binary and the `typescript` package directory to the sandbox, not the rest of a version manager's installation, its global packages or your home directory. A system-wide install under `/usr` is visible like the rest of `/usr`, which the sandbox mounts read-only for every language, global packages in `/usr/lib/node_modules` included. Wrappers that replace `tsc` with a script or binary of their own (Volta, asdf or pnpm shims) aren't supported, and neither is TypeScript 7, whose compiler is a native binary in separate per-platform packages that the sandbox doesn't mount. Tested with Node 24.22.1 and TypeScript 6.0.3; TypeScript results can differ between `tsc` versions, whose checks and error messages change.
 
 ## Usage
 

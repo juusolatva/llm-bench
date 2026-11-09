@@ -143,6 +143,35 @@ function harness_basics(): void {
   r.expectDestroyed(c2, 0);
 }
 
+function harness_pingCap(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  r.add(c1, "S", 0);
+  r.buffered(c1, 92);
+  r.ping(1);
+  r.expectWritten(c1, ["S", harness_PING]);
+  r.expectDestroyed(c1, 0);
+  r.buffered(c1, 93);
+  r.ping(2);
+  r.expectDestroyed(c1, 1);
+  r.expectWritten(c1, ["S", harness_PING]);
+  r.expectCounts([1, 0]);
+}
+
+function harness_blockedByPing(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  r.add(c1, "S", 0);
+  r.accept(c1, false);
+  r.ping(1);
+  r.expectWritten(c1, ["S", harness_PING]);
+  r.accept(c1, true);
+  r.broadcast("U1", 2);
+  r.expectWritten(c1, ["S", harness_PING]);
+  r.drained(c1, 3);
+  r.expectWritten(c1, ["S", harness_PING, "U1"]);
+}
+
 function harness_duplicateAdd(): void {
   const r = new harness_Run();
   const c1 = new harness_Client("c1");
@@ -234,6 +263,42 @@ function harness_blockedWithoutUpdates(): void {
   r.expectWritten(c1, ["S", "U1"]);
 }
 
+function harness_drainedWithoutMissing(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  r.broadcast("U0", 0);
+  r.accept(c1, false);
+  r.add(c1, "S", 1);
+  r.accept(c1, true);
+  r.drained(c1, 2);
+  r.expectWritten(c1, ["S"]);
+}
+
+function harness_blockedByUpdate(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  r.add(c1, "S", 0);
+  r.accept(c1, false);
+  r.broadcast("U1", 1);
+  r.expectWritten(c1, ["S", "U1"]);
+  r.accept(c1, true);
+  r.drained(c1, 2);
+  r.expectWritten(c1, ["S", "U1"]);
+}
+
+function harness_drainedTwice(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  r.accept(c1, false);
+  r.add(c1, "S", 0);
+  r.broadcast("U1", 1);
+  r.drained(c1, 2);
+  r.expectWritten(c1, ["S", "U1"]);
+  r.accept(c1, true);
+  r.drained(c1, 3);
+  r.expectWritten(c1, ["S", "U1"]);
+}
+
 function harness_timeout(): void {
   const r = new harness_Run();
   const c1 = new harness_Client("c1");
@@ -320,11 +385,16 @@ function harness_readd(): void {
 
 const harness_scenarios: (() => void)[] = [
   harness_basics,
+  harness_pingCap,
+  harness_blockedByPing,
   harness_duplicateAdd,
   harness_cap,
   harness_snapshotOverCap,
   harness_blocked,
   harness_blockedWithoutUpdates,
+  harness_drainedWithoutMissing,
+  harness_blockedByUpdate,
+  harness_drainedTwice,
   harness_timeout,
   harness_reblocked,
   harness_drainedOverCap,

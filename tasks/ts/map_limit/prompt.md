@@ -9,7 +9,7 @@ export function mapLimit<T, R>(
 ```
 
 It calls `fn(item, index)` once for each item, with at most `limit` calls pending at a time, and resolves with the results in the order of `items`:
-- If `limit` isn't a positive integer (for example 0, -1, 1.5, `NaN` or `Infinity`), the returned promise rejects with a `RangeError` and `fn` is never called. `mapLimit` itself doesn't throw.
+- If `limit` isn't a positive integer (for example 0, -1, 1.5, `NaN` or `Infinity`), the returned promise rejects with a `RangeError` and `fn` is never called, even when `items` is empty. `mapLimit` itself doesn't throw.
 - The calls for the first `min(limit, items.length)` items start before `mapLimit` returns.
 - Whenever a pending call settles, the call for the next item that hasn't started yet starts. So items start in index order, and `limit` calls are pending as long as items remain.
 - If a call rejects, the returned promise rejects with that same error at once, without waiting for the calls still pending, and no further calls start.
