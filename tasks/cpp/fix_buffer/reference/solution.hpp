@@ -10,7 +10,7 @@ public:
         std::memset(data_, 0, size_);
     }
     Buffer(const Buffer& other) : size_(other.size_), data_(new char[other.size_]) {
-        std::memcpy(data_, other.data_, size_);
+        if (size_) std::memcpy(data_, other.data_, size_);   // a moved-from source has a null data_
     }
     Buffer(Buffer&& other) noexcept
         : size_(std::exchange(other.size_, 0)), data_(std::exchange(other.data_, nullptr)) {}
