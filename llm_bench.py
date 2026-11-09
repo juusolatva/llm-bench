@@ -990,31 +990,34 @@ FLOAT_FIELDS = ("seconds", "load_seconds")
 RETRY_FINISHES = ("bad_response", "disconnected", "skipped")
 
 
+def results_row(raw, path):
+    """One results CSV record as a row: numeric fields converted, defaults for columns of newer versions, and
+    an old "backend" column renamed to "endpoint". Raises ValueError if a required column is missing."""
+    row = {k: v for k, v in raw.items() if k is not None}
+    if "endpoint" not in row and "backend" in row:
+        row["endpoint"] = row.pop("backend")
+    missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
+    if missing:
+        raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
+    for k in INT_FIELDS:
+        row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
+    for k in FLOAT_FIELDS:
+        row[k] = float(row.get(k) or 0)
+    for k in FIELDS:
+        if row.get(k) is None:
+            row[k] = ""
+    # Empty when the server didn't report it, so a missing count isn't read as zero.
+    row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
+    # Empty in rows from before the column existed; summarize falls back to an estimate for them.
+    row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
+    return row
+
+
 def read_results(path):
     """Rows of a results CSV, numeric fields converted. Files from older versions are accepted: missing
     columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint"."""
-    rows = []
     with open(path, newline="") as f:
-        for raw in csv.DictReader(f):
-            row = {k: v for k, v in raw.items() if k is not None}
-            if "endpoint" not in row and "backend" in row:
-                row["endpoint"] = row.pop("backend")
-            missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
-            if missing:
-                raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
-            for k in INT_FIELDS:
-                row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
-            for k in FLOAT_FIELDS:
-                row[k] = float(row.get(k) or 0)
-            for k in FIELDS:
-                if row.get(k) is None:
-                    row[k] = ""
-            # Empty when the server didn't report it, so a missing count isn't read as zero.
-            row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
-            # Empty in rows from before the column existed; summarize falls back to an estimate for them.
-            row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
-            rows.append(row)
-    return rows
+        return [results_row(raw, path) for raw in csv.DictReader(f)]
 
 
 def is_finished(row):
@@ -1154,16 +1157,9 @@ def ended_with_reply(row):
     return not (is_model_error(finish) or finish in ("timeout", "skipped"))
 
 
-def summarize(rows):
-    """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
-    (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
-    newest version is scored without that task. Several rows of a task are trials in different rounds.
-    Throughput ("tps") is completion tokens per second of the replies that reported them (usage_seconds); None
-    without any. Rows from before usage_seconds existed count if they ended with a reply that reported usage
-    (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
-    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
-    reported them (otherwise None: a partial count would be on another scale than completion tokens).
-    Returns (groups, dropped row count)."""
+def newest_rows(rows):
+    """{(endpoint, model, settings): {task: rows}} of the rows of each task's newest version, and the number of
+    rows of other versions that were dropped."""
     newest = newest_configs(rows)
     tasks_by_group = {}
     dropped = 0
@@ -1174,48 +1170,79 @@ def summarize(rows):
             continue
         group = tasks_by_group.setdefault((r["endpoint"], r["model"], settings), {})
         group.setdefault(r["task"], []).append(r)
+    return tasks_by_group, dropped
+
+
+def throughput(trials):
+    """Completion tokens per second of the replies that reported them, or None without any (see summarize)."""
+    measured = [(r["completion_tokens"], r["usage_seconds"]) for r in trials if r.get("usage_seconds") is not None]
+    measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
+                 and ended_with_reply(r) and r["completion_tokens"] > 0]
+    usage_seconds = sum(sec for _, sec in measured)
+    tokens = sum(tokens for tokens, _ in measured)
+    return tokens / usage_seconds if usage_seconds and tokens else None
+
+
+def mean_reasoning_tokens(tasks):
+    """Reasoning tokens per round, summed over tasks ({task: rows}), or None unless every trial with a reply
+    reported them (see summarize)."""
+    trials = [r for task_rows in tasks.values() for r in task_rows]
+    # Every trial with a reply needs a count, including one that got replies and then a request error (a
+    # request error ends a trial, so every attempt before the last got a reply): its completion tokens count,
+    # so its unknown reasoning tokens can't count as zero.
+    with_replies = [r for r in trials if ended_with_reply(r) or (r.get("attempts") or 0) > 1]
+    if not with_replies or any(r.get("reasoning_tokens") is None for r in with_replies):
+        return None
+    return sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
+               for task_rows in tasks.values())
+
+
+def add_task_scores(g, task, task_rows):
+    """Add one task's trials (rows from different rounds) to the group's scores, means and per-task counts."""
+    n = len(task_rows)
+    p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
+    p = sum(r["passed"] for r in task_rows) / n
+    g["p1"] += p1
+    g["pass"] += p
+    # Variance of one round's score: a sum of per-task Bernoulli variables (unbiased estimate).
+    correction = n / (n - 1) if n > 1 else 0.0
+    g["var1"] += p1 * (1 - p1) * correction
+    g["var"] += p * (1 - p) * correction
+    g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
+    g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
+    g["s"] += sum(r["seconds"] for r in task_rows) / n
+    g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
+                           "passed": sum(r["passed"] for r in task_rows),
+                           "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
+    g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
+    lang = g["langs"][task_rows[0]["lang"]]
+    lang[0] += p
+    lang[1] += 1
+    g["trials"].append(n)
+    if task_rows[-1].get("context"):
+        g["context"] = task_rows[-1]["context"]
+
+
+def summarize(rows):
+    """Aggregate rows per (endpoint, model, settings). Every model with the same settings is scored on the same
+    (newest) version of each task: rows of other versions are dropped, so a model without trials of a task's
+    newest version is scored without that task. Several rows of a task are trials in different rounds.
+    Throughput ("tps") is completion tokens per second of the replies that reported them (usage_seconds); None
+    without any. Rows from before usage_seconds existed count if they ended with a reply that reported usage
+    (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
+    Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
+    reported them (otherwise None: a partial count would be on another scale than completion tokens).
+    Returns (groups, dropped row count)."""
+    tasks_by_group, dropped = newest_rows(rows)
     groups = []
     for (endpoint, model, settings), tasks in tasks_by_group.items():
         g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
              "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
-             "trials": [], "tasks": set(tasks), "context": "unchecked", "rt": None, "per_task": {}}
-        trials = [r for task_rows in tasks.values() for r in task_rows]
-        measured = [(r["completion_tokens"], r["usage_seconds"]) for r in trials if r.get("usage_seconds") is not None]
-        measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
-                     and ended_with_reply(r) and r["completion_tokens"] > 0]
-        usage_seconds = sum(sec for _, sec in measured)
-        tokens = sum(tokens for tokens, _ in measured)
-        g["tps"] = tokens / usage_seconds if usage_seconds and tokens else None
-        # Every trial with a reply needs a count, including one that got replies and then a request error (a
-        # request error ends a trial, so every attempt before the last got a reply): its completion tokens count,
-        # so its unknown reasoning tokens can't count as zero.
-        with_replies = [r for r in trials if ended_with_reply(r) or (r.get("attempts") or 0) > 1]
-        if with_replies and all(r.get("reasoning_tokens") is not None for r in with_replies):
-            g["rt"] = sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
-                          for task_rows in tasks.values())
+             "trials": [], "tasks": set(tasks), "context": "unchecked", "per_task": {},
+             "tps": throughput([r for task_rows in tasks.values() for r in task_rows]),
+             "rt": mean_reasoning_tokens(tasks)}
         for task, task_rows in tasks.items():
-            n = len(task_rows)
-            p1 = sum(r["passed_on"] == 1 for r in task_rows) / n
-            p = sum(r["passed"] for r in task_rows) / n
-            g["p1"] += p1
-            g["pass"] += p
-            # Variance of one round's score: a sum of per-task Bernoulli variables (unbiased estimate).
-            correction = n / (n - 1) if n > 1 else 0.0
-            g["var1"] += p1 * (1 - p1) * correction
-            g["var"] += p * (1 - p) * correction
-            g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
-            g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
-            g["s"] += sum(r["seconds"] for r in task_rows) / n
-            g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
-                                   "passed": sum(r["passed"] for r in task_rows),
-                                   "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
-            g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
-            lang = g["langs"][task_rows[0]["lang"]]
-            lang[0] += p
-            lang[1] += 1
-            g["trials"].append(n)
-            if task_rows[-1].get("context"):
-                g["context"] = task_rows[-1]["context"]
+            add_task_scores(g, task, task_rows)
         groups.append(g)
     return groups, dropped
 
@@ -1248,36 +1275,39 @@ def group_label(g, layout):
     return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if layout["show_settings"] else "")
 
 
+def score_cell(value, var, n, repeated):
+    """A pass count: mean±sd/n with several rounds, otherwise count/n."""
+    return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
+
+
+def lang_cell(lang_counts, repeated):
+    """A per-language pass count: the mean with several rounds, otherwise the count, out of n."""
+    value, n = lang_counts
+    return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
+
+
+def summary_row(g, layout):
+    """One model's row of the summary table as display strings."""
+    repeated = layout["repeated"]
+    cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
+    if repeated:
+        lo, hi = min(g["trials"]), max(g["trials"])
+        cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
+    cells += [score_cell(g["p1"], g["var1"], g["n"], repeated), score_cell(g["pass"], g["var"], g["n"], repeated)]
+    cells += [lang_cell(g["langs"][lang], repeated) if lang in g["langs"] else "-" for lang in layout["langs"]]
+    cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
+    if layout["reasoning"]:
+        cells.append("-" if g["rt"] is None else f"{g['rt']:.0f}")
+    cells += [f"{g['s']:.1f}", "-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
+    return cells
+
+
 def summary_cells(groups, layout):
     """The summary as display strings: (header, rows, number of leading text columns)."""
-    repeated, langs = layout["repeated"], layout["langs"]
-
-    def score(value, var, n):
-        """A pass count: mean±sd/n with several rounds, otherwise count/n."""
-        return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
-
-    def lang_cell(lang_counts):
-        """A per-language pass count: the mean with several rounds, otherwise the count, out of n."""
-        value, n = lang_counts
-        return f"{value:.1f}/{n}" if repeated else f"{round(value)}/{n}"
-
     text = ["endpoint", "model"] + (["settings"] if layout["show_settings"] else [])
-    header = (text + (["rounds"] if repeated else []) + ["pass@1", "passed", *langs, "prompt_tok", "compl_tok"]
-              + (["reason_tok"] if layout["reasoning"] else []) + ["sec", "tok/s", "load"])
-    body = []
-    for g in groups:
-        cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
-        if repeated:
-            lo, hi = min(g["trials"]), max(g["trials"])
-            cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
-        cells += [score(g["p1"], g["var1"], g["n"]), score(g["pass"], g["var"], g["n"])]
-        cells += [lang_cell(g["langs"][lang]) if lang in g["langs"] else "-" for lang in langs]
-        cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
-        if layout["reasoning"]:
-            cells.append("-" if g["rt"] is None else f"{g['rt']:.0f}")
-        cells += [f"{g['s']:.1f}", "-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
-        body.append(cells)
-    return header, body, len(text)
+    header = (text + (["rounds"] if layout["repeated"] else []) + ["pass@1", "passed", *layout["langs"],
+              "prompt_tok", "compl_tok"] + (["reason_tok"] if layout["reasoning"] else []) + ["sec", "tok/s", "load"])
+    return header, [summary_row(g, layout) for g in groups], len(text)
 
 
 def summary_records(groups, layout):
