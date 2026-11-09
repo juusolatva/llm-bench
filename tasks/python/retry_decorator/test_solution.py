@@ -30,7 +30,7 @@ case = "retry(times=3, exceptions=(KeyError, ValueError), delay=1, backoff=3) on
 try:
     got = always()
 except (KeyError, ValueError) as e:
-    assert e is errs[-1] and len(errs) == 3, \
+    assert len(errs) == 3 and e is errs[-1], \
         f"{case}: raised {e!r} after {len(errs)} calls, want KeyError(2), the exception from the 3rd and last call"
 else:
     raise AssertionError(f"{case}: returned {got!r}, want the last KeyError re-raised")

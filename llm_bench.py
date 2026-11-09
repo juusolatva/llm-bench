@@ -841,7 +841,11 @@ def check_context(label, base, model, opts, stop, base_tokens):
         log(f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
             f"smaller. Raise the server's context length or lower --max-tokens / --attempts", err=True)
         return f"rejected:{error}"
-    got = usage.get("prompt_tokens") or 0
+    got = usage.get("prompt_tokens")
+    if got is None:   # no valid count this time: truncation can't be told apart from a working context
+        log(f"{label}: warning: can't check the context size (the server reports no token usage for the "
+            f"{need}-token prompt)", err=True)
+        return "unchecked"
     if got < CONTEXT_TOLERANCE * expected:
         log(f"{label}: warning: the context holds only about {got} of the {need} tokens needed; long replies and "
             f"retries will be cut off. Raise the server's context length or lower --max-tokens / --attempts",

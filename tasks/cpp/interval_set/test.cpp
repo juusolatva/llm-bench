@@ -34,18 +34,20 @@ static void harness_contains(const IntervalSet& s, long x, bool want, const char
     }
 }
 
-// The large-set test: fail as soon as it has taken 20 s, so a slow solution gets this message well before the
-// sandbox's time limit. `step` names the operations in progress.
+// The large-set test: called after each call, so a slow solution fails as soon as the test has taken 20 s, well
+// before the sandbox's time limit. `call` is the call that just returned, with i its loop index (-1: none).
 static std::chrono::steady_clock::time_point harness_t0;
-static void harness_check_time(const char* step) {
+static void harness_check_time(const char* call, long i) {
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - harness_t0).count();
-    if (secs >= 20) {
-        std::fprintf(stderr, "too slow: the large-set test (add [3i, 3i+1) for i < 200000, contains(3i) and "
-                     "contains(3i+1) for each i, remove [3i, 3i+1) for even i, then add [3i, 3i+7) for i = 1, 5, 9, ...) "
-                     "took over 20 s (stopped during %s); contains must run in O(log n), and add and remove in O(log n) plus "
-                     "O(1) per stored interval they merge or delete\n", step);
-        std::exit(1);
-    }
+    if (secs < 20) return;
+    char where[64] = "";
+    if (i >= 0) std::snprintf(where, sizeof where, " with i = %ld", i);
+    std::fprintf(stderr, "too slow: the large-set test (add(3i, 3i+1) for i = 0..199999; then contains(3i) and "
+                 "contains(3i+1) for each i; then remove(3i, 3i+1) for even i; then add(3i, 3i+7) for i = 1, 5, 9, ...; "
+                 "then intervals()) has taken %.1f s (limit 20 s) and the last call to return was %s%s; contains must "
+                 "run in O(log n), and add and remove in O(log n) plus O(1) per stored interval they merge or delete\n",
+                 secs, call, where);
+    std::exit(1);
 }
 
 int main() {
@@ -88,38 +90,40 @@ int main() {
 
     // Large set: add [3i, 3i+1) for i < 200000, remove the even i, then add [3i, 3i+7) for i = 1, 5, 9, ...
     // which merges each with the interval starting at 3(i+2). Expected: n/4 intervals [3i, 3i+7).
-    // The elapsed time is checked every 1000 operations.
     harness_t0 = std::chrono::steady_clock::now();
     IntervalSet big;
     const long n = 200000;
     for (long i = 0; i < n; i++) {
         big.add(3 * i, 3 * i + 1);
-        if (i % 1000 == 0) harness_check_time("the adds");
+        harness_check_time("add(3i, 3i+1)", i);
     }
     for (long i = 0; i < n; i++) {
-        if (i % 1000 == 0) harness_check_time("the contains calls");
-        if (!big.contains(3 * i) || big.contains(3 * i + 1)) {
+        bool in = big.contains(3 * i);
+        harness_check_time("contains(3i)", i);
+        bool after = big.contains(3 * i + 1);
+        harness_check_time("contains(3i+1)", i);
+        if (!in || after) {
             std::fprintf(stderr, "large set after adding [3i, 3i+1) for i < %ld: contains(%ld) = %d, contains(%ld) = %d, "
-                         "want 1 and 0\n", n, 3 * i, big.contains(3 * i), 3 * i + 1, big.contains(3 * i + 1));
+                         "want 1 and 0\n", n, 3 * i, in, 3 * i + 1, after);
             return 1;
         }
     }
     for (long i = 0; i < n; i += 2) {
         big.remove(3 * i, 3 * i + 1);
-        if (i % 1000 == 0) harness_check_time("the removes");
+        harness_check_time("remove(3i, 3i+1)", i);
     }
     for (long i = 1; i + 1 < n; i += 4) {
         big.add(3 * i, 3 * i + 7);
-        if (i % 1000 == 1) harness_check_time("the merging adds");
+        harness_check_time("add(3i, 3i+7)", i);
     }
     auto iv = big.intervals();
+    harness_check_time("intervals()", -1);
     harness_vec head(iv.begin(), iv.begin() + std::min<std::size_t>(iv.size(), 3));
     if (iv.size() != static_cast<std::size_t>(n / 4) || head != harness_vec{{3, 10}, {15, 22}, {27, 34}}) {
         std::fprintf(stderr, "large set: intervals() has %zu intervals starting %s, want %ld starting { [3,10) [15,22) [27,34) }\n",
                      iv.size(), harness_str(head).c_str(), n / 4);
         harness_fails++;
     }
-    harness_check_time("intervals()");
     if (harness_fails) return 1;
     std::puts("ok");
 }

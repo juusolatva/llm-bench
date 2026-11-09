@@ -45,7 +45,8 @@ def test_chat_refuses_redirect(mock_server, capsys):
     s = mock_server(replies=[Reply(status=307, body=b"", headers={"Location": "http://127.0.0.1:9/v1/chat"})])
     assert chat(s)[:4] == ("", None, {}, "http_307")
     assert "not followed" in capsys.readouterr().err
-    assert len(s.requests) == 1 and s.gets == []
+    assert len(s.requests) == 1
+    assert s.gets == []
 
 
 @pytest.mark.parametrize(("usage", "want"), [
@@ -230,6 +231,18 @@ def test_context_check_rejects_implausible_counts(mock_server, tmp_path, capsys,
     assert row["context"] == context
     assert len(s.probes) == 2   # warm-up and calibration: no filler prompt is built from these counts
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reported", [None, "4000", 4000.5])
+def test_context_check_unchecked_without_full_size_count(mock_server, tmp_path, capsys, reported):
+    # The calibration counts are fine, but the full-size prompt's count is missing or invalid: that's not "short:0".
+    full_size = (Reply(body=b'{"choices": [{"message": {"content": "OK"}, "finish_reason": "length"}]}')
+                 if reported is None else probe_usage(reported))
+    s = mock_server(replies=[""], probe_reply=[probe_usage(10), probe_usage(2010), full_size])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == "unchecked"
+    assert len(s.probes) == 3
+    assert "no token usage for the" in capsys.readouterr().err
 
 
 def test_context_check_disabled(mock_server, tmp_path):
