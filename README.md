@@ -1,6 +1,6 @@
 # llm-bench
 
-A dependency-free benchmark for checking how well LLMs write and fix code. It sends 28 small programming and terminal tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
+A dependency-free benchmark for checking how well LLMs write and fix code. It sends 32 small programming and terminal tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
 
 It works with any server that implements `GET /v1/models` and `POST /v1/chat/completions`, including Ollama, LM Studio, the llama.cpp server, vLLM and hosted OpenAI-compatible APIs.
 
@@ -15,6 +15,7 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 | C++ | `cpp_top_words`, `cpp_lru_cache`, `cpp_fix_buffer`, `cpp_interval_set` (built with ASan + UBSan) |
 | Rust | `rust_version`, `rust_csv_line`, `rust_fix_inventory`, `rust_topo_order` |
 | Go | `go_word_freq`, `go_kv_http`, `go_fix_count_lengths`, `go_parallel_map` (run with `-race`) |
+| TypeScript | `ts_parse_config`, `ts_map_limit`, `ts_broadcaster`, `ts_fix_route` (checked with `tsc --strict`) |
 | Bash | `bash_top_words`, `bash_rotate_backups`, `bash_fix_rename`, `bash_access_log` |
 | Terminal | `term_find_refs`, `term_set_port`, `term_fix_portable`, `term_compare_dirs` |
 
@@ -27,14 +28,14 @@ Each task is a directory under [`tasks/`](tasks):
 ```
 tasks/<lang>/<task>/
   prompt.md          # sent to the model as is
-  test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go or test.sh for other languages)
+  test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go, test.ts or test.sh for other languages)
   reference/
     solution.py      # a known-correct solution (not sent to the model), named like the model's solution file
 ```
 
 The task name is the language prefix plus the directory name, so `tasks/python/parse_duration` is `py_parse_duration`.
 
-A solution passes when its harness exits with status 0 and has printed its final line, `harness: all checks passed`, after its last check (Rust harnesses use libtest's `test result: ok.` summary instead). So a solution that ends the process early with status 0, for example with `sys.exit(0)` at import, fails instead of skipping the remaining checks. Rust solutions are built as a library crate and the harness as a separate test crate, so the functions and types a prompt asks for must be `pub`.
+A solution passes when its harness exits with status 0 and has printed its final line, `harness: all checks passed`, after its last check (Rust harnesses use libtest's `test result: ok.` summary instead). So a solution that ends the process early with status 0, for example with `sys.exit(0)` at import, fails instead of skipping the remaining checks. Rust solutions are built as a library crate and the harness as a separate test crate, so the functions and types a prompt asks for must be `pub`. TypeScript solutions are compiled together with the harness by `tsc --strict`, so a type error in either file fails the build, and the harness imports the names the prompt asks for (`import { route } from "./solution.js";`), which must be exported.
 
 ### Private tasks
 
@@ -45,14 +46,14 @@ Tasks published on the internet can end up in model training data. To benchmark 
 ./llm_bench.py localhost:11434 --tasks-dir ~/my-tasks --tasks-dir ./tasks
 ```
 
-Their harnesses must print the final line too (Rust harnesses import the solution's items from the `solution` crate: `use solution::parse_csv_line;`). A harness that ends with a plain `ok`, as before benchmark version 0.5.0, fails every solution.
+Their harnesses must print the final line too (Rust harnesses import the solution's items from the `solution` crate: `use solution::parse_csv_line;`, TypeScript harnesses from `./solution.js`). A harness that ends with a plain `ok`, as before benchmark version 0.5.0, fails every solution.
 
 ## Requirements
 
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`); 0.11 or newer for the Go build cache (see [Go tasks](#go-tasks)).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
-- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks. You only need the toolchains for the tasks you select with `--task`.
+- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5+), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
 
@@ -64,6 +65,8 @@ sudo apt install bubblewrap build-essential golang rustc gawk
 ```
 
 `rustc` installed via rustup also works: the sandbox exposes only the resolved toolchain directory, not `~/.cargo` or `~/.rustup`.
+
+Node and TypeScript can come from a version manager such as fnm or nvm, or from a system-wide install: the benchmark uses the `node` and `tsc` that come first on `PATH` (for example after `npm install -g typescript` in the Node installation you use) and exposes only the Node binary and the `typescript` package directory to the sandbox, not the rest of the installation, its global packages or your home directory. Version manager shims that replace `tsc` with a binary of their own (Volta, asdf) aren't supported. Tested with Node 24.22.1 and TypeScript 6.0.3; TypeScript results can differ between `tsc` versions, whose checks and error messages change.
 
 ## Usage
 
@@ -160,11 +163,15 @@ If the server itself becomes unreachable, the benchmark retries the request afte
 
 `go test -race` needs a race-instrumented build of the Go standard library, which takes about 35 s to compile from scratch on a 2-CPU sandbox: over half of the 60 s limit. So when Go tasks are selected, the benchmark first compiles it once into a temporary build cache (about 1–2 minutes, running only trusted code). Each sandbox then sees that cache through an overlay whose writes go to a private tmpfs, so attempts can't change it for each other. This needs bubblewrap 0.11+ and overlayfs in user namespaces (Linux 5.11+); otherwise the benchmark warns and every Go attempt compiles from scratch.
 
+## TypeScript tasks
+
+The solution and harness are compiled with a fixed `tsconfig.json` (`strict`, target ES2023, the ES2023 and DOM libraries, `"types": []`) and run with `node` as ES modules. There is no `@types/node`, so solutions can use the ECMAScript standard library and the web-standard globals Node also provides (`console`, `URL`, `setTimeout`, ...), but no Node modules or globals such as `process`; the prompts say so. `tsc` prints its errors with the offending source line, and the benchmark removes the color codes from that output before sending it back to the model.
+
 ## Sandbox
 
 Model-generated code never runs directly on the host. Each build and test runs inside:
 
-- a **bubblewrap** sandbox with all namespaces unshared (no network), all capabilities dropped and a cleared environment. Only `/usr`, `/bin`, `/lib*`, the Rust toolchain and a read-only copy of the task's files are visible, and everything is written to private tmpfs mounts.
+- a **bubblewrap** sandbox with all namespaces unshared (no network), all capabilities dropped and a cleared environment. Only `/usr`, `/bin`, `/lib*`, the Rust toolchain, the Node binary, the TypeScript package and a read-only copy of the task's files are visible, and everything is written to private tmpfs mounts.
 - a transient **systemd user unit** with a memory limit (2 GiB, no swap), a task limit (128), a CPU limit (200 %), a 60 s run time limit and a file-size limit. Before starting the sandbox, a small launcher checks that these cgroup limits were actually applied and refuses to run if not.
 
 If the sandbox is unavailable, the benchmark exits before contacting any server. There is no option to run without it.

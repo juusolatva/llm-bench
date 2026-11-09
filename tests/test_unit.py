@@ -350,6 +350,11 @@ def test_builtin_harnesses_print_the_final_line(task):
         assert test.count(done) == 1
     if task["lang"] == "go":
         assert "func TestMain(m *testing.M)" in test
+    if task["lang"] == "ts":
+        # Named imports from the compiled solution module only, so a missing export is a compile error naming it.
+        assert re.search(r'^import \{[^}]+\} from "\./solution\.js";$', test, re.MULTILINE)
+        assert "import *" not in test
+        assert "node:" not in test
 
 
 def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):
@@ -591,8 +596,8 @@ def bwrap_options(args, name, nargs):
 
 
 def test_sandbox_command_isolates_the_command(monkeypatch, tmp_path):
-    monkeypatch.setattr(llm_bench, "GO_CACHE", None)
-    monkeypatch.setattr(llm_bench, "RUST_SYSROOT", None)
+    for name in ("GO_CACHE", "RUST_SYSROOT", "NODE_BIN", "TS_PACKAGE"):   # set by check_toolchains in earlier tests
+        monkeypatch.setattr(llm_bench, name, None)
     _, bwrap = sandbox_args(tmp_path)
     for flag in ("--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
                  "--clearenv"):
