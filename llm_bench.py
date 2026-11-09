@@ -87,6 +87,7 @@ SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 # printed it, so a solution that ends the process early with status 0 (sys.exit(0) at import, exit(0) in C)
 # fails instead of skipping the remaining checks.
 HARNESS_FINAL_LINE = "harness: all checks passed"
+SH_HARNESS = "test.sh"   # the harness file of the Bash and terminal tasks
 # Per language: task name prefix, solution file, harness file, code block language tags (preferred by
 # extract_code), extra files, build/test commands, other tools the tasks rely on ("tools", checked by
 # check_toolchains like the commands), and "final_line": text the last command must print after its
@@ -111,11 +112,11 @@ LANGS = {
     "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
            "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
-    "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
-             "cmds": [["bash", "test.sh"]], "final_line": HARNESS_FINAL_LINE},
+    "bash": {"prefix": "bash", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
+             "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE},
     # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
-    "term": {"prefix": "term", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
-             "cmds": [["bash", "test.sh"]], "final_line": HARNESS_FINAL_LINE,
+    "term": {"prefix": "term", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
+             "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE,
              "tools": ("gawk", "grep", "sed", "find", "xargs", "sort", "comm", "diff", "cmp")},
 }
 
