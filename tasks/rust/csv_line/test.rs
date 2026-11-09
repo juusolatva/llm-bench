@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod harness_tests {
-    use super::*;
+    use solution::parse_csv_line;
     fn harness_ok(line: &str, want: &[&str]) {
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
         let got = parse_csv_line(line);

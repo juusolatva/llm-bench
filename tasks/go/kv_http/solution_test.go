@@ -4,10 +4,21 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 )
+
+// TestMain prints the harness's final line only after every test passed. The benchmark requires it, so a
+// solution that ends the process early (e.g. os.Exit(0) in an init function) fails.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		fmt.Println("harness: all checks passed")
+	}
+	os.Exit(code)
+}
 
 func harnessDo(h http.Handler, method, path, body string) (int, string) {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))

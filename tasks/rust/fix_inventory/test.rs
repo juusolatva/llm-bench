@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod harness_tests {
-    use super::*;
+    use solution::Inventory;
     /// Inventory wrapper that records the calls made so far, so failures can show them.
     struct HarnessInv { inv: Inventory, log: Vec<String> }
     impl HarnessInv {

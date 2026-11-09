@@ -7,8 +7,8 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import MODEL_DIR, Reply
 from conftest import MockServer as llm_bench_mock_server
-from conftest import Reply
 
 import llm_bench
 
@@ -160,15 +160,15 @@ def test_no_code_reply(mock_server, tmp_path):
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], attempts=2)
     assert (row["passed"], row["attempts"], row["fail_stage"]) == (0, 2, "no_code")
     assert "did not contain any code" in s.requests[1]["messages"][-1]["content"]
-    assert (tmp_path / "runs/test_model/py_t0/cfg/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
+    assert (tmp_path / f"runs/{MODEL_DIR}/py_t0/cfg/repeat_1/attempt_1/log.txt").read_text() == "[no code in reply]"
 
 
 def test_colliding_model_ids_get_separate_transcripts(mock_server, tmp_path):
     s = mock_server(models=[".foo", "_foo"], replies=["", ""])
     run_endpoint(s, tmp_path, models=[".foo", "_foo"], tasks=TASKS[:1])
     dirs = sorted(p.name for p in (tmp_path / "runs").iterdir())
-    assert len(dirs) == 2
-    assert all(d.startswith("_foo-") for d in dirs)
+    assert dirs == sorted(llm_bench.model_dirs([".foo", "_foo"]).values())
+    assert dirs[0] == "_foo" and dirs[1].startswith("_foo~")
     for d in dirs:
         assert (tmp_path / "runs" / d / "py_t0/cfg/repeat_1/attempt_1/response.md").is_file()
 
@@ -301,7 +301,7 @@ def test_repeat_runs_each_task_k_times_repeat_major(mock_server, tmp_path):
     s = mock_server(replies=[""] * 4)
     rows = run_endpoint(s, tmp_path, tasks=TASKS[:2], repeat=2)
     assert [(r["task"], r["repeat"]) for r in rows] == [("py_t0", 1), ("py_t1", 1), ("py_t0", 2), ("py_t1", 2)]
-    assert (tmp_path / "runs/test_model/py_t0/cfg/repeat_2/attempt_1").is_dir()
+    assert (tmp_path / f"runs/{MODEL_DIR}/py_t0/cfg/repeat_2/attempt_1").is_dir()
     assert len(s.probes) == 3   # one warm-up and context check per model, not per repeat
 
 
@@ -343,7 +343,7 @@ def test_transcripts_of_other_configs_are_kept(mock_server, tmp_path):
     rows = run_endpoint(s, tmp_path, tasks=[{**TASKS[0], "config": "other"}])   # e.g. --attempts changed
     assert rows[0]["repeat"] == 1   # numbering restarts for the new config, but in its own directory
     for config, reply in (("cfg", "first"), ("other", "second")):
-        response = tmp_path / f"runs/test_model/py_t0/{config}/repeat_1/attempt_1/response.md"
+        response = tmp_path / f"runs/{MODEL_DIR}/py_t0/{config}/repeat_1/attempt_1/response.md"
         assert response.read_text() == reply
 
 

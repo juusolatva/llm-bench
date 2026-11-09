@@ -1,3 +1,4 @@
+import hashlib
 import sys
 import time
 import urllib.error
@@ -41,25 +42,85 @@ def test_safe_name(name, want):
     assert llm_bench.safe_name(name) == want
 
 
-def test_model_dirs_disambiguate_collisions():
-    dirs = llm_bench.model_dirs([".foo", "_foo", "a/b", "qwen/qwen3:8b"])
-    assert dirs["qwen/qwen3:8b"] == "qwen_qwen3_8b"   # no collision: plain safe name
-    assert dirs["a/b"] == "a_b"
-    assert dirs[".foo"] != dirs["_foo"]
-    assert all(d.startswith("_foo-") and len(d) == len("_foo-") + 8 for d in (dirs[".foo"], dirs["_foo"]))
-    assert llm_bench.model_dirs([".foo", "_foo"]) == {k: dirs[k] for k in (".foo", "_foo")}   # deterministic
+def sha16(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def test_model_dirs_unique_even_against_hashed_names():
-    import hashlib
-    h = hashlib.sha256(b"a/b").hexdigest()
-    tricky = "a_b-" + h[:8]   # equals the hashed name "a/b" gets
-    dirs = llm_bench.model_dirs(["a/b", "a_b", tricky])
-    assert len(set(dirs.values())) == 3, dirs
-    chain = ["a/b", "a_b", "a_b-" + h[:8], "a_b-" + h[:16], "a_b-" + h]   # collides on every hash length
-    for models in (chain, chain[::-1]):
-        assert len(set(llm_bench.model_dirs(models).values())) == len(chain)
+def test_model_dirs_hash_unsafe_ids():
+    dirs = llm_bench.model_dirs([".foo", "_foo", "a/b", "a_b", "llama3.1-8b", "qwen/qwen3:8b"])
+    assert all(dirs[m] == m for m in ("_foo", "a_b", "llama3.1-8b"))   # already safe: unchanged
+    assert dirs[".foo"] == "_foo~" + sha16(".foo")
+    assert dirs["a/b"] == "a_b~" + sha16("a/b")
+    assert dirs["qwen/qwen3:8b"] == "qwen_qwen3_8b~" + sha16("qwen/qwen3:8b")
     assert llm_bench.model_dirs(["x", "x"]) == {"x": "x"}
+
+
+def test_model_dirs_dont_depend_on_the_selection():
+    """Runs that select different models never share a directory: a/b alone and a_b alone (and an ID equal to
+    another's hashed name) get different names, so a later run can't delete an earlier run's transcripts."""
+    hashed = llm_bench.model_dirs(["a/b"])["a/b"]
+    assert llm_bench.model_dirs(["a_b"]) == {"a_b": "a_b"}
+    assert llm_bench.model_dirs([hashed])[hashed] not in {hashed, "a_b"}   # "~" isn't safe, so it's hashed too
+    assert llm_bench.model_dirs(["a_b", "a/b", hashed])["a/b"] == hashed
+
+
+def test_model_dirs_number_hash_collisions(monkeypatch):
+    class FakeHash:
+        def hexdigest(self):
+            return "0" * 64
+    monkeypatch.setattr(llm_bench.hashlib, "sha256", lambda data: FakeHash())
+    assert llm_bench.model_dirs(["a/b", "a:b", "a b"]) == {
+        "a/b": "a_b~" + "0" * 16, "a:b": "a_b~" + "0" * 16 + "-2", "a b": "a_b~" + "0" * 16 + "-3"}
+
+
+@pytest.mark.parametrize(("out", "want"), [
+    ("$ ./t\nharness: all checks passed\n", True),
+    ("$ gcc x.c\n$ ./t\nstuff\nharness: all checks passed (3 checks)\nmore\n", True),   # a prefix match
+    ("$ ./t\n", False),                                                  # ended early
+    ("$ ./t\nall checks passed\n", False),
+    ("$ ./t\n  harness: all checks passed\n", False),                    # not at the start of the line
+    ("harness: all checks passed\n$ ./t\n", False),                      # only before the last command
+    ("$ gcc x.c\nharness: all checks passed\n", False),                  # the last command never started
+    ("$ ./t\nharness: all checks passed\n$ ./t\n", False),               # the last "$ ./t" line counts
+])
+def test_finished(out, want):
+    assert llm_bench.finished(out, "./t", llm_bench.HARNESS_FINAL_LINE) is want
+
+
+def test_finished_rust_summary_line():
+    out = "$ ./t\n\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored\n"
+    assert llm_bench.finished(out, "./t", llm_bench.LANGS["rust"]["final_line"])
+    assert not llm_bench.finished("$ ./t\n\nrunning 3 tests\n", "./t", llm_bench.LANGS["rust"]["final_line"])
+
+
+@pytest.mark.parametrize(("lang", "output", "passed"), [
+    ("python", "harness: all checks passed\n", True),
+    ("python", "", False),
+    ("rust", "running 3 tests\ntest result: ok. 3 passed\n", True),
+    ("rust", "running 3 tests\n", False),
+])
+def test_run_task_needs_the_final_line(monkeypatch, tmp_path, lang, output, passed):
+    """Exit status 0 passes only with the language's final line; without it the attempt fails at the test stage
+    and the output explains why. (run_cmd is stubbed: this checks run_task's logic, not the sandbox.)"""
+    spec = llm_bench.LANGS[lang]
+    rendered = [llm_bench.shlex.join(c) for c in spec["cmds"]]
+    out = "".join(f"$ {r}\n" for r in rendered) + output
+    calls = []
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: calls.append(cwd) or llm_bench.CmdResult(0, out, False))
+    task = {"lang": lang, "test": "the harness"}
+    ok, log, stage, cmd, fail_out = llm_bench.run_task(task, "the solution", tmp_path / "w")
+    assert ok is passed
+    assert (tmp_path / "w" / spec["sol"]).read_text() == "the solution"   # written separately, also for Rust
+    assert (tmp_path / "w" / spec["test"]).read_text() == "the harness"
+    assert log.endswith("[exit 0]")
+    if passed:
+        assert (stage, cmd, fail_out) == (None, None, None)
+    else:
+        assert (stage, cmd) == ("test", rendered[-1])
+        note = f'its final line "{spec["final_line"]}" was never printed'
+        assert note in fail_out
+        assert note in log
+        assert "Your solution failed. Output of `" in llm_bench.feedback(stage, cmd, fail_out)
 
 
 def test_extract_code_strips_think():
@@ -226,6 +287,24 @@ def test_builtin_tasks_are_consistent():
     assert all(n == 4 for n in per_lang.values())
     assert all(sum(t["lang"] == lang and "_fix_" in t["name"] for t in BUILTIN_TASKS) == 1
                for lang in llm_bench.LANGS)
+
+
+@pytest.mark.parametrize("task", BUILTIN_TASKS, ids=[t["name"] for t in BUILTIN_TASKS])
+def test_builtin_harnesses_print_the_final_line(task):
+    """Each harness prints its language's final line, which run_task requires (Rust: libtest prints it). Go
+    harnesses print it from TestMain; Rust harnesses import the solution's public items by name, so a missing
+    `pub` fails with rustc's "is private" error."""
+    test, done = task["test"], llm_bench.LANGS[task["lang"]]["final_line"]
+    if task["lang"] == "rust":
+        assert done == "test result: ok."
+        assert "super::" not in test
+        assert "use solution::" in test
+        assert "use solution::*" not in test
+    else:
+        assert done == llm_bench.HARNESS_FINAL_LINE
+        assert test.count(done) == 1
+    if task["lang"] == "go":
+        assert "func TestMain(m *testing.M)" in test
 
 
 def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):

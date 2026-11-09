@@ -41,7 +41,7 @@ from typing import NamedTuple
 # --- CONFIGURATION ---
 # Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
 # code extraction, build/test handling), so rows from different versions are never mixed.
-BENCH_VERSION = "0.4.0"
+BENCH_VERSION = "0.5.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
@@ -82,25 +82,35 @@ SYSTEM = (
 )
 
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+# The line a harness prints after its last check. A run passes only if the last command exits with status 0 and
+# printed it, so a solution that ends the process early with status 0 (sys.exit(0) at import, exit(0) in C)
+# fails instead of skipping the remaining checks.
+HARNESS_FINAL_LINE = "harness: all checks passed"
 # Per language: task name prefix, solution file, harness file, code block language tags (preferred by
-# extract_code), whether the harness is appended to the solution instead of written as its own file (Rust's
-# #[cfg(test)] module), extra files, build/test commands.
+# extract_code), extra files, build/test commands, and "final_line": the start of a line the last command must
+# print (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
+# directory mode (no package argument) because package mode hides a passing test binary's output. A Rust harness
+# is its own crate that uses the solution's public API, and libtest's summary line is its final line.
 LANGS = {
     "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py", "tags": ("python", "py", "python3"),
-               "cmds": [["python3", "test_solution.py"]]},
+               "cmds": [["python3", "test_solution.py"]], "final_line": HARNESS_FINAL_LINE},
     "c": {"prefix": "c", "sol": "solution.c", "test": "test.c", "tags": ("c", "h"),
           "cmds": [["gcc", "-std=gnu17", "-O1", "-g", "-Wall", *SAN, "solution.c", "test.c", "-o", "t", "-lm"],
-                   ["./t"]]},
+                   ["./t"]], "final_line": HARNESS_FINAL_LINE},
     "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp", "tags": ("cpp", "c++", "cxx", "cc", "hpp", "h++"),
             "cmds": [["g++", "-std=c++17", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"],
-                     ["./t"]]},
-    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "tags": ("rust", "rs"), "append": True,
-             "cmds": [["rustc", "--edition", "2021", "--test", "-O", "-o", "t", "lib.rs"], ["./t"]]},
+                     ["./t"]], "final_line": HARNESS_FINAL_LINE},
+    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "tags": ("rust", "rs"),
+             "cmds": [["rustc", "--edition", "2021", "--crate-type", "rlib", "--crate-name", "solution", "-O",
+                       "-o", "libsolution.rlib", "lib.rs"],
+                      ["rustc", "--edition", "2021", "--test", "-O", "--extern", "solution=libsolution.rlib",
+                       "-o", "t", "test.rs"],
+                      ["./t"]], "final_line": "test result: ok."},
     "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
-           "cmds": [["go", "test", "-race", "-count=1", "."]]},
+           "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
     "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
-             "cmds": [["bash", "test.sh"]]},
+             "cmds": [["bash", "test.sh"]], "final_line": HARNESS_FINAL_LINE},
 }
 
 # --------------------------------------------------------------------------------------------
@@ -176,17 +186,17 @@ def safe_name(name):
 
 
 def model_dirs(models):
-    """Transcript directory names for model IDs, unique per endpoint, so no model can delete or overwrite
-    another model's transcripts. Each ID gets safe_name(ID), or that plus "-" and a short hash of the ID if
-    another ID has the same safe name (".foo" and "_foo", "a/b" and "a_b"). A name still taken by an earlier
-    model (e.g. an ID that equals another's hashed name) gets "-2", "-3", ... appended."""
-    models = list(dict.fromkeys(models))
-    counts = Counter(safe_name(m) for m in models)
+    """Transcript directory names for model IDs, so no model can delete or overwrite another model's transcripts,
+    including models benchmarked in other runs. An ID that is already a safe name keeps it; any other ID gets
+    safe_name(ID) plus "~" and the first 16 hex digits of its SHA-256 ("a/b" becomes "a_b~<hash>"). The name doesn't
+    depend on which other models are selected, and "~" never occurs in a safe name, so a hashed name never equals a
+    plain one. Two IDs share a name only if their hashes collide; within one call the later one then gets "-2",
+    "-3", ... appended."""
     names, taken = {}, set()
-    for m in models:
+    for m in dict.fromkeys(models):
         name = safe_name(m)
-        if counts[name] > 1:
-            name = f"{name}-{hashlib.sha256(m.encode()).hexdigest()[:8]}"
+        if name != m:
+            name = f"{name}~{hashlib.sha256(m.encode()).hexdigest()[:16]}"
         candidate, k = name, 2
         while name in taken:
             name, k = f"{candidate}-{k}", k + 1
@@ -567,20 +577,31 @@ def feedback(stage, cmd, out):
             "Fix the problem. Reply with exactly one fenced code block containing the complete corrected file.")
 
 
+EARLY_EXIT_NOTE = ('[the test harness exited with status 0 before it finished: its final line "{final_line}" was never '
+                   "printed. Does your code end the process, e.g. with exit(), sys.exit(), os.Exit() or "
+                   "std::process::exit()?]")
+
+
+def finished(out, last_cmd, final_line):
+    """Whether a line of `out` after the last "$ <last_cmd>" line starts with `final_line`: the harness got through
+    all its checks instead of the process ending early."""
+    lines = out.splitlines()
+    start = max((i for i, line in enumerate(lines) if line == f"$ {last_cmd}"), default=None)
+    return start is not None and any(line.startswith(final_line) for line in lines[start + 1:])
+
+
 def run_task(task, code, workdir):
     """Write solution + harness into workdir, build and test in one sandbox.
     Returns (passed, log, fail_stage, failing command, its output); the last three are None on success.
-    fail_stage is "build" (a command before the last failed), "test" (the last command failed) or
-    "time_limit" (the sandbox was killed at CMD_TIMEOUT_S)."""
+    Passing needs exit status 0 and the language's final line from the last command (see finished()).
+    fail_stage is "build" (a command before the last failed), "test" (the last command failed, or exited with
+    status 0 without the final line) or "time_limit" (the sandbox was killed at CMD_TIMEOUT_S)."""
     lang = LANGS[task["lang"]]
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
-    if lang.get("append"):
-        (workdir / lang["sol"]).write_text(code + "\n\n" + task["test"])
-    else:
-        (workdir / lang["sol"]).write_text(code)
-        (workdir / lang["test"]).write_text(task["test"])
+    (workdir / lang["sol"]).write_text(code)
+    (workdir / lang["test"]).write_text(task["test"])
     for name, content in lang.get("extra", {}).items():
         (workdir / name).write_text(content)
     rendered = [shlex.join(cmd) for cmd in lang["cmds"]]
@@ -590,9 +611,12 @@ def run_task(task, code, workdir):
     # Build and execute in one sandbox so private compiler outputs persist only
     # for this attempt. Parent-owned source/transcript files are read-only inputs.
     rc, out, timed_out = run_cmd([BASH, "-ec", "\n".join(script)], workdir)
-    run_log = f"{out}\n[exit {rc}]"
     if rc == 0:
-        return True, run_log, None, None, None
+        if finished(out, rendered[-1], lang["final_line"]):
+            return True, f"{out}\n[exit {rc}]", None, None, None
+        out += "\n" + EARLY_EXIT_NOTE.format(final_line=lang["final_line"])
+        return False, f"{out}\n[exit {rc}]", "test", rendered[-1], out
+    run_log = f"{out}\n[exit {rc}]"
     # The failing command is the last one whose "$ cmd" marker appears in the output.
     markers = {f"$ {r}": i for i, r in enumerate(rendered)}
     index = max((markers[line] for line in out.splitlines() if line in markers), default=0)

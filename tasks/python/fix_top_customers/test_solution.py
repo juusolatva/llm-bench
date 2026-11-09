@@ -17,4 +17,4 @@ harness_check([("zed", 2), ("amy", 2), ("kim", 2), ("bo", 3)], [("bo", 3), ("amy
 harness_check([], [])
 got = top_customers((r for r in [("y", 1), ("x", 1)]), n=1)
 assert got == [("x", 1)], f"top_customers(<generator of [('y', 1), ('x', 1)]>, n=1): got {got!r}, want [('x', 1)]"
-print("ok")
+print("harness: all checks passed")

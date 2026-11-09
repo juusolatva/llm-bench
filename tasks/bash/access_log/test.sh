@@ -18,4 +18,4 @@ EOF
 printf '%s\n' '200 3' '304 1' '404 1' '500 1' 'total_bytes 3912' > "$T/want"
 bash "$SOL" "$T/access log" > "$T/out" 2> "$T/err" < /dev/null || { rc=$?; show_input; fail "bash solution.sh 'access log': exit status $rc, want 0 (stderr: $(cat "$T/err"))"; }
 cmp -s "$T/out" "$T/want" || { show_input; diff "$T/want" "$T/out" >&2; fail "bash solution.sh 'access log': wrong output (diff above: < want, > got)"; }
-echo ok
+echo 'harness: all checks passed'

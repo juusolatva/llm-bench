@@ -4,6 +4,12 @@
 int parse_kv(const char *line, char *key, size_t keysz, char *val, size_t valsz);
 
 static int fails;
+/* malloc that exits instead of returning NULL, so a failed allocation isn't blamed on the solution. */
+static void *harness_alloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { fputs("harness: allocation failed\n", stderr); exit(2); }
+    return p;
+}
 /* Print s in double quotes with control characters escaped (\n, \r, \t, \xNN), so whitespace in inputs is visible. */
 static void harness_put_escaped(const char *s) {
     fputc('"', stderr);
@@ -19,8 +25,8 @@ static void harness_put_escaped(const char *s) {
 }
 static void t(const char *line, size_t ks, size_t vs, int want, const char *wk, const char *wv) {
     size_t n = strlen(line) + 1;
-    char *l = malloc(n); memcpy(l, line, n);
-    char *k = malloc(ks), *v = malloc(vs);   /* exact sizes: ASan catches overflows */
+    char *l = harness_alloc(n); memcpy(l, line, n);
+    char *k = harness_alloc(ks), *v = harness_alloc(vs);   /* exact sizes: ASan catches overflows */
     int r = parse_kv(l, k, ks, v, vs);
     if (r == 1 && (!memchr(k, '\0', ks) || !memchr(v, '\0', vs))) {
         fputs("parse_kv(", stderr);
@@ -76,6 +82,6 @@ int main(void) {
     t("k=abc", 4, 4, 1, "k", "abc");
     t("k=abcd", 4, 4, -1, 0, 0);
     if (fails) return 1;
-    puts("ok");
+    puts("harness: all checks passed");
     return 0;
 }

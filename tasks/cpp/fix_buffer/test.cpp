@@ -101,5 +101,5 @@ int main() {
     HARNESS_CHECK(w.size() == 200 && harness_at(w[10], 0) == 5 && harness_at(w[10], 15) == 6,
                   "copy w = v of that vector: w.size() = %zu, w[10][0] = %d, w[10][15] = %d; want 200, 5 and 6",
                   w.size(), w.size() > 10 ? harness_at(w[10], 0) : -1, w.size() > 10 ? harness_at(w[10], 15) : -1);
-    std::puts("ok");
+    std::puts("harness: all checks passed");
 }

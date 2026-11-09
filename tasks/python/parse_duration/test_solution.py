@@ -12,4 +12,4 @@ for s in ["", "h", "10", "1x", "1m1h", "1h1h", "1h 30m", "-5s", "1.5h", "1hm", "
     except ValueError:
         continue
     raise AssertionError(f"parse_duration({s!r}): returned {got!r}, want ValueError")
-print("ok")
+print("harness: all checks passed")

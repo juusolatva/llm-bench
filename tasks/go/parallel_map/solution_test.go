@@ -3,11 +3,23 @@ package solution
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// TestMain prints the harness's final line only after every test passed. The benchmark requires it, so a
+// solution that ends the process early (e.g. os.Exit(0) in an init function) fails.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		fmt.Println("harness: all checks passed")
+	}
+	os.Exit(code)
+}
 
 // harnessTracker counts calls of f: started, currently active and the peak number active at once.
 type harnessTracker struct {
@@ -141,20 +153,18 @@ func TestErrorCancelsAndStops(t *testing.T) {
 func TestErrorWithOneWorker(t *testing.T) {
 	const cs = "ParallelMap([0 1 2 3 4], workers 1) with f always failing"
 	boom := errors.New("boom")
-	var calls, startedCanceled atomic.Int64
+	var calls atomic.Int64
 	got, err := ParallelMap(context.Background(), []int{0, 1, 2, 3, 4}, 1, func(ctx context.Context, x int) (int, error) {
 		calls.Add(1)
-		if ctx.Err() != nil {
-			startedCanceled.Add(1)
-		}
 		return 0, boom
 	})
 	if !errors.Is(err, boom) || got != nil {
 		t.Fatalf("%s: got %v, %v; want nil and boom", cs, got, err)
 	}
-	// As above, one call that races with recording the first error is tolerated.
-	if n := startedCanceled.Load(); n > 1 {
-		t.Fatalf("%s: f was called %d times, %d of them after the error (their context was already canceled); no new calls may start after an error", cs, calls.Load(), n)
+	// The first call fails, so no other call may start. As above, one call that races with recording the
+	// error is tolerated.
+	if n := calls.Load(); n > 2 {
+		t.Fatalf("%s: f was called %d times, want at most 2 (the first call fails, and no new calls may start after an error)", cs, n)
 	}
 }
 
