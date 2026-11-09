@@ -124,35 +124,50 @@ DEFAULT_TASKS_DIR = Path(__file__).resolve().parent / "tasks"
 TASK_DIR_RE = re.compile(r"[a-z0-9][a-z0-9_]*")
 
 
+def _visible_dirs(path):
+    """The subdirectories of path that aren't hidden ("." or "_" prefix), sorted by name."""
+    return sorted(p for p in path.iterdir() if p.is_dir() and p.name[0] not in "._")
+
+
+def _check_lang_dirs(root):
+    """Raise ValueError if root is missing or has a visible subdirectory that isn't a LANGS key."""
+    if not root.is_dir():
+        raise ValueError(f"task directory not found: {root}")
+    for entry in _visible_dirs(root):
+        if entry.name not in LANGS:
+            raise ValueError(f"{entry}: unknown language directory (known: {', '.join(LANGS)})")
+
+
+def _load_task(taskdir, lang, seen):
+    """Read one task directory into a task dict and record its name in seen (name -> directory).
+    Raises ValueError for a bad directory name, missing or empty files, or a duplicate task name."""
+    spec = LANGS[lang]
+    if not TASK_DIR_RE.fullmatch(taskdir.name):
+        raise ValueError(f"{taskdir}: task directory names may contain only a-z, 0-9 and _")
+    prompt_file, test_file = taskdir / "prompt.md", taskdir / spec["test"]
+    for f in (prompt_file, test_file):
+        if not f.is_file():
+            raise ValueError(f"{taskdir}: missing {f.name}")
+    name = f"{spec['prefix']}_{taskdir.name}"
+    if name in seen:
+        raise ValueError(f"duplicate task {name}: {seen[name]} and {taskdir}")
+    seen[name] = taskdir
+    prompt = prompt_file.read_text().strip()
+    if not prompt:
+        raise ValueError(f"{prompt_file}: empty prompt")
+    return {"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text()}
+
+
 def load_tasks(roots):
     """Load the tasks under each root directory. Tasks are ordered by language (LANGS order), then by
     root, then by directory name. Raises ValueError for malformed layouts or duplicate task names."""
     tasks, seen = [], {}
     for root in map(Path, roots):
-        if not root.is_dir():
-            raise ValueError(f"task directory not found: {root}")
-        for entry in sorted(root.iterdir()):
-            if entry.is_dir() and entry.name[0] not in "._" and entry.name not in LANGS:
-                raise ValueError(f"{entry}: unknown language directory (known: {', '.join(LANGS)})")
-        for lang, spec in LANGS.items():
+        _check_lang_dirs(root)
+        for lang in LANGS:
             langdir = root / lang
-            if not langdir.is_dir():
-                continue
-            for taskdir in sorted(p for p in langdir.iterdir() if p.is_dir() and p.name[0] not in "._"):
-                if not TASK_DIR_RE.fullmatch(taskdir.name):
-                    raise ValueError(f"{taskdir}: task directory names may contain only a-z, 0-9 and _")
-                prompt_file, test_file = taskdir / "prompt.md", taskdir / spec["test"]
-                for f in (prompt_file, test_file):
-                    if not f.is_file():
-                        raise ValueError(f"{taskdir}: missing {f.name}")
-                name = f"{spec['prefix']}_{taskdir.name}"
-                if name in seen:
-                    raise ValueError(f"duplicate task {name}: {seen[name]} and {taskdir}")
-                seen[name] = taskdir
-                prompt = prompt_file.read_text().strip()
-                if not prompt:
-                    raise ValueError(f"{prompt_file}: empty prompt")
-                tasks.append({"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text()})
+            if langdir.is_dir():
+                tasks.extend(_load_task(taskdir, lang, seen) for taskdir in _visible_dirs(langdir))
     order = list(LANGS)
     return sorted(tasks, key=lambda t: order.index(t["lang"]))   # stable: keeps root and name order
 
