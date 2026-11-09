@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go and Bash tasks.
+"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, Bash and terminal tasks.
 
 Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM Studio,
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
@@ -7,7 +7,8 @@ Tasks are loaded from tasks/<lang>/<task>/ next to this script (see load_tasks).
 Output: results_<endpoint>.csv (one row per trial: one model on one task) and
 runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
-toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils).
+toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils; GNU diffutils, grep, sed and
+gawk for terminal tasks).
 Run with --help for usage.
 """
 import argparse
@@ -87,7 +88,8 @@ SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 # fails instead of skipping the remaining checks.
 HARNESS_FINAL_LINE = "harness: all checks passed"
 # Per language: task name prefix, solution file, harness file, code block language tags (preferred by
-# extract_code), extra files, build/test commands, and "final_line": text the last command must print after its
+# extract_code), extra files, build/test commands, other tools the tasks rely on ("tools", checked by
+# check_toolchains like the commands), and "final_line": text the last command must print after its
 # last check (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
 # directory mode (no package argument) because package mode hides a passing test binary's output. A Rust harness
 # is its own crate that uses the solution's public API, and libtest's summary line is its final line.
@@ -111,6 +113,10 @@ LANGS = {
            "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
     "bash": {"prefix": "bash", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
              "cmds": [["bash", "test.sh"]], "final_line": HARNESS_FINAL_LINE},
+    # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
+    "term": {"prefix": "term", "sol": "solution.sh", "test": "test.sh", "tags": ("bash", "sh", "shell"),
+             "cmds": [["bash", "test.sh"]], "final_line": HARNESS_FINAL_LINE,
+             "tools": ("gawk", "grep", "sed", "find", "xargs", "sort", "comm", "diff", "cmp")},
 }
 
 # --------------------------------------------------------------------------------------------
@@ -661,8 +667,9 @@ def check_toolchains(tasks):
     """Verify the toolchains needed by the selected tasks only."""
     global RUST_SYSROOT
     langs = {t["lang"] for t in tasks}
-    missing = sorted({cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"]
-                      if not cmd[0].startswith("./") and shutil.which(cmd[0]) is None})
+    needed = {cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"] if not cmd[0].startswith("./")}
+    needed |= {tool for lang in langs for tool in LANGS[lang].get("tools", ())}
+    missing = sorted(name for name in needed if shutil.which(name) is None)
     if missing:
         sys.exit(f"missing toolchains on PATH: {', '.join(missing)}\n"
                  f"install them or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")

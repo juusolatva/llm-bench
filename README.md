@@ -1,6 +1,6 @@
 # llm-bench
 
-A dependency-free benchmark for checking how well LLMs write and fix code. It sends 24 small programming tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
+A dependency-free benchmark for checking how well LLMs write and fix code. It sends 28 small programming and terminal tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
 
 It works with any server that implements `GET /v1/models` and `POST /v1/chat/completions`, including Ollama, LM Studio, the llama.cpp server, vLLM and hosted OpenAI-compatible APIs.
 
@@ -16,6 +16,9 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 | Rust | `rust_version`, `rust_csv_line`, `rust_fix_inventory`, `rust_topo_order` |
 | Go | `go_word_freq`, `go_kv_http`, `go_fix_count_lengths`, `go_parallel_map` (run with `-race`) |
 | Bash | `bash_top_words`, `bash_rotate_backups`, `bash_fix_rename`, `bash_access_log` |
+| Terminal | `term_find_refs`, `term_set_port`, `term_fix_portable`, `term_compare_dirs` |
+
+Bash tasks ask for reusable scripts: arguments, usage errors, exit codes and the Bash language itself. Terminal tasks ask for the one-off commands you would type to search, edit and compare files with everyday tools (grep, sed, awk, find, sort, comm, xargs), including fixing commands written for macOS so they work with the GNU tools. They run with no arguments in a prepared directory with tricky file names (spaces, quotes, leading dashes, hidden files) and allow no other interpreters.
 
 The tests check only what the prompt states. Run `./llm_bench.py --list-tasks` to list them.
 
@@ -49,7 +52,7 @@ Their harnesses must print the final line too (Rust harnesses import the solutio
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`); 0.11 or newer for the Go build cache (see [Go tasks](#go-tasks)).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
-- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils. You only need the toolchains for the tasks you select with `--task`.
+- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
 
@@ -57,7 +60,7 @@ Example installs:
 # Fedora
 sudo dnf install bubblewrap gcc gcc-c++ libasan libubsan golang rust
 # Debian / Ubuntu
-sudo apt install bubblewrap build-essential golang rustc
+sudo apt install bubblewrap build-essential golang rustc gawk
 ```
 
 `rustc` installed via rustup also works: the sandbox exposes only the resolved toolchain directory, not `~/.cargo` or `~/.rustup`.

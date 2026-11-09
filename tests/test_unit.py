@@ -285,6 +285,14 @@ def test_default_model_filter(model, keep):
     assert llm_bench.default_model_filter(model) is keep
 
 
+def test_check_toolchains_checks_the_tools_of_selected_languages(monkeypatch):
+    """A language's "tools" are checked like its commands, and only for the selected tasks' languages."""
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name: None if name in ("gawk", "go") else f"/usr/bin/{name}")
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: gawk\n"):
+        llm_bench.check_toolchains([{"lang": "term"}, {"lang": "bash"}])
+    llm_bench.check_toolchains([{"lang": "bash"}, {"lang": "python"}])   # gawk and go aren't needed
+
+
 BUILTIN_TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
 
 
@@ -466,7 +474,7 @@ def test_cli_tasks_dir(monkeypatch, capsys, tmp_path):
     assert capsys.readouterr().out.split() == ["py_mine", "python"]
     run_main(monkeypatch, "--list-tasks", "--tasks-dir", str(tmp_path),
              "--tasks-dir", str(llm_bench.DEFAULT_TASKS_DIR))
-    assert len(capsys.readouterr().out.splitlines()) == 25
+    assert len(capsys.readouterr().out.splitlines()) == 1 + len(BUILTIN_TASKS)
 
 
 def test_cli_bad_tasks_dir(monkeypatch, tmp_path):
