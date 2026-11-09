@@ -1,6 +1,8 @@
 """Request handling and the per-endpoint loop. No sandbox needed: no reply here contains code to run."""
 import csv
 import json
+import re
+import shlex
 import socket
 import threading
 import time
@@ -830,3 +832,86 @@ def test_durations_ignore_wall_clock_changes(monkeypatch, mock_server, tmp_path)
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
     assert 0 <= row["usage_seconds"] <= row["seconds"] + 0.005 < 5   # seconds is rounded to 0.01 s, usage_seconds to 0.1 ms
     assert 0 <= row["load_seconds"] < 5
+
+
+GOOD_REPLY = "```python\ndef parse_duration(s):\n    return 0\n```"
+
+
+@pytest.fixture
+def no_sandbox(monkeypatch):
+    """Run main() without bwrap: skip the sandbox and toolchain checks, and make every build and test pass
+    (run_task's own logic is checked in tests/test_unit.py, the real sandbox in tests/test_e2e.py)."""
+    monkeypatch.setattr(llm_bench, "check_sandbox", lambda: None)
+    monkeypatch.setattr(llm_bench, "check_toolchains", lambda tasks: None)
+    def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
+        # The script echoes "$ CMD" before each command (printf '%s\n' '$ CMD'); print those markers.
+        out = "".join(shlex.split(line)[2] + "\n" for line in cmd[-1].splitlines() if line.startswith("printf "))
+        return llm_bench.CmdResult(0, out + llm_bench.HARNESS_FINAL_LINE + "\n", False)
+    monkeypatch.setattr(llm_bench, "run_cmd", run_cmd)
+
+
+def run_main(monkeypatch, tmp_path, *argv):
+    monkeypatch.setattr("sys.argv", ["llm_bench.py", *argv, "-o", str(tmp_path)])
+    llm_bench.main()
+
+
+def test_main_runs_the_selected_tasks(monkeypatch, tmp_path, capsys, mock_server, no_sandbox):
+    s = mock_server(models=["test/model", "nomic-embed-text"], replies=["", GOOD_REPLY])
+    run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration", "--task", "nope_*", "-t", "x")
+    (row,) = read_csv(tmp_path / "results_mock_x.csv")   # the embedding model is left out by default
+    assert (row["model"], row["passed"], row["passed_on"]) == ("test/model", "1", "2")
+    captured = capsys.readouterr()
+    assert "task pattern 'nope_*' matched no task" in captured.err
+    assert "test/model" in captured.out   # the summary
+
+
+def test_main_resume_summarizes_earlier_rows(monkeypatch, tmp_path, mock_server, no_sandbox):
+    s = mock_server(replies=[GOOD_REPLY, GOOD_REPLY])
+    run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration")
+    summarized = []
+    monkeypatch.setattr(llm_bench, "print_summary", summarized.append)
+    run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration", "--repeat", "2", "--resume")
+    assert len(s.requests) == 2   # the resumed run adds only the second repeat
+    (rows,) = summarized   # but its summary includes the first run's row too
+    assert sorted(int(r["repeat"]) for r in rows) == [1, 2]
+
+
+def test_main_warns_about_unmatched_model_patterns(monkeypatch, tmp_path, capsys, mock_server, no_sandbox):
+    s = mock_server()
+    with pytest.raises(SystemExit, match="no models selected"):
+        run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration", "--model", "nope*")
+    assert "pattern 'nope*' matched no model" in capsys.readouterr().err
+
+
+def test_main_prepares_the_go_cache_for_go_tasks(monkeypatch, tmp_path, mock_server, no_sandbox):
+    prepared = []
+    monkeypatch.setattr(llm_bench, "prepare_go_cache", prepared.append)
+    s = mock_server(replies=[""])
+    run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "go_*", "--attempts", "1", "--model", "test/*")
+    (directory,) = prepared
+    assert not llm_bench.Path(directory).exists()   # removed after the run
+
+
+def test_run_all_stops_on_ctrl_c(monkeypatch, tmp_path, capsys):
+    started = threading.Event()
+    def run_endpoint(name, base, models, tasks, args, csv_path, runs_dir, rows, stop):
+        rows.append({"endpoint": name, "model": "m", "task": "py_t", "lang": "python", "passed": 1, "passed_on": 1,
+                     "prompt_tokens": 10, "completion_tokens": 5, "seconds": 1.0})
+        started.set()
+        stop.wait(10)
+    def join(self, timeout=None):
+        started.wait(5)
+        raise KeyboardInterrupt
+    stopped = []
+    monkeypatch.setattr(llm_bench, "run_endpoint", run_endpoint)
+    monkeypatch.setattr(llm_bench.threading.Thread, "join", join)
+    monkeypatch.setattr(llm_bench, "stop_active_units", lambda: stopped.append(True))
+    args = SimpleNamespace(resume=False)
+    with pytest.raises(SystemExit) as exc:
+        llm_bench.run_all(args, {"e": ["m"]}, {"e": "http://localhost:1/v1"}, [],
+                          {"e": (tmp_path / "r.csv", tmp_path / "runs")})
+    assert exc.value.code == 130
+    assert stopped == [True]
+    captured = capsys.readouterr()
+    assert "interrupted" in captured.err
+    assert re.search(r"^e +m +1/1", captured.out, re.M)   # the summary of the trials finished so far

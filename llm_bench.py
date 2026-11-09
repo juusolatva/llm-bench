@@ -456,16 +456,9 @@ def sandbox_path_dirs():
     return [*system_path, "/usr/bin", "/bin"]
 
 
-def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
-    """Run only inside a mandatory namespace sandbox and bounded systemd unit.
-    timeout: run time limit (default CMD_TIMEOUT_S). go_cache_rw: host directory mounted writable as the Go
-    build cache, used only to warm GO_CACHE with trusted code; otherwise GO_CACHE (if set) is mounted as an
-    overlay whose writes go to a private tmpfs."""
-    timeout = timeout or CMD_TIMEOUT_S
-    tools = {name: shutil.which(name) for name in ("bwrap", "systemd-run", "systemctl")}
-    if not all(tools.values()):
-        return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
-    unit = f"llm-bench-{uuid.uuid4().hex}.service"
+def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
+    """The command line that runs cmd in a bwrap sandbox inside the bounded systemd unit `unit` (see run_cmd).
+    tools maps "bwrap" and "systemd-run" to their paths."""
     sandbox = [tools["bwrap"], "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
                "--new-session", "--cap-drop", "ALL", "--clearenv"]
     # Expose runtime/toolchain files, not all of /etc, /home, /run or the host root.
@@ -507,6 +500,20 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
         sys.executable, "-c", CGROUP_GUARD, str(SANDBOX_MEMORY_BYTES),
         str(SANDBOX_TASKS), *sandbox,
     ]
+    return command
+
+
+def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
+    """Run only inside a mandatory namespace sandbox and bounded systemd unit.
+    timeout: run time limit (default CMD_TIMEOUT_S). go_cache_rw: host directory mounted writable as the Go
+    build cache, used only to warm GO_CACHE with trusted code; otherwise GO_CACHE (if set) is mounted as an
+    overlay whose writes go to a private tmpfs."""
+    timeout = timeout or CMD_TIMEOUT_S
+    tools = {name: shutil.which(name) for name in ("bwrap", "systemd-run", "systemctl")}
+    if not all(tools.values()):
+        return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
+    unit = f"llm-bench-{uuid.uuid4().hex}.service"
+    command = sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw)
     # A regular file plus hard LimitFSIZE bounds output without an unbounded
     # communicate() buffer. Read only a bounded prefix back into the parent.
     with tempfile.TemporaryFile() as output:
@@ -530,6 +537,8 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
                     with ACTIVE_UNITS_LOCK:
                         ACTIVE_UNITS.discard(unit)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            with ACTIVE_UNITS_LOCK:   # also when the unit never started (Popen failed)
+                ACTIVE_UNITS.discard(unit)
             return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
         # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
         timed_out = rc != 0 and time.monotonic() - t0 >= timeout
