@@ -20,4 +20,4 @@ bash "$SOL" empty txt log > out 2> err < /dev/null
 rc=$?
 [ "$rc" -eq 0 ] || fail "$case2: exit status $rc, want 0"
 [ ! -s err ] || fail "$case2: stderr not empty: $(cat err)"
-echo ok
+echo 'harness: all checks passed'

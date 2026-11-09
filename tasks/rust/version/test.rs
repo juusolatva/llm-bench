@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod harness_tests {
-    use super::*;
+    use solution::Version;
     fn v(a: u64, b: u64, c: u64) -> Version { Version { major: a, minor: b, patch: c } }
     /// Compiles only if Version implements the traits the prompt lists (Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash).
     fn harness_has_traits<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash>() {}

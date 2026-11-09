@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod harness_tests {
-    use super::*;
+    use solution::topo_order;
 
     fn harness_check(n: usize, edges: &[(usize, usize)], want: &[usize]) {
         let got = topo_order(n, edges);

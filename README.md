@@ -31,6 +31,8 @@ tasks/<lang>/<task>/
 
 The task name is the language prefix plus the directory name, so `tasks/python/parse_duration` is `py_parse_duration`.
 
+A solution passes when its harness exits with status 0 and has printed its final line, `harness: all checks passed`, after its last check (Rust harnesses use libtest's `test result: ok.` summary instead). So a solution that ends the process early with status 0, for example with `sys.exit(0)` at import, fails instead of skipping the remaining checks. Rust solutions are built as a library crate and the harness as a separate test crate, so the functions and types a prompt asks for must be `pub`.
+
 ### Private tasks
 
 Tasks published on the internet can end up in model training data. To benchmark with tasks of your own, create a directory with the same layout and pass it with `--tasks-dir`. It replaces the built-in tasks; to run both, also pass the built-in directory:
@@ -39,6 +41,8 @@ Tasks published on the internet can end up in model training data. To benchmark 
 ./llm_bench.py localhost:11434 --tasks-dir ~/my-tasks
 ./llm_bench.py localhost:11434 --tasks-dir ~/my-tasks --tasks-dir ./tasks
 ```
+
+Their harnesses must print the final line too (Rust harnesses import the solution's items from the `solution` crate: `use solution::parse_csv_line;`). A harness that ends with a plain `ok`, as before benchmark version 0.5.0, fails every solution.
 
 ## Requirements
 
@@ -125,7 +129,7 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
   | `config` | Hash of everything that affects the result: benchmark version, system prompt, `--max-tokens`, `--attempts`, `--timeout`, parameters, sandbox limits, and the task's own prompt, harness and build commands. Rows with equal hashes were produced under the same conditions. |
 
   A file written by an older version whose columns are all still current is upgraded before a run appends to it: it's rewritten once with the current columns, and the new ones are empty in its existing rows. The benchmark refuses to append to a file with other columns (or the same column twice), and leaves a file it can't upgrade untouched.
-- `runs/<endpoint>[_<tag>]/<model>/<task>/<config>/repeat_<r>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. `<config>` and `r` match the row's `config` and `repeat`, so later trials never overwrite earlier transcripts, even after settings or a task change. `<model>` is the model ID with characters other than letters, digits, `.`, `_` and `-` (and a leading dot) replaced by `_`; if two of an endpoint's models end up with the same name, both get a short hash of their ID appended (and `-2`, `-3`, … in the unlikely case that a name is still taken).
+- `runs/<endpoint>[_<tag>]/<model>/<task>/<config>/repeat_<r>/attempt_<n>/`: `response.md` (raw model reply), `log.txt` (build/test output), and the files that were tested. `<config>` and `r` match the row's `config` and `repeat`, so later trials never overwrite earlier transcripts, even after settings or a task change. `<model>` is the model ID if it only contains letters, digits, `.`, `_` and `-` (and doesn't start with a dot). Otherwise those other characters (and a leading dot) are replaced by `_` and `~` plus a 16-digit hash of the ID is appended, so `org/model` becomes `org_model~<hash>`. The name doesn't depend on which other models are run, so two models practically never share a directory, not even across runs (that takes a collision of the 64-bit hashes; within a run, `-2`, `-3`, … are appended then). IDs longer than 200 bytes are cut to fit before the hash is added.
 - A summary table on stdout, one line per endpoint and model: `pass@1` (tasks passed on the first attempt), `passed` (tasks passed within `--attempts`), per-language results, token counts (`reason_tok` only when some row reports reasoning tokens; `-` for a model unless every trial that got a reply reported them, since a partial count isn't on the same scale as `compl_tok`), total reply time (`sec`), throughput (`tok/s`: completion tokens per second of the replies that reported them, from `usage_seconds`; `-` without any, or when no tokens were generated; rows from older versions without `usage_seconds` count with all their reply time if they ended with a reply that reported token usage; it includes prompt processing, so it's lower than the pure generation speed) and load time. Models are sorted by `passed`, then `pass@1`. With `--resume` the table covers the whole results file; otherwise just this run. Ctrl-C stops the run promptly and still prints the summary of the trials finished so far.
 
   A **round** is one trial of every task. When tasks have several trials (`--repeat`, or re-runs under the same settings), scores are mean passes per round, shown as `mean±sd/tasks`, and a `rounds` column shows the number of trials per task. The ± is the standard deviation of a single round's score, estimated from each task's pass rate: if two models are closer than that, one round can't tell them apart. Tokens and seconds are then means per round. `--summary` works the same on any set of results files; rows are only averaged when their `settings` match (otherwise a `settings` column tells the groups apart). Models with the same settings are all scored on the same version of each task, its newest one (from the latest `run_id`): rows of older versions are left out, so a model without trials of a task's newest version is scored without that task. Scores are only comparable between models scored on the same tasks; when models with the same settings were scored on different tasks (because of `--task`, or a task version that only some of them were run on), a warning under the table names the tasks each one is missing.
@@ -147,7 +151,7 @@ If the model's warm-up request fails (for example it can't be loaded), all its t
 
 If the server itself becomes unreachable, the benchmark retries the request after 10, 30 and 60 seconds, then stops that endpoint. Tasks it didn't get to have no rows.
 
-`fail_stage` says where the last attempt failed: `build` (compiling), `test` (the test harness failed), `time_limit` (building and testing exceeded the 60 s sandbox limit), `no_code` (the reply contained no code), `request` (one of the request-level failures above), `load` (the model failed to load) or `budget` (skipped by `--max-length-finishes`). It's empty when the task passed.
+`fail_stage` says where the last attempt failed: `build` (compiling), `test` (the test harness failed, or exited with status 0 without printing its final line), `time_limit` (building and testing exceeded the 60 s sandbox limit), `no_code` (the reply contained no code), `request` (one of the request-level failures above), `load` (the model failed to load) or `budget` (skipped by `--max-length-finishes`). It's empty when the task passed.
 
 ## Go tasks
 

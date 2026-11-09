@@ -42,4 +42,4 @@ check "$T/two" "two" any-exit
 : > "$T/empty"
 : > "$T/want"
 check "$T/empty" "empty" any-exit
-echo ok
+echo 'harness: all checks passed'

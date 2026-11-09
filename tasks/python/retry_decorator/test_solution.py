@@ -93,4 +93,4 @@ for bad in (0, -1):
         pass
     else:
         raise AssertionError(f"retry(times={bad}): did not raise, want ValueError")
-print("ok")
+print("harness: all checks passed")

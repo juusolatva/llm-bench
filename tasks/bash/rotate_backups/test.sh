@@ -67,4 +67,4 @@ listing > got
 setup
 listing > want
 cmp -s got want || { diff want got >&2; fail "wrong usage (arguments d; d 1 x; d -1; d abc; d 1x; d ''; nodir 1; d/notes.txt 1) deleted files in d (diff above: < want, > got)"; }
-echo ok
+echo 'harness: all checks passed'

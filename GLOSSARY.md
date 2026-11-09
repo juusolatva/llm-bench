@@ -21,8 +21,12 @@ The task's statement, sent to the model word for word. It is separate from the s
 _Avoid_: Instructions, problem statement
 
 **Harness**:
-The hidden test program that decides whether a solution passes a task.
+The hidden test program that decides whether a solution passes a task. A solution passes only if the harness exits with status 0 and prints its final line.
 _Avoid_: Test suite, tests, checker
+
+**Final line**:
+The line a harness prints after its last check, `harness: all checks passed` (for Rust, libtest's `test result: ok.` summary). Requiring it catches a solution that ends the process with status 0 before the checks finish.
+_Avoid_: Marker, sentinel, done line
 
 **Reference solution**:
 A known-correct solution kept with the task to prove the harness can be passed. It is never shown to models.

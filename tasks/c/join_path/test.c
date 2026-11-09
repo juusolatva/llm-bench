@@ -4,7 +4,13 @@
 char *join_path(const char *a, const char *b);
 
 static int fails;
-static char *dup(const char *s) { size_t n = strlen(s) + 1; char *d = malloc(n); memcpy(d, s, n); return d; }
+/* malloc that exits instead of returning NULL, so a failed allocation isn't blamed on the solution. */
+static void *harness_alloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { fputs("harness: allocation failed\n", stderr); exit(2); }
+    return p;
+}
+static char *dup(const char *s) { size_t n = strlen(s) + 1; char *d = harness_alloc(n); memcpy(d, s, n); return d; }
 static void t(const char *a, const char *b, const char *want) {
     char *ha = dup(a), *hb = dup(b);  /* exact-size heap copies: ASan catches over-reads */
     char *r = join_path(ha, hb);
@@ -26,6 +32,6 @@ int main(void) {
     t("", "", "");
     t("a/b", "c/d/", "a/b/c/d/");
     if (fails) return 1;
-    puts("ok");
+    puts("harness: all checks passed");
     return 0;
 }

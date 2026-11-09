@@ -1,8 +1,6 @@
 """Reference solutions: every built-in task has one, and it passes the task's harness in the real sandbox.
 
 This catches broken or over-strict harnesses, which otherwise only show up as models failing."""
-import tempfile
-
 import pytest
 
 import llm_bench
@@ -25,22 +23,6 @@ def test_reference_exists(task):
     path = reference_file(task)
     assert path.is_file(), f"missing reference solution {path}"
     assert path.read_text().strip()
-
-
-@pytest.fixture(scope="session")
-def go_cache():
-    """Warm the Go build cache once, like a real run does, so Go tasks stay under the time limit."""
-    try:
-        llm_bench.check_toolchains(GO_TASKS)
-    except SystemExit as exc:
-        pytest.skip(str(exc))
-    with tempfile.TemporaryDirectory(prefix="llm-bench-test-go-") as d:
-        llm_bench.prepare_go_cache(d)
-        if llm_bench.GO_CACHE is None:
-            pytest.fail("warming the Go build cache failed (see the warning above); without it Go tasks "
-                        "compile the standard library each time and hit the time limit")
-        yield
-        llm_bench.GO_CACHE = None
 
 
 def check_reference(task, tmp_path):

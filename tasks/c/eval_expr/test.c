@@ -4,10 +4,16 @@
 int eval_expr(const char *s, long *out);
 
 static int harness_fails;
+/* malloc that exits instead of returning NULL, so a failed allocation isn't blamed on the solution. */
+static void *harness_alloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { fputs("harness: allocation failed\n", stderr); exit(2); }
+    return p;
+}
 /* Check eval_expr(expr): want_rc 0 with result want, or -1 with *out left unchanged. */
 static void harness_t(const char *expr, int want_rc, long want) {
     size_t n = strlen(expr) + 1;
-    char *s = malloc(n);              /* exact-size heap copy: ASan catches over-reads */
+    char *s = harness_alloc(n);       /* exact-size heap copy: ASan catches over-reads */
     memcpy(s, expr, n);
     long out = 12345;
     int rc = eval_expr(s, &out);
@@ -51,6 +57,6 @@ int main(void) {
     harness_t("4 % 2", -1, 0);
     harness_t("x", -1, 0);
     if (harness_fails) return 1;
-    puts("ok");
+    puts("harness: all checks passed");
     return 0;
 }

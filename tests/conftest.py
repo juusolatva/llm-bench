@@ -10,6 +10,9 @@ import pytest
 
 import llm_bench
 
+# Transcript directory of MockServer's default model "test/model" ("/" isn't safe, so the name is hashed).
+MODEL_DIR = llm_bench.model_dirs(["test/model"])["test/model"]
+
 
 @dataclass
 class Reply:
@@ -170,3 +173,20 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "sandbox" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(scope="session")
+def go_cache():
+    """Warm the Go build cache once, like a real run does, so Go tasks stay under the time limit."""
+    try:
+        tasks = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
+        llm_bench.check_toolchains([t for t in tasks if t["lang"] == "go"])
+    except SystemExit as exc:
+        pytest.skip(str(exc))
+    with tempfile.TemporaryDirectory(prefix="llm-bench-test-go-") as d:
+        llm_bench.prepare_go_cache(d)
+        if llm_bench.GO_CACHE is None:
+            pytest.fail("warming the Go build cache failed (see the warning above); without it Go tasks "
+                        "compile the standard library each time and hit the time limit")
+        yield
+        llm_bench.GO_CACHE = None

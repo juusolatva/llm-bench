@@ -1,10 +1,22 @@
 package solution
 
 import (
+	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+// TestMain prints the harness's final line only after every test passed. The benchmark requires it, so a
+// solution that ends the process early (e.g. os.Exit(0) in an init function) fails.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		fmt.Println("harness: all checks passed")
+	}
+	os.Exit(code)
+}
 
 func TestCountLengths(t *testing.T) {
 	words := make([]string, 5000)

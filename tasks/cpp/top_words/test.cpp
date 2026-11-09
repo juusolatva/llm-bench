@@ -26,5 +26,5 @@ int main() {
     harness_t("it's a1b a", 5, {{"a", 2}, {"b", 1}, {"it", 1}, {"s", 1}});
     harness_t("zeta Alpha alpha ZETA beta", 2, {{"alpha", 2}, {"zeta", 2}});
     if (harness_fails) return 1;
-    std::puts("ok");
+    std::puts("harness: all checks passed");
 }

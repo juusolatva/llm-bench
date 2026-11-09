@@ -73,6 +73,6 @@ int main(void) {
                           "want %d", round ? " and iv_remove_at(f, len - 1)" : "", j, f.data[j], (int)j + 1);
     }
     iv_free(&f);
-    puts("ok");
+    puts("harness: all checks passed");
     return 0;
 }

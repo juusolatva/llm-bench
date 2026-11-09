@@ -102,5 +102,5 @@ int main() {
                      "want %d\n", capacity, n, big.size(), capacity);
         return 1;
     }
-    std::puts("ok");
+    std::puts("harness: all checks passed");
 }

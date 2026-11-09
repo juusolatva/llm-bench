@@ -125,5 +125,5 @@ int main() {
         harness_fails++;
     }
     if (harness_fails) return 1;
-    std::puts("ok");
+    std::puts("harness: all checks passed");
 }
