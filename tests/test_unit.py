@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sys
 import time
 import urllib.error
@@ -287,10 +288,29 @@ def test_default_model_filter(model, keep):
 
 def test_check_toolchains_checks_the_tools_of_selected_languages(monkeypatch):
     """A language's "tools" are checked like its commands, and only for the selected tasks' languages."""
-    monkeypatch.setattr(llm_bench.shutil, "which", lambda name: None if name in ("gawk", "go") else f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench.shutil, "which",
+                        lambda name, path=None: None if name in ("gawk", "go") else f"/usr/bin/{name}")
     with pytest.raises(SystemExit, match=r"missing toolchains on PATH: gawk\n"):
         llm_bench.check_toolchains([{"lang": "term"}, {"lang": "bash"}])
     llm_bench.check_toolchains([{"lang": "bash"}, {"lang": "python"}])   # gawk and go aren't needed
+
+
+def test_check_toolchains_ignores_tools_outside_the_sandbox_path(monkeypatch, tmp_path):
+    """A tool found only in a PATH entry the sandbox doesn't expose (a home directory, here tmp_path) is missing:
+    the sandbox couldn't run it."""
+    tool = tmp_path / "llm-bench-test-tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setitem(llm_bench.LANGS["term"], "tools", (tool.name,))
+    assert llm_bench.shutil.which(tool.name) == str(tool)   # found on the host PATH
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: llm-bench-test-tool\n"):
+        llm_bench.check_toolchains([{"lang": "term"}])
+
+
+def test_sandbox_path_dirs_keeps_only_entries_under_usr(monkeypatch):
+    monkeypatch.setenv("PATH", os.pathsep.join(["/home/someone/bin", "relative/bin", "/usr/llm-bench-test/bin", "/opt/x"]))
+    assert llm_bench.sandbox_path_dirs() == ["/usr/llm-bench-test/bin", "/usr/bin", "/bin"]
 
 
 BUILTIN_TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
