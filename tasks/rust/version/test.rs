@@ -6,13 +6,17 @@ mod harness_tests {
     fn harness_has_traits<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash>() {}
 
     #[test] fn parse_ok() {
-        for (s, want) in [("1.2.3", v(1, 2, 3)), ("v10.0.1", v(10, 0, 1)), ("0.0.0", v(0, 0, 0))] {
+        for (s, want) in [("1.2.3", v(1, 2, 3)), ("v10.0.1", v(10, 0, 1)), ("0.0.0", v(0, 0, 0)),
+                          ("18446744073709551615.4294967296.0", v(u64::MAX, 4294967296, 0)),
+                          ("0.18446744073709551615.4294967296", v(0, u64::MAX, 4294967296)),
+                          ("4294967296.0.18446744073709551615", v(4294967296, 0, u64::MAX))] {
             let got = s.parse::<Version>();
             assert!(got == Ok(want), "{:?}.parse::<Version>(): got {:?}, want Ok({:?})", s, got, want);
         }
     }
     #[test] fn parse_err() {
-        for s in ["", "1.2", "1.2.3.4", "1..3", "a.b.c", "v", "vv1.2.3", "1.2.-3", " 1.2.3", "1.2.3 ", "1.2.x", "V1.2.3"] {
+        for s in ["", "1.2", "1.2.3.4", "1..3", "a.b.c", "v", "vv1.2.3", "1.2.-3", " 1.2.3", "1.2.3 ", "1.2.x", "V1.2.3",
+                  "18446744073709551616.0.0", "0.18446744073709551616.0", "0.0.18446744073709551616", "1.2.99999999999999999999"] {
             let got = s.parse::<Version>();
             assert!(got.is_err(), "{:?}.parse::<Version>(): got {:?}, want an Err", s, got);
         }

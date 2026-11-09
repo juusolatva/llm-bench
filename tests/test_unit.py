@@ -1,8 +1,10 @@
 import sys
 import time
+import urllib.error
 from collections import Counter
 
 import pytest
+from conftest import Reply
 
 import llm_bench
 
@@ -293,6 +295,37 @@ def test_http_json_enforces_size_cap(mock_server, monkeypatch):
     monkeypatch.setattr(llm_bench, "MAX_RESPONSE_BYTES", 100)
     with pytest.raises(ValueError, match="exceeds"):
         llm_bench.http_json(f"{s.url}/models")
+
+
+@pytest.mark.parametrize(("status", "location", "target"), [
+    (302, "http://127.0.0.1:9/v1/models", "redirect to 'http://127.0.0.1:9/v1/models'"),
+    (308, "https://example.com/v1/models", "redirect to 'https://example.com/v1/models'"),
+    (302, "file:///etc/passwd", "redirect to 'file:///etc/passwd'"),   # urllib refuses this one itself
+    (302, None, "redirect"),
+    (300, "/v1/models/a", "redirect to '{base}/v1/models/a'"),       # urllib has no handler for 300
+    (301, "http://[bad", "redirect to 'http://[bad'"),               # urljoin() can't parse it
+])
+def test_http_json_refuses_redirects(mock_server, status, location, target):
+    # urllib's default handler would read the whole redirect body (no size cap; here it would wait for the
+    # rest until the timeout) and send the API key to the new location. The error has an empty body.
+    s = mock_server(api_key="sekrit", models_reply=Reply(status=status, body=b"<html>Moved</html>", length=10**9,
+                                                         hold=10, headers={"Location": location} if location else {}))
+    t0 = time.monotonic()
+    with pytest.raises(urllib.error.HTTPError) as e:
+        llm_bench.http_json(f"{s.url}/models", timeout=5, api_key="sekrit")
+    assert time.monotonic() - t0 < 3
+    assert e.value.code == status
+    assert f"; {target.format(base=s.url.removesuffix('/v1'))} not followed (use the final URL" in e.value.reason
+    assert e.value.read() == b""
+    assert s.gets == ["/v1/models"]
+
+
+def test_list_models_reports_redirect(mock_server, capsys):
+    s = mock_server(models_reply=Reply(status=301, body=b"", headers={"Location": "/v2/models"}))
+    assert llm_bench.list_models("m", s.url, None) == []
+    err = capsys.readouterr().err
+    assert f"HTTP Error 301: Moved Permanently; redirect to '{s.url.removesuffix('/v1')}/v2/models' not followed" in err
+    assert s.gets == ["/v1/models"]
 
 
 def test_list_models_unreachable(capsys):

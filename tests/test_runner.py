@@ -41,6 +41,33 @@ def test_chat_classifies_failures(mock_server, reply, error):
     assert chat(s)[:4] == ("", None, {}, error)
 
 
+@pytest.mark.parametrize(("length", "hold"), [(None, 0), (10**9, 10)])   # a complete body and a stalled one
+def test_chat_refuses_redirect(mock_server, capsys, length, hold):
+    s = mock_server(replies=[Reply(status=307, body=b"<html>Moved</html>", length=length, hold=hold,
+                                   headers={"Location": "http://127.0.0.1:9/v1/chat"})])
+    t0 = time.monotonic()
+    assert chat(s, timeout=5)[:4] == ("", None, {}, "http_307")
+    assert time.monotonic() - t0 < 4
+    err = capsys.readouterr().err
+    assert "redirect to 'http://127.0.0.1:9/v1/chat' not followed" in err
+    assert "Moved</html>" not in err
+    assert len(s.requests) == 1
+    assert s.gets == []
+
+
+@pytest.mark.parametrize(("usage", "want"), [
+    ({"prompt_tokens": "10", "completion_tokens": 5}, {"completion_tokens": 5}),
+    ({"prompt_tokens": 10, "completion_tokens": 1.5}, {"prompt_tokens": 10}),
+    ({"prompt_tokens": -1, "completion_tokens": True}, {}),
+    ({"prompt_tokens": None, "completion_tokens": 0, "total_tokens": "x"}, {"completion_tokens": 0, "total_tokens": "x"}),
+])
+def test_chat_drops_invalid_token_counts(mock_server, usage, want):
+    # Not a bad response: the server just reports no usable count, as if it reported none.
+    s = mock_server(replies=[Reply(body=json.dumps({"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+                                                    "usage": usage}).encode())])
+    assert chat(s)[:4] == ("x", "stop", want, None)
+
+
 def test_chat_timeout(mock_server):
     s = mock_server(replies=[Reply(text="late", sleep=3)])
     assert chat(s, timeout=1)[3] == "timeout"
@@ -190,6 +217,38 @@ def test_context_check(mock_server, tmp_path, server, options, context):
         need = llm_bench.context_needed(opts(**options))
         assert len(s.probes) == 3
         assert 10 + len(s.probes[2]["messages"][0]["content"].split()) >= 0.99 * need   # mock: 1 token per word
+
+
+def probe_usage(prompt_tokens):
+    return Reply(body=json.dumps({"choices": [{"message": {"content": "OK"}, "finish_reason": "length"}],
+                                  "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1}}).encode())
+
+
+@pytest.mark.parametrize(("warm_up", "calibration", "context", "message"), [
+    (1, 1.0000000000000002, "unchecked", "reports no token usage"),   # a fraction: no count, not 2e23 filler words
+    (1, "5000", "unchecked", "reports no token usage"),
+    (10, 11, "short:11", "0.0005 tokens per word"),    # too few tokens per word: the calibration prompt was cut off
+    (10, 50_000, "unchecked", "25 tokens per word"),
+])
+def test_context_check_rejects_implausible_counts(mock_server, tmp_path, capsys, warm_up, calibration, context,
+                                                  message):
+    s = mock_server(replies=[""], probe_reply=[probe_usage(warm_up), probe_usage(calibration)])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == context
+    assert len(s.probes) == 2   # warm-up and calibration: no filler prompt is built from these counts
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reported", [None, "4000", 4000.5])
+def test_context_check_unchecked_without_full_size_count(mock_server, tmp_path, capsys, reported):
+    # The calibration counts are fine, but the full-size prompt's count is missing or invalid: that's not "short:0".
+    full_size = (Reply(body=b'{"choices": [{"message": {"content": "OK"}, "finish_reason": "length"}]}')
+                 if reported is None else probe_usage(reported))
+    s = mock_server(replies=[""], probe_reply=[probe_usage(10), probe_usage(2010), full_size])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == "unchecked"
+    assert len(s.probes) == 3
+    assert "no token usage for the" in capsys.readouterr().err
 
 
 def test_context_check_disabled(mock_server, tmp_path):

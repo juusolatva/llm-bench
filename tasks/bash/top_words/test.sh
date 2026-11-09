@@ -29,6 +29,12 @@ printf 'zed Zed amy\namy b9b\n' > "$T/ties"
 printf '%s\n' '2 amy' '2 b' '2 zed' > "$T/want"
 check "$T/ties" "ties"
 
+# Counts of 10, 9 and 2 tell a numeric sort from a text sort, which would put "9" and "2" before "10".
+{ for i in 1 2 3 4 5 6 7 8 9 10; do printf 'alpha '; done; printf '\nbeta Beta\n'
+  for i in 1 2 3 4 5 6 7 8 9; do printf 'gamma '; done; printf '\n'; } > "$T/counts"
+printf '%s\n' '10 alpha' '9 gamma' '2 beta' > "$T/want"
+check "$T/counts" "counts"
+
 printf 'b a b\n' > "$T/two"
 printf '%s\n' '2 b' '1 a' > "$T/want"
 check "$T/two" "two" any-exit

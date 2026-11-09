@@ -12,6 +12,7 @@ Run with --help for usage.
 """
 import argparse
 import bisect
+import contextlib
 import csv
 import hashlib
 import http.client
@@ -52,6 +53,9 @@ SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server i
 CONTEXT_BASE_TOKENS = 1000
 CONTEXT_PER_RETRY_TOKENS = 4000
 CONTEXT_CALIBRATION_WORDS = 2000   # filler words used to measure the tokenizer's tokens per word
+# Plausible tokens per filler word (common English words): outside this range the server's counts are wrong,
+# and the lower bound also caps the size of the filler prompt built from them.
+CONTEXT_TOKENS_PER_WORD = (0.5, 10)
 CONTEXT_TOLERANCE = 0.95           # reported prompt tokens below this share of the expected count = truncated
 FEEDBACK_CHARS = 6000          # max characters of failing build/test output sent back to the model
 CMD_TIMEOUT_S = 60
@@ -202,17 +206,47 @@ def log(msg, err=False):
         f.flush()
 
 
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Replaces urllib's redirect handler, which follows redirects: it reads the whole redirect body, without
+    the MAX_RESPONSE_BYTES cap, and sends the Authorization header on to the new location, even on another
+    host (and a redirected POST arrives as a GET without its body anyway). Declining here, before any of
+    that, leaves every 3xx to urllib's default error handler, which raises it as an HTTPError."""
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+HTTP_OPENER = urllib.request.build_opener(NoRedirects)
+
+
 def http_json(url, payload=None, timeout=60, api_key=None):
     """GET url (or POST payload as JSON) and return the decoded JSON reply. Raises ValueError if the reply
-    exceeds MAX_RESPONSE_BYTES or isn't JSON, and urllib/http.client errors on HTTP or connection failures."""
+    exceeds MAX_RESPONSE_BYTES or isn't JSON, and urllib/http.client errors on HTTP or connection failures
+    (urllib.error.HTTPError for a redirect, which is never followed)."""
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
-        body = r.read(MAX_RESPONSE_BYTES + 1)
+    try:
+        with HTTP_OPENER.open(req, timeout=timeout) as r:
+            # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
+            body = r.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        if not 300 <= e.code < 400:
+            raise
+        # Raise a redirect without its body: the server's body (often a short HTML page) would replace the
+        # reason in chat()'s log, and a stalled one would hold it until the timeout.
+        e.close()
+        location = e.headers.get("Location")
+        if location:
+            with contextlib.suppress(ValueError):   # malformed (e.g. "http://[bad"): report it as sent
+                location = urllib.parse.urljoin(url, location)
+        target = f"redirect to {location[:200]!r}" if location else "redirect"
+        raise urllib.error.HTTPError(url, e.code, f"{e.reason}; {target} not followed (use the final URL as the "
+                                     "endpoint)", e.headers, None) from None
     if len(body) > MAX_RESPONSE_BYTES:
         raise ValueError(f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes")
     return json.loads(body)
@@ -619,6 +653,13 @@ def server_reachable(base, api_key):
         return False
 
 
+def valid_counts(usage):
+    """usage without prompt_tokens and completion_tokens values that aren't non-negative ints: a server that
+    reports something else (a string, a fraction, a bool) reports no count, and callers can rely on the rest."""
+    return {k: v for k, v in usage.items()
+            if k not in ("prompt_tokens", "completion_tokens") or (type(v) is int and v >= 0)}
+
+
 def chat(label, base, payload, opts, stop):
     """POST one chat completion. Returns (text, finish_reason, usage, error, seconds); seconds is the duration of
     the last HTTP request alone, without the waits for an unreachable server.
@@ -664,6 +705,7 @@ def chat(label, base, payload, opts, stop):
             usage = resp.get("usage") or {}
             if not isinstance(usage, dict):
                 raise TypeError(f"usage is {type(usage).__name__}")
+            usage = valid_counts(usage)
         except (KeyError, IndexError, TypeError, AttributeError) as e:
             log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
             return "", None, {}, "bad_response", seconds
@@ -715,8 +757,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         result["finish_reason"] = finish
         result["prompt_tokens"] += usage.get("prompt_tokens") or 0
         result["completion_tokens"] += usage.get("completion_tokens") or 0
-        completion_tokens = usage.get("completion_tokens")
-        if type(completion_tokens) is int and completion_tokens >= 0:   # reported, even if 0: a measurement
+        if usage.get("completion_tokens") is not None:   # reported, even if 0: a measurement
             # Throughput's time base: the requests of the replies that report their tokens, no server waits.
             result["usage_seconds"] += request_seconds
         # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
@@ -797,6 +838,16 @@ def check_context(label, base, model, opts, stop, base_tokens):
             err=True)
         return "unchecked"
     per_word = (sample_tokens - base_tokens) / CONTEXT_CALIBRATION_WORDS
+    counts = (f"the server reports {base_tokens} prompt tokens for a short prompt and {sample_tokens} with "
+              f"{CONTEXT_CALIBRATION_WORDS} words added, {per_word:.3g} tokens per word")
+    low, high = CONTEXT_TOKENS_PER_WORD
+    if per_word < low:   # even the calibration prompt was cut off (or the counts are wrong)
+        log(f"{label}: warning: the context holds only about {sample_tokens} of the {need} tokens needed ({counts}); "
+            f"long replies and retries will be cut off. Raise the server's context length", err=True)
+        return f"short:{sample_tokens}"
+    if per_word > high:
+        log(f"{label}: warning: can't check the context size ({counts})", err=True)
+        return "unchecked"
     words = math.ceil((need - base_tokens) / per_word)
     expected = base_tokens + per_word * words
     log(f"{label}: checking that the context holds {need} tokens...", err=True)
@@ -805,7 +856,11 @@ def check_context(label, base, model, opts, stop, base_tokens):
         log(f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
             f"smaller. Raise the server's context length or lower --max-tokens / --attempts", err=True)
         return f"rejected:{error}"
-    got = usage.get("prompt_tokens") or 0
+    got = usage.get("prompt_tokens")
+    if got is None:   # no valid count this time: truncation can't be told apart from a working context
+        log(f"{label}: warning: can't check the context size (the server reports no token usage for the "
+            f"{need}-token prompt)", err=True)
+        return "unchecked"
     if got < CONTEXT_TOLERANCE * expected:
         log(f"{label}: warning: the context holds only about {got} of the {need} tokens needed; long replies and "
             f"retries will be cut off. Raise the server's context length or lower --max-tokens / --attempts",

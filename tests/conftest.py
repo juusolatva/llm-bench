@@ -20,6 +20,8 @@ class Reply:
     length: int | None = None  # Content-Length to announce (larger than body = truncated reply)
     close: bool = False       # drop the connection without a response
     sleep: float = 0          # delay before answering
+    headers: dict | None = None  # with body: extra response headers (e.g. Location for a redirect)
+    hold: float = 0           # with body: keep the connection open this long after the body (a stalled reply)
 
 
 class MockServer:
@@ -28,18 +30,23 @@ class MockServer:
     Probe requests (max_tokens=1: the warm-up and context check) don't consume replies and are kept in
     `probes`. They report one prompt token per word plus 10; `context` caps the reported count (a server
     that truncates prompts), `reject_over` answers HTTP 400 above that many tokens, and `probe_reply`
-    (a Reply) replaces the answer to every probe (e.g. a model that fails to load)."""
+    (a Reply) replaces the answer to every probe (e.g. a model that fails to load); a list of Replies answers
+    the probes in order, the last one repeating. `models_reply` (a Reply) replaces the answer to GET /models.
+    The paths of GET requests are kept in `gets`."""
 
     def __init__(self, models=("test/model",), replies=(), api_key=None, context=None, reject_over=None,
-                 probe_reply=None):
+                 probe_reply=None, models_reply=None):
         self.models = list(models)
         self.replies = list(replies)
         self.api_key = api_key
         self.context = context
         self.reject_over = reject_over
-        self.probe_reply = probe_reply
+        self.probe_reply = list(probe_reply) if isinstance(probe_reply, list) else probe_reply
+        self.models_reply = models_reply
+        self.gets = []
         self.requests = []
         self.probes = []
+        self.stopping = threading.Event()   # ends held replies
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -60,10 +67,33 @@ class MockServer:
                     return False
                 return True
 
+            def _send_reply(self, reply):
+                """Answer with a scripted Reply; False if it's a plain completion text the caller must send."""
+                if reply.sleep:
+                    time.sleep(reply.sleep)
+                if reply.close:   # drop the connection without answering
+                    self.close_connection = True
+                    return True
+                if reply.body is None:
+                    return False
+                self.send_response(reply.status)
+                for name, value in (reply.headers or {}).items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(reply.length or len(reply.body)))
+                self.end_headers()
+                self.wfile.write(reply.body)
+                if reply.hold:
+                    self.wfile.flush()
+                    server.stopping.wait(reply.hold)
+                return True
+
             def do_GET(self):
+                server.gets.append(self.path)
                 if not self._authorized():
                     return
-                if self.path == "/v1/models":
+                if server.models_reply is not None:
+                    self._send_reply(server.models_reply)
+                elif self.path == "/v1/models":
                     self._send(200, {"data": [{"id": m} for m in server.models]})
                 else:
                     self._send(404, {})
@@ -85,20 +115,13 @@ class MockServer:
                                          "usage": {"prompt_tokens": tokens, "completion_tokens": 1}})
                         return
                     reply = server.probe_reply
+                    if isinstance(reply, list):
+                        reply = reply.pop(0) if len(reply) > 1 else reply[0]
                 else:
                     server.requests.append(req)
                     reply = server.replies.pop(0) if server.replies else ""
                 if isinstance(reply, Reply):
-                    if reply.sleep:
-                        time.sleep(reply.sleep)
-                    if reply.close:   # drop the connection without answering
-                        self.close_connection = True
-                        return
-                    if reply.body is not None:
-                        self.send_response(reply.status)
-                        self.send_header("Content-Length", str(reply.length or len(reply.body)))
-                        self.end_headers()
-                        self.wfile.write(reply.body)
+                    if self._send_reply(reply):
                         return
                     reply = reply.text
                 self._send(200, {"choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
@@ -113,6 +136,7 @@ class MockServer:
         return self
 
     def __exit__(self, *exc):
+        self.stopping.set()
         self.httpd.shutdown()
         self.httpd.server_close()
 
