@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -726,6 +727,45 @@ def test_run_task_failure_stage(monkeypatch, tmp_path, output, rc, timed_out, st
     assert (ok, got_stage, cmd, fail_out) == (False, stage, rendered[index], out)
     assert log == f"{out}\n[exit {rc}]"
     assert not (tmp_path / "w" / "stale").exists()   # the work directory starts empty
+
+
+def test_ts_tsconfig_extra():
+    cfg = json.loads(llm_bench.LANGS["ts"]["extra"]["tsconfig.json"])
+    assert cfg["compilerOptions"] == {"strict": True, "target": "es2023", "lib": ["es2023", "dom"],
+                                      "module": "nodenext", "types": [], "outDir": "out", "pretty": True}
+    assert cfg["files"] == ["solution.ts", "test.ts"]
+    assert json.loads(llm_bench.LANGS["ts"]["extra"]["package.json"]) == {"type": "module"}
+
+
+def test_run_task_strips_ansi_for_ts(monkeypatch, tmp_path):
+    """tsc's pretty output is colored; the model gets it without escape sequences."""
+    rendered = [llm_bench.shlex.join(c) for c in llm_bench.LANGS["ts"]["cmds"]]
+    out = f"$ {rendered[0]}\n$ {rendered[1]}\n\x1b[96mok\x1b[0m\n\x1b[1m{llm_bench.HARNESS_FINAL_LINE}\x1b[0m\n"
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(0, out, False))
+    ok, log, *_ = llm_bench.run_task({"lang": "ts", "test": "harness"}, "code", tmp_path / "w")
+    assert ok
+    assert "\x1b" not in log
+    assert (tmp_path / "w" / "tsconfig.json").is_file()
+    assert (tmp_path / "w" / "package.json").is_file()
+    fail = f"$ {rendered[0]}\ntest.ts:2:7 - \x1b[91merror\x1b[0m TS2322\n"
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(2, fail, False))
+    ok, _, stage, cmd, fail_out = llm_bench.run_task({"lang": "ts", "test": "harness"}, "code", tmp_path / "w")
+    assert (ok, stage, cmd) == (False, "build", rendered[0])
+    assert fail_out == f"$ {rendered[0]}\ntest.ts:2:7 - error TS2322\n"
+
+
+def test_run_task_keeps_ansi_for_other_languages(monkeypatch, tmp_path):
+    rendered = [llm_bench.shlex.join(c) for c in llm_bench.LANGS["c"]["cmds"]]
+    out = f"$ {rendered[0]}\n$ {rendered[1]}\n\x1b[1mFAIL\x1b[0m\n"
+    monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(1, out, False))
+    assert llm_bench.run_task({"lang": "c", "test": "h"}, "code", tmp_path / "w")[4] == out
+
+
+def test_extract_code_prefers_the_ts_block():
+    reply = 'Input:\n```json\n{"name": "a"}\n```\nSolution:\n```ts\nexport const a = 1;\n```\n'
+    assert llm_bench.extract_code(reply, "ts").strip() == "export const a = 1;"
+    reply = 'Run:\n```bash\nnode x\n```\n```typescript\nexport const b = 2;\n```\n'
+    assert llm_bench.extract_code(reply, "ts").strip() == "export const b = 2;"
 
 
 def go_cache_run_cmd(results, cache_writes=False):

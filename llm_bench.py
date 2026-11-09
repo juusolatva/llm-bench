@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, Bash and terminal tasks.
+"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, TypeScript, Bash and terminal
+tasks.
 
 Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM Studio,
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
@@ -7,8 +8,8 @@ Tasks are loaded from tasks/<lang>/<task>/ next to this script (see load_tasks).
 Output: results_<endpoint>.csv (one row per trial: one model on one task) and
 runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
-toolchains on PATH: python3, gcc, g++, rustc, go, bash (+ coreutils/findutils; GNU diffutils, grep, sed and
-gawk for terminal tasks).
+toolchains on PATH: python3, gcc, g++, rustc, go, node + tsc, bash (+ coreutils/findutils; GNU diffutils, grep, sed
+and gawk for terminal tasks).
 Run with --help for usage.
 """
 import argparse
@@ -94,6 +95,23 @@ SH_HARNESS = "test.sh"   # the harness file of the Bash and terminal tasks
 # last check (see finished()). Go harnesses print HARNESS_FINAL_LINE from TestMain, and `go test` runs in local
 # directory mode (no package argument) because package mode hides a passing test binary's output. A Rust harness
 # is its own crate that uses the solution's public API, and libtest's summary line is its final line.
+# TypeScript compiles solution and harness with a fixed tsconfig.json (strict, ES2023 + DOM libraries, no @types)
+# and runs the output on Node; "strip_ansi" removes the color codes of tsc's "pretty" output, which also shows
+# the failing source line.
+TS_CONFIG = """\
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2023",
+    "lib": ["es2023", "dom"],
+    "module": "nodenext",
+    "types": [],
+    "outDir": "out",
+    "pretty": true
+  },
+  "files": ["solution.ts", "test.ts"]
+}
+"""
 LANGS = {
     "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py", "tags": ("python", "py", "python3"),
                "cmds": [["python3", "test_solution.py"]], "final_line": HARNESS_FINAL_LINE},
@@ -112,6 +130,10 @@ LANGS = {
     "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
            "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
            "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
+    "ts": {"prefix": "ts", "sol": "solution.ts", "test": "test.ts", "tags": ("typescript", "ts"),
+           "extra": {"package.json": '{"type": "module"}\n', "tsconfig.json": TS_CONFIG},
+           "cmds": [["tsc", "--project", "tsconfig.json"], ["node", "out/test.js"]],
+           "final_line": HARNESS_FINAL_LINE, "strip_ansi": True},
     "bash": {"prefix": "bash", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
              "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE},
     # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
@@ -199,6 +221,7 @@ FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")   # terminal color/style sequences (CSI)
 
 
 def safe_name(name):
@@ -652,6 +675,8 @@ def run_task(task, code, workdir):
     # Build and execute in one sandbox so private compiler outputs persist only
     # for this attempt. Parent-owned source/transcript files are read-only inputs.
     rc, out, timed_out = run_cmd([BASH, "-ec", "\n".join(script)], workdir)
+    if lang.get("strip_ansi"):
+        out = ANSI_RE.sub("", out)
     if rc == 0:
         if finished(out, rendered[-1], lang["final_line"]):
             return True, f"{out}\n[exit {rc}]", None, None, None
