@@ -303,6 +303,7 @@ def test_http_json_enforces_size_cap(mock_server, monkeypatch):
     (302, "file:///etc/passwd", "redirect to 'file:///etc/passwd'"),   # urllib refuses this one itself
     (302, None, "redirect"),
     (300, "/v1/models/a", "redirect to '{base}/v1/models/a'"),       # urllib has no handler for 300
+    (301, "http://[bad", "redirect to 'http://[bad'"),               # urljoin() can't parse it
 ])
 def test_http_json_refuses_redirects(mock_server, status, location, target):
     # urllib's default handler would read the whole redirect body (no size cap; here it would wait for the

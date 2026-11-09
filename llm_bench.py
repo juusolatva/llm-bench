@@ -12,6 +12,7 @@ Run with --help for usage.
 """
 import argparse
 import bisect
+import contextlib
 import csv
 import hashlib
 import http.client
@@ -240,7 +241,10 @@ def http_json(url, payload=None, timeout=60, api_key=None):
         # reason in chat()'s log, and a stalled one would hold it until the timeout.
         e.close()
         location = e.headers.get("Location")
-        target = f"redirect to {urllib.parse.urljoin(url, location)[:200]!r}" if location else "redirect"
+        if location:
+            with contextlib.suppress(ValueError):   # malformed (e.g. "http://[bad"): report it as sent
+                location = urllib.parse.urljoin(url, location)
+        target = f"redirect to {location[:200]!r}" if location else "redirect"
         raise urllib.error.HTTPError(url, e.code, f"{e.reason}; {target} not followed (use the final URL as the "
                                      "endpoint)", e.headers, None) from None
     if len(body) > MAX_RESPONSE_BYTES:
