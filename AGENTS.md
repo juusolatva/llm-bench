@@ -52,14 +52,15 @@ Repository layout:
 
 ## Checking changes
 
-Run both before handing off a change:
+Run these before handing off a change:
 
 ```sh
 uv run --locked --no-build --group dev ruff check .
+uv run --locked --no-build --group dev ruff format --check .
 uv run --locked --no-build --group dev pytest
 ```
 
-(Or run `ruff check .` and `pytest` directly if both are installed.)
+(Or run `ruff check .`, `ruff format --check .` and `pytest` directly if they're installed.)
 
 - `tests/test_unit.py`: pure functions, task loading (including the built-in task set's consistency), the CLI, the sandbox's command line (`sandbox_command()`), and `run_cmd`/`run_task`/the Go cache setup with a stand-in for the sandbox. No sandbox needed.
 - `tests/test_runner.py`: request handling (`chat()` failure classification: HTTP errors, malformed or truncated replies, dropped connections, timeouts, server down) and the per-endpoint loop, against the mock server, and whole `main()` runs with the sandbox check and `run_cmd` stubbed. No sandbox needed: replies with code only reach the stubbed `run_cmd`.
@@ -67,12 +68,12 @@ uv run --locked --no-build --group dev pytest
 - `tests/test_e2e.py` (marker `sandbox`): full runs against the `MockServer` in `tests/conftest.py`, an OpenAI-compatible stdlib server that returns scripted replies, plus checks that the sandbox hides the home directory, the network and the environment. These tests skip themselves when bwrap + a systemd user session aren't available (e.g. in containers and on CI), so run them on a Linux host after touching the runner or the sandbox. Check the output for skips with `pytest -rs`.
 - Add tests for new CLI options and runner behaviour. Use `MockServer(replies=[...])` to script model answers; a `Reply(...)` entry scripts HTTP errors, raw bodies (with extra headers, e.g. a redirect's `Location`), dropped connections, slow replies or stalled bodies (`length` larger than the body plus `hold` to keep the connection open), and `models_reply` replaces the answer to `GET /models`. Warm-up and context-check requests (`max_tokens=1`) don't consume replies; they're recorded in `MockServer.probes`, and the `context`, `reject_over` and `probe_reply` options simulate truncating, refusing or failing servers (`probe_reply` takes one `Reply` for every probe or a list answered in order).
 - SonarQube Cloud's cognitive-complexity limit is 15 per function (check it locally, e.g. with `complexipy llm_bench.py`). Keep new functions under it, but splitting code that reads well top to bottom just to get under 15 isn't the goal.
-- `ruff format` isn't enforced. Don't reformat the whole file in an unrelated change.
+- `ruff format` is enforced on CI (`tasks/` is excluded). Run `ruff format .` before committing. Add formatting-only commits (e.g. after a ruff upgrade changes the style) to `.git-blame-ignore-revs`.
 - pytest collects only from `tests/` (`testpaths`), so Python harnesses under `tasks/` (named `test_solution.py`) are never run as tests themselves.
 
 ## CI
 
-- `.github/workflows/`: `ci.yml` has two jobs: `test` (ruff + pytest on Python 3.13 and 3.14) and `sonarqube` (after the tests: pytest under `coverage`, then SonarQube Cloud analysis, configured in `sonar-project.properties`; skipped for fork PRs, which get no secrets; automatic analysis is off; the quality gate requires 80 % coverage of new code, and sandbox tests skip on CI, so new runner code needs tests that work without the sandbox too). `osv-scanner.yml` runs OSV-Scanner over the whole repository (`uv.lock` is currently its only lockfile). CodeQL runs through GitHub's default setup (Python, Actions, C/C++ and Go, extended query suite), not a workflow file. OSV and CodeQL report to GitHub code scanning.
+- `.github/workflows/`: `ci.yml` has two jobs: `test` (ruff check, ruff format --check and pytest on Python 3.13 and 3.14) and `sonarqube` (after the tests: pytest under `coverage`, then SonarQube Cloud analysis, configured in `sonar-project.properties`; skipped for fork PRs, which get no secrets; automatic analysis is off; the quality gate requires 80 % coverage of new code, and sandbox tests skip on CI, so new runner code needs tests that work without the sandbox too). `osv-scanner.yml` runs OSV-Scanner over the whole repository (`uv.lock` is currently its only lockfile). CodeQL runs through GitHub's default setup (Python, Actions, C/C++ and Go, extended query suite), not a workflow file. OSV and CodeQL report to GitHub code scanning.
 - Pin actions to full commit SHAs with the version in a comment, set `persist-credentials: false` on checkouts, and check workflow changes with `actionlint` and `zizmor --persona=auditor`.
 - Don't commit files named `*old-results.json`, `*new-results.json` or `*.sarif`: the OSV PR scan writes its baseline to these paths, and the `guard-osv-results` job fails a PR that tracks one.
 
