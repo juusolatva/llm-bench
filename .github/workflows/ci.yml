@@ -26,6 +26,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv run --locked --no-build --group dev ruff check .
+      - run: uv run --locked --no-build --group dev ruff format --check --diff .
       # Sandbox (end-to-end) tests skip themselves when bwrap + a systemd user session are unavailable.
       - run: uv run --locked --no-build --group dev pytest -rs
 
