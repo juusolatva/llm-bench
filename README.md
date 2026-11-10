@@ -1,5 +1,12 @@
 # llm-bench
 
+[![CI](https://github.com/juusolatva/llm-bench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/juusolatva/llm-bench/actions/workflows/ci.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_llm-bench&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_llm-bench)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_llm-bench&metric=coverage)](https://sonarcloud.io/summary/overall?id=juusolatva_llm-bench)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Python](https://img.shields.io/badge/python-3.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/github/license/juusolatva/llm-bench)](LICENSE)
+
 A dependency-free benchmark for checking how well LLMs write and fix code. It sends 32 small programming and terminal tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
 
 It works with any server that implements `GET /v1/models` and `POST /v1/chat/completions`, including Ollama, LM Studio, the llama.cpp server, vLLM and hosted OpenAI-compatible APIs.
