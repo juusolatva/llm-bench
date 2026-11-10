@@ -12,6 +12,7 @@ toolchains on PATH: python3, gcc, g++, rustc, go, node + tsc, bash (+ coreutils/
 and gawk for terminal tasks).
 Run with --help for usage.
 """
+
 import argparse
 import bisect
 import contextlib
@@ -45,21 +46,21 @@ from typing import NamedTuple
 # code extraction, build/test handling), so rows from different versions are never mixed.
 BENCH_VERSION = "0.5.0"
 # Defaults for the command-line options (see --help).
-DEFAULT_TIMEOUT_S = 1800       # per request: ~max tokens / slowest model's tok/s (at long context) + load time
-DEFAULT_MAX_TOKENS = 16384     # worst-case prompt (~9k tokens) + max tokens must fit in the context window
-DEFAULT_ATTEMPTS = 3           # 1 = no feedback; N = initial attempt + N-1 attempts with build/test feedback
-MAX_MODEL_ERRORS = 3           # skip the rest of a model after this many request errors in a row
+DEFAULT_TIMEOUT_S = 1800  # per request: ~max tokens / slowest model's tok/s (at long context) + load time
+DEFAULT_MAX_TOKENS = 16384  # worst-case prompt (~9k tokens) + max tokens must fit in the context window
+DEFAULT_ATTEMPTS = 3  # 1 = no feedback; N = initial attempt + N-1 attempts with build/test feedback
+MAX_MODEL_ERRORS = 3  # skip the rest of a model after this many request errors in a row
 SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server is unreachable, then give up
 # Context check: a trial needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
 # (system + task prompt; each retry adds the previous reply and the clipped build/test output).
 CONTEXT_BASE_TOKENS = 1000
 CONTEXT_PER_RETRY_TOKENS = 4000
-CONTEXT_CALIBRATION_WORDS = 2000   # filler words used to measure the tokenizer's tokens per word
+CONTEXT_CALIBRATION_WORDS = 2000  # filler words used to measure the tokenizer's tokens per word
 # Plausible tokens per filler word (common English words): outside this range the server's counts are wrong,
 # and the lower bound also caps the size of the filler prompt built from them.
 CONTEXT_TOKENS_PER_WORD = (0.5, 10)
-CONTEXT_TOLERANCE = 0.95           # reported prompt tokens below this share of the expected count = truncated
-FEEDBACK_CHARS = 6000          # max characters of failing build/test output sent back to the model
+CONTEXT_TOLERANCE = 0.95  # reported prompt tokens below this share of the expected count = truncated
+FEEDBACK_CHARS = 6000  # max characters of failing build/test output sent back to the model
 CMD_TIMEOUT_S = 60
 SANDBOX_MEMORY_BYTES = 2 * 1024**3
 SANDBOX_TASKS = 128
@@ -67,23 +68,23 @@ SANDBOX_TMP_BYTES = 512 * 1024**2
 SANDBOX_FILE_BYTES = 64 * 1024**2
 MAX_OUTPUT_BYTES = 1024**2
 MAX_RESPONSE_BYTES = 8 * 1024**2  # API reply body cap, enforced before JSON parsing
-MAX_CONTENT_CHARS = 1024**2        # completion text cap, enforced before anything is written under runs/
+MAX_CONTENT_CHARS = 1024**2  # completion text cap, enforced before anything is written under runs/
 # Only the resolved Rust toolchain is exposed, never ~/.cargo or all of ~/.rustup.
 RUST_SYSROOT = None
 # Likewise only the resolved Node binary and TypeScript package (set by check_toolchains for TypeScript tasks),
 # never the rest of a Node installation (global packages) or the home directory around it.
 NODE_BIN = None
 TS_PACKAGE = None
-NODE_MIN = (22, 0)   # oldest supported Node (major, minor)
-TS_MIN = (5, 5)      # oldest TypeScript that accepts "target": "es2023"
-TS_MAX_MAJOR = 6     # TypeScript 7 runs a native compiler from separate platform packages the sandbox doesn't mount
+NODE_MIN = (22, 0)  # oldest supported Node (major, minor)
+TS_MIN = (5, 5)  # oldest TypeScript that accepts "target": "es2023"
+TS_MAX_MAJOR = 6  # TypeScript 7 runs a native compiler from separate platform packages the sandbox doesn't mount
 BASH = "/bin/bash"
 LD_SO_CACHE = "/etc/ld.so.cache"
-GO_CACHE_MOUNT = "/opt/go-cache"   # where sandboxes see the Go build cache
+GO_CACHE_MOUNT = "/opt/go-cache"  # where sandboxes see the Go build cache
 # Host directory with a pre-built Go build cache (race-instrumented standard library), shown to each sandbox
 # through a throwaway overlay so attempts can't change it for each other. None: every sandbox starts empty.
 GO_CACHE = None
-GO_CACHE_WARM_TIMEOUT_S = 900   # warming compiles the whole standard library once, with -race
+GO_CACHE_WARM_TIMEOUT_S = 900  # warming compiles the whole standard library once, with -race
 
 SYSTEM = (
     "You are an expert programmer. Reply with exactly one fenced code block containing the complete "
@@ -95,7 +96,7 @@ SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 # printed it, so a solution that ends the process early with status 0 (sys.exit(0) at import, exit(0) in C)
 # fails instead of skipping the remaining checks.
 HARNESS_FINAL_LINE = "harness: all checks passed"
-SH_HARNESS = "test.sh"   # the harness file of the Bash and terminal tasks
+SH_HARNESS = "test.sh"  # the harness file of the Bash and terminal tasks
 # Per language: task name prefix, solution file, harness file, code block language tags (preferred by
 # extract_code), extra files, build/test commands, other tools the tasks rely on ("tools", checked by
 # check_toolchains like the commands), and "final_line": text the last command must print after its
@@ -120,33 +121,102 @@ TS_CONFIG = """\
 }
 """
 LANGS = {
-    "python": {"prefix": "py", "sol": "solution.py", "test": "test_solution.py", "tags": ("python", "py", "python3"),
-               "cmds": [["python3", "test_solution.py"]], "final_line": HARNESS_FINAL_LINE},
-    "c": {"prefix": "c", "sol": "solution.c", "test": "test.c", "tags": ("c", "h"),
-          "cmds": [["gcc", "-std=gnu17", "-O1", "-g", "-Wall", *SAN, "solution.c", "test.c", "-o", "t", "-lm"],
-                   ["./t"]], "final_line": HARNESS_FINAL_LINE},
-    "cpp": {"prefix": "cpp", "sol": "solution.hpp", "test": "test.cpp", "tags": ("cpp", "c++", "cxx", "cc", "hpp", "h++"),
-            "cmds": [["g++", "-std=c++17", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"],
-                     ["./t"]], "final_line": HARNESS_FINAL_LINE},
-    "rust": {"prefix": "rust", "sol": "lib.rs", "test": "test.rs", "tags": ("rust", "rs"),
-             "cmds": [["rustc", "--edition", "2021", "--crate-type", "rlib", "--crate-name", "solution", "-O",
-                       "-o", "libsolution.rlib", "lib.rs"],
-                      ["rustc", "--edition", "2021", "--test", "-O", "--extern", "solution=libsolution.rlib",
-                       "-o", "t", "test.rs"],
-                      ["./t"]], "final_line": "test result: ok."},
-    "go": {"prefix": "go", "sol": "solution.go", "test": "solution_test.go", "tags": ("go", "golang"),
-           "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
-           "cmds": [["go", "test", "-race", "-count=1"]], "final_line": HARNESS_FINAL_LINE},
-    "ts": {"prefix": "ts", "sol": "solution.ts", "test": "test.ts", "tags": ("typescript", "ts"),
-           "extra": {"package.json": '{"type": "module"}\n', "tsconfig.json": TS_CONFIG},
-           "cmds": [["tsc", "--project", "tsconfig.json"], ["node", "out/test.js"]],
-           "final_line": HARNESS_FINAL_LINE, "strip_ansi": True},
-    "bash": {"prefix": "bash", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
-             "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE},
+    "python": {
+        "prefix": "py",
+        "sol": "solution.py",
+        "test": "test_solution.py",
+        "tags": ("python", "py", "python3"),
+        "cmds": [["python3", "test_solution.py"]],
+        "final_line": HARNESS_FINAL_LINE,
+    },
+    "c": {
+        "prefix": "c",
+        "sol": "solution.c",
+        "test": "test.c",
+        "tags": ("c", "h"),
+        "cmds": [["gcc", "-std=gnu17", "-O1", "-g", "-Wall", *SAN, "solution.c", "test.c", "-o", "t", "-lm"], ["./t"]],
+        "final_line": HARNESS_FINAL_LINE,
+    },
+    "cpp": {
+        "prefix": "cpp",
+        "sol": "solution.hpp",
+        "test": "test.cpp",
+        "tags": ("cpp", "c++", "cxx", "cc", "hpp", "h++"),
+        "cmds": [["g++", "-std=c++17", "-O1", "-g", "-Wall", *SAN, "-pthread", "test.cpp", "-o", "t"], ["./t"]],
+        "final_line": HARNESS_FINAL_LINE,
+    },
+    "rust": {
+        "prefix": "rust",
+        "sol": "lib.rs",
+        "test": "test.rs",
+        "tags": ("rust", "rs"),
+        "cmds": [
+            [
+                "rustc",
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "solution",
+                "-O",
+                "-o",
+                "libsolution.rlib",
+                "lib.rs",
+            ],
+            [
+                "rustc",
+                "--edition",
+                "2021",
+                "--test",
+                "-O",
+                "--extern",
+                "solution=libsolution.rlib",
+                "-o",
+                "t",
+                "test.rs",
+            ],
+            ["./t"],
+        ],
+        "final_line": "test result: ok.",
+    },
+    "go": {
+        "prefix": "go",
+        "sol": "solution.go",
+        "test": "solution_test.go",
+        "tags": ("go", "golang"),
+        "extra": {"go.mod": "module solution\n\ngo 1.22\n"},
+        "cmds": [["go", "test", "-race", "-count=1"]],
+        "final_line": HARNESS_FINAL_LINE,
+    },
+    "ts": {
+        "prefix": "ts",
+        "sol": "solution.ts",
+        "test": "test.ts",
+        "tags": ("typescript", "ts"),
+        "extra": {"package.json": '{"type": "module"}\n', "tsconfig.json": TS_CONFIG},
+        "cmds": [["tsc", "--project", "tsconfig.json"], ["node", "out/test.js"]],
+        "final_line": HARNESS_FINAL_LINE,
+        "strip_ansi": True,
+    },
+    "bash": {
+        "prefix": "bash",
+        "sol": "solution.sh",
+        "test": SH_HARNESS,
+        "tags": ("bash", "sh", "shell"),
+        "cmds": [["bash", SH_HARNESS]],
+        "final_line": HARNESS_FINAL_LINE,
+    },
     # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
-    "term": {"prefix": "term", "sol": "solution.sh", "test": SH_HARNESS, "tags": ("bash", "sh", "shell"),
-             "cmds": [["bash", SH_HARNESS]], "final_line": HARNESS_FINAL_LINE,
-             "tools": ("gawk", "grep", "sed", "find", "xargs", "sort", "comm", "diff", "cmp")},
+    "term": {
+        "prefix": "term",
+        "sol": "solution.sh",
+        "test": SH_HARNESS,
+        "tags": ("bash", "sh", "shell"),
+        "cmds": [["bash", SH_HARNESS]],
+        "final_line": HARNESS_FINAL_LINE,
+        "tools": ("gawk", "grep", "sed", "find", "xargs", "sort", "comm", "diff", "cmp"),
+    },
 }
 
 # --------------------------------------------------------------------------------------------
@@ -205,15 +275,36 @@ def load_tasks(roots):
             if langdir.is_dir():
                 tasks.extend(_load_task(taskdir, lang, seen) for taskdir in _visible_dirs(langdir))
     order = list(LANGS)
-    return sorted(tasks, key=lambda t: order.index(t["lang"]))   # stable: keeps root and name order
+    return sorted(tasks, key=lambda t: order.index(t["lang"]))  # stable: keeps root and name order
+
 
 # --------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------
 
-FIELDS = ["run_id", "endpoint", "model", "task", "lang", "repeat", "passed", "passed_on", "attempts",
-          "prompt_tokens", "completion_tokens", "reasoning_tokens", "seconds", "usage_seconds", "load_seconds", "finish_reason",
-          "fail_stage", "context", "params", "settings", "config"]
+FIELDS = [
+    "run_id",
+    "endpoint",
+    "model",
+    "task",
+    "lang",
+    "repeat",
+    "passed",
+    "passed_on",
+    "attempts",
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "seconds",
+    "usage_seconds",
+    "load_seconds",
+    "finish_reason",
+    "fail_stage",
+    "context",
+    "params",
+    "settings",
+    "config",
+]
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_CLOSE = "</think>"
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -228,7 +319,7 @@ FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")   # terminal color/style sequences (CSI)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")  # terminal color/style sequences (CSI)
 
 
 def safe_name(name):
@@ -237,7 +328,7 @@ def safe_name(name):
     return re.sub(r"^\.", "_", UNSAFE_NAME_RE.sub("_", name)) or "_"
 
 
-MODEL_DIR_BYTES = 200   # longest transcript directory name before "-2", "-3", ...: file systems allow 255 bytes
+MODEL_DIR_BYTES = 200  # longest transcript directory name before "-2", "-3", ...: file systems allow 255 bytes
 
 
 def model_dirs(models):
@@ -251,7 +342,7 @@ def model_dirs(models):
     for m in dict.fromkeys(models):
         name = safe_name(m)
         if name != m or len(name.encode()) > MODEL_DIR_BYTES:
-            prefix = name.encode()[:MODEL_DIR_BYTES - 17].decode(errors="ignore")   # \w also matches non-ASCII
+            prefix = name.encode()[: MODEL_DIR_BYTES - 17].decode(errors="ignore")  # \w also matches non-ASCII
             name = f"{prefix}~{hashlib.sha256(m.encode()).hexdigest()[:16]}"
         candidate, k = name, 2
         while name in taken:
@@ -308,11 +399,12 @@ def http_json(url, payload=None, timeout=60, api_key=None):
         e.close()
         location = e.headers.get("Location")
         if location:
-            with contextlib.suppress(ValueError):   # malformed (e.g. "http://[bad"): report it as sent
+            with contextlib.suppress(ValueError):  # malformed (e.g. "http://[bad"): report it as sent
                 location = urllib.parse.urljoin(url, location)
         target = f"redirect to {location[:200]!r}" if location else "redirect"
-        raise urllib.error.HTTPError(url, e.code, f"{e.reason}; {target} not followed (use the final URL as the "
-                                     "endpoint)", e.headers, None) from None
+        raise urllib.error.HTTPError(
+            url, e.code, f"{e.reason}; {target} not followed (use the final URL as the endpoint)", e.headers, None
+        ) from None
     if len(body) > MAX_RESPONSE_BYTES:
         raise ValueError(f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes")
     return json.loads(body)
@@ -357,22 +449,22 @@ def _code_blocks(text):
     The closing fences are found in one pass, so this stays linear in the reply length."""
     closes = [(m.start(), m.end(), len(m.group(1))) for m in FENCE_CLOSE_RE.finditer(text)]
     starts = [c[0] for c in closes]
-    longest_after = [0] * (len(closes) + 1)   # longest closing fence at or after each index
+    longest_after = [0] * (len(closes) + 1)  # longest closing fence at or after each index
     for i in range(len(closes) - 1, -1, -1):
         longest_after[i] = max(closes[i][2], longest_after[i + 1])
     blocks, pos = [], 0
-    while (opening := FENCE_OPEN_RE.search(text, pos)):
+    while opening := FENCE_OPEN_RE.search(text, pos):
         fence, tag = (opening.group(1), opening.group(2)) if opening.group(1) else (opening.group(3), opening.group(4))
         i = bisect.bisect_left(starts, opening.end())
         if longest_after[i] < len(fence):
             break
-        while closes[i][2] < len(fence):   # shorter fences inside the block are code
+        while closes[i][2] < len(fence):  # shorter fences inside the block are code
             i += 1
         code_end, end, _ = closes[i]
         line_start = text.rfind("\n", 0, code_end) + 1
         if line_start >= opening.end() and not text[line_start:code_end].strip():
-            code_end = line_start   # a fence on its own (possibly indented) line: the code ends before it
-        blocks.append((opening.start(), end, tag, text[opening.end():code_end]))
+            code_end = line_start  # a fence on its own (possibly indented) line: the code ends before it
+        blocks.append((opening.start(), end, tag, text[opening.end() : code_end]))
         pos = end
     return blocks
 
@@ -405,17 +497,17 @@ def strip_think(text):
     outside = set(_outside_code(_code_blocks(text), [m.start() for m in pairs]))
     pieces, end = [], 0
     for m in pairs:
-        if m.start() in outside:   # pairs inside code stay in place
-            pieces.append(text[end:m.start()])
+        if m.start() in outside:  # pairs inside code stay in place
+            pieces.append(text[end : m.start()])
             end = m.end()
     text = "".join(pieces) + text[end:]
     blocks = _code_blocks(text)
     closes = _outside_code(blocks, [m.start() for m in re.finditer(THINK_CLOSE, text)])
     followed = [c for c in closes if blocks and blocks[-1][0] > c]
     if followed:
-        text = text[followed[-1] + len(THINK_CLOSE):]
+        text = text[followed[-1] + len(THINK_CLOSE) :]
     elif closes and not blocks:
-        text = text[closes[0] + len(THINK_CLOSE):]
+        text = text[closes[0] + len(THINK_CLOSE) :]
     return "" if text.lstrip().startswith("<think>") else text
 
 
@@ -430,8 +522,7 @@ def extract_code(text, lang=None):
     if not blocks:
         return text
     tags = LANGS[lang]["tags"] if lang else ()
-    candidates = ([code for _, _, tag, code in blocks if tag.lower() in tags]
-                  or [code for _, _, _, code in blocks])
+    candidates = [code for _, _, tag, code in blocks if tag.lower() in tags] or [code for _, _, _, code in blocks]
     longest = max(reversed(candidates), key=lambda code: len(code.strip()))
     last = candidates[-1]
     return last if 2 * len(last.strip()) >= len(longest.strip()) else longest
@@ -460,11 +551,11 @@ os.execv(sys.argv[3], sys.argv[3:])
 class CmdResult(NamedTuple):
     rc: int
     out: str
-    timed_out: bool   # killed at the CMD_TIMEOUT_S time limit
+    timed_out: bool  # killed at the CMD_TIMEOUT_S time limit
 
 
 TIME_LIMIT_MARKER = "[killed: exceeded the {limit} s time limit for building and testing]"
-ACTIVE_UNITS = set()          # systemd units of running sandboxes, stopped on interrupt
+ACTIVE_UNITS = set()  # systemd units of running sandboxes, stopped on interrupt
 ACTIVE_UNITS_LOCK = threading.Lock()
 
 
@@ -473,8 +564,13 @@ def stop_active_units():
     with ACTIVE_UNITS_LOCK:
         units = list(ACTIVE_UNITS)
     for unit in units:
-        subprocess.run(["systemctl", "--user", "stop", unit], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        subprocess.run(
+            ["systemctl", "--user", "stop", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
 
 
 def sandbox_path_dirs():
@@ -482,16 +578,26 @@ def sandbox_path_dirs():
     tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
     then /usr/bin and /bin. Home, project and relative entries are left out because the sandbox doesn't expose
     them."""
-    system_path = [path for path in os.get_exec_path()
-                   if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")]
+    system_path = [
+        path for path in os.get_exec_path() if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")
+    ]
     return [*system_path, "/usr/bin", "/bin"]
 
 
 def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
     """The command line that runs cmd in a bwrap sandbox inside the bounded systemd unit `unit` (see run_cmd).
     tools maps "bwrap" and "systemd-run" to their paths."""
-    sandbox = [tools["bwrap"], "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
-               "--new-session", "--cap-drop", "ALL", "--clearenv"]
+    sandbox = [
+        tools["bwrap"],
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+        "--clearenv",
+    ]
     # Expose runtime/toolchain files, not all of /etc, /home, /run or the host root.
     for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives"):
         if Path(path).exists():
@@ -504,38 +610,79 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
     if NODE_BIN is not None:
         sandbox += ["--ro-bind", str(NODE_BIN), "/opt/node/bin/node"]
     if TS_PACKAGE is not None:
-        sandbox += ["--ro-bind", str(TS_PACKAGE), "/opt/typescript",
-                    "--symlink", "/opt/typescript/bin/tsc", "/opt/node/bin/tsc"]
-    sandbox += ["--proc", "/proc", "--dev", "/dev",
-                "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/tmp",
-                "--size", str(SANDBOX_TMP_BYTES), "--tmpfs", "/work",
-                "--ro-bind", str(Path(cwd).resolve()), "/input", "--chdir", "/work"]
+        sandbox += [
+            "--ro-bind",
+            str(TS_PACKAGE),
+            "/opt/typescript",
+            "--symlink",
+            "/opt/typescript/bin/tsc",
+            "/opt/node/bin/tsc",
+        ]
+    sandbox += [
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--size",
+        str(SANDBOX_TMP_BYTES),
+        "--tmpfs",
+        "/tmp",
+        "--size",
+        str(SANDBOX_TMP_BYTES),
+        "--tmpfs",
+        "/work",
+        "--ro-bind",
+        str(Path(cwd).resolve()),
+        "/input",
+        "--chdir",
+        "/work",
+    ]
     if go_cache_rw is not None:
         sandbox += ["--bind", str(go_cache_rw), GO_CACHE_MOUNT]
     elif GO_CACHE is not None:
         sandbox += ["--overlay-src", str(GO_CACHE), "--tmp-overlay", GO_CACHE_MOUNT]
     sandbox_path = ":".join(["/opt/rust/bin", "/opt/node/bin", *sandbox_path_dirs()])
     for key, value in {
-        "PATH": sandbox_path, "HOME": "/tmp", "TMPDIR": "/tmp", "LC_ALL": "C",
+        "PATH": sandbox_path,
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "LC_ALL": "C",
         "GOCACHE": GO_CACHE_MOUNT if go_cache_rw is not None or GO_CACHE is not None else "/tmp/go-cache",
-        "GOPATH": "/tmp/go", "GOPROXY": "off",
-        "GOSUMDB": "off", "GOTOOLCHAIN": "local", "GOMAXPROCS": "2",
+        "GOPATH": "/tmp/go",
+        "GOPROXY": "off",
+        "GOSUMDB": "off",
+        "GOTOOLCHAIN": "local",
+        "GOMAXPROCS": "2",
     }.items():
         sandbox += ["--setenv", key, value]
     # Copy inputs into private tmpfs. Generated files never reach parent reports,
     # including symlinks named response.md/log.txt or compiler-created artifacts.
-    sandbox += ["--", BASH, "-ec",
-                'cp -a /input/. /work/\nexec "$@"', "sandbox", *cmd]
+    sandbox += ["--", BASH, "-ec", 'cp -a /input/. /work/\nexec "$@"', "sandbox", *cmd]
     command = [
-        tools["systemd-run"], "--user", "--quiet", "--wait", "--pipe", "--collect",
-        f"--unit={unit}", f"--property=MemoryMax={SANDBOX_MEMORY_BYTES}",
-        "--property=MemorySwapMax=0", f"--property=TasksMax={SANDBOX_TASKS}",
-        "--property=CPUQuota=200%", f"--property=RuntimeMaxSec={timeout}s",
-        "--property=TimeoutStopSec=2s", "--property=KillMode=control-group",
-        "--property=OOMPolicy=kill", "--property=NoNewPrivileges=yes",
-        "--property=LimitCORE=0", f"--property=LimitFSIZE={SANDBOX_FILE_BYTES}",
-        sys.executable, "-c", CGROUP_GUARD, str(SANDBOX_MEMORY_BYTES),
-        str(SANDBOX_TASKS), *sandbox,
+        tools["systemd-run"],
+        "--user",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        f"--unit={unit}",
+        f"--property=MemoryMax={SANDBOX_MEMORY_BYTES}",
+        "--property=MemorySwapMax=0",
+        f"--property=TasksMax={SANDBOX_TASKS}",
+        "--property=CPUQuota=200%",
+        f"--property=RuntimeMaxSec={timeout}s",
+        "--property=TimeoutStopSec=2s",
+        "--property=KillMode=control-group",
+        "--property=OOMPolicy=kill",
+        "--property=NoNewPrivileges=yes",
+        "--property=LimitCORE=0",
+        f"--property=LimitFSIZE={SANDBOX_FILE_BYTES}",
+        sys.executable,
+        "-c",
+        CGROUP_GUARD,
+        str(SANDBOX_MEMORY_BYTES),
+        str(SANDBOX_TASKS),
+        *sandbox,
     ]
     return command
 
@@ -558,15 +705,19 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
             ACTIVE_UNITS.add(unit)
         t0 = time.monotonic()
         try:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                       stdout=output, stderr=subprocess.STDOUT)
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
             try:
                 rc = process.wait(timeout=timeout + 10)
             finally:
                 # Also kill detached descendants after normal completion or interruption.
                 try:
-                    subprocess.run([tools["systemctl"], "--user", "stop", unit], check=False,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    subprocess.run(
+                        [tools["systemctl"], "--user", "stop", unit],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
                 finally:
                     if process.poll() is None:
                         process.kill()
@@ -574,7 +725,7 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
                     with ACTIVE_UNITS_LOCK:
                         ACTIVE_UNITS.discard(unit)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            with ACTIVE_UNITS_LOCK:   # also when the unit never started (Popen failed)
+            with ACTIVE_UNITS_LOCK:  # also when the unit never started (Popen failed)
                 ACTIVE_UNITS.discard(unit)
             return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
         # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
@@ -605,8 +756,10 @@ def check_ts_sandbox(tasks):
     with tempfile.TemporaryDirectory(prefix="llm-sandbox-check-") as directory:
         rc, out, _ = run_cmd(["tsc", "--version"], Path(directory))
     if rc != 0:
-        sys.exit("tsc doesn't run inside the sandbox, which sees only the Node binary and the typescript package "
-                 f"(TypeScript builds that need other files aren't supported):\n{out}")
+        sys.exit(
+            "tsc doesn't run inside the sandbox, which sees only the Node binary and the typescript package "
+            f"(TypeScript builds that need other files aren't supported):\n{out}"
+        )
 
 
 GO_WARM_TEST = """package solution
@@ -634,20 +787,31 @@ def prepare_go_cache(directory):
     (work / "solution_test.go").write_text(GO_WARM_TEST)
     log("go: warming the build cache (race-instrumented standard library), this takes a minute...", err=True)
     t0 = time.monotonic()
-    warm = run_cmd([BASH, "-ec", "go build -race std\n" + shlex.join(LANGS["go"]["cmds"][-1])], work,
-                   timeout=GO_CACHE_WARM_TIMEOUT_S, go_cache_rw=cache)
+    warm = run_cmd(
+        [BASH, "-ec", "go build -race std\n" + shlex.join(LANGS["go"]["cmds"][-1])],
+        work,
+        timeout=GO_CACHE_WARM_TIMEOUT_S,
+        go_cache_rw=cache,
+    )
     if warm.rc != 0:
-        log(f"go: warning: warming the build cache failed; each Go attempt compiles the standard library "
-            f"from scratch and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(warm.out)}", err=True)
+        log(
+            f"go: warning: warming the build cache failed; each Go attempt compiles the standard library "
+            f"from scratch and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(warm.out)}",
+            err=True,
+        )
         return
     GO_CACHE = cache
-    probe = run_cmd([BASH, "-ec", f"touch {GO_CACHE_MOUNT}/llm-bench-probe\n"
-                     + shlex.join(LANGS["go"]["cmds"][-1])], work)
+    probe = run_cmd(
+        [BASH, "-ec", f"touch {GO_CACHE_MOUNT}/llm-bench-probe\n" + shlex.join(LANGS["go"]["cmds"][-1])], work
+    )
     if probe.rc != 0 or (cache / "llm-bench-probe").exists():
         GO_CACHE = None
-        log("go: warning: the warmed build cache can't be mounted as a private overlay (needs bubblewrap 0.11+ "
+        log(
+            "go: warning: the warmed build cache can't be mounted as a private overlay (needs bubblewrap 0.11+ "
             f"and overlayfs in user namespaces); each Go attempt compiles the standard library from scratch "
-            f"and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(probe.out)}", err=True)
+            f"and may hit the {CMD_TIMEOUT_S} s limit:\n{clip(probe.out)}",
+            err=True,
+        )
         return
     log(f"go: build cache ready in {time.monotonic() - t0:.0f}s", err=True)
 
@@ -655,20 +819,28 @@ def prepare_go_cache(directory):
 def feedback(stage, cmd, out):
     """The follow-up message sent to the model after a failed attempt."""
     if stage == "no_code":
-        return ("Your reply did not contain any code. Reply with exactly one fenced code block containing the "
-                "complete file.")
+        return (
+            "Your reply did not contain any code. Reply with exactly one fenced code block containing the "
+            "complete file."
+        )
     if stage == "time_limit":
-        head = (f"Your solution was stopped because building and testing it exceeded the {CMD_TIMEOUT_S} s "
-                f"time limit. Output of `{cmd}` before it was stopped:")
+        head = (
+            f"Your solution was stopped because building and testing it exceeded the {CMD_TIMEOUT_S} s "
+            f"time limit. Output of `{cmd}` before it was stopped:"
+        )
     else:
         head = f"Your solution failed. Output of `{cmd}`:"
-    return (f"{head}\n```\n{clip(out)}\n```\n"
-            "Fix the problem. Reply with exactly one fenced code block containing the complete corrected file.")
+    return (
+        f"{head}\n```\n{clip(out)}\n```\n"
+        "Fix the problem. Reply with exactly one fenced code block containing the complete corrected file."
+    )
 
 
-EARLY_EXIT_NOTE = ('[the test harness exited with status 0 before it finished: its final line "{final_line}" was never '
-                   "printed. Does your code end the process, e.g. with exit(), sys.exit(), os.Exit() or "
-                   "std::process::exit()?]")
+EARLY_EXIT_NOTE = (
+    '[the test harness exited with status 0 before it finished: its final line "{final_line}" was never '
+    "printed. Does your code end the process, e.g. with exit(), sys.exit(), os.Exit() or "
+    "std::process::exit()?]"
+)
 
 
 def finished(out, last_cmd, final_line):
@@ -677,7 +849,7 @@ def finished(out, last_cmd, final_line):
     the harness's output, so its own unterminated output (print("x", end="")) can come first on the same line."""
     lines = out.splitlines()
     start = max((i for i, line in enumerate(lines) if line == f"$ {last_cmd}"), default=None)
-    return start is not None and any(final_line in line for line in lines[start + 1:])
+    return start is not None and any(final_line in line for line in lines[start + 1 :])
 
 
 def run_task(task, code, workdir):
@@ -726,7 +898,7 @@ def clip(text, limit=FEEDBACK_CHARS):
     if len(text) <= limit:
         return text
     head = limit * 2 // 3
-    return text[:head] + "\n[... truncated ...]\n" + text[-(limit - head):]
+    return text[:head] + "\n[... truncated ...]\n" + text[-(limit - head) :]
 
 
 def version_tuple(text):
@@ -738,7 +910,7 @@ def version_tuple(text):
         if not match:
             break
         parts.append(int(match.group()))
-        if match.end() < len(part):   # a pre-release or build suffix ends the version
+        if match.end() < len(part):  # a pre-release or build suffix ends the version
             break
     if len(parts) < 2:
         raise ValueError(f"unrecognized version {text!r}")
@@ -748,8 +920,7 @@ def version_tuple(text):
 def resolve_rust_sysroot():
     """The resolved Rust toolchain directory. rustc may be a rustup proxy under ~/.cargo, so the sandbox gets the
     actual compiler installation instead of the proxy, user home or rustup configuration."""
-    result = subprocess.run(["rustc", "--print", "sysroot"], check=True,
-                            capture_output=True, text=True, timeout=10)
+    result = subprocess.run(["rustc", "--print", "sysroot"], check=True, capture_output=True, text=True, timeout=10)
     sysroot = Path(result.stdout.strip()).resolve(strict=True)
     if not (sysroot / "bin/rustc").is_file():
         raise ValueError("Rust sysroot does not contain bin/rustc")
@@ -760,8 +931,13 @@ def resolve_node_bin():
     """The resolved binary of the `node` on the host PATH, asked from node itself, so version manager shims that
     dispatch to the real binary work too. Only the last non-empty output line counts: NODE_OPTIONS can make node
     print warnings first."""
-    result = subprocess.run(["node", "-e", "console.log(JSON.stringify([process.execPath, process.versions.node]))"],
-                            check=True, capture_output=True, text=True, timeout=10)
+    result = subprocess.run(
+        ["node", "-e", "console.log(JSON.stringify([process.execPath, process.versions.node]))"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     try:
         exec_path, version = json.loads(lines[-1])
@@ -784,16 +960,20 @@ def resolve_ts_package():
     except (OSError, ValueError):
         meta = None
     if tsc.name != "tsc" or tsc.parent.name != "bin" or not isinstance(meta, dict) or meta.get("name") != "typescript":
-        raise ValueError(f"tsc at {tsc} isn't inside a typescript package; put a real tsc first on PATH "
-                         "(wrappers such as Volta, asdf or pnpm shims aren't supported)")
+        raise ValueError(
+            f"tsc at {tsc} isn't inside a typescript package; put a real tsc first on PATH "
+            "(wrappers such as Volta, asdf or pnpm shims aren't supported)"
+        )
     version = str(meta.get("version", ""))
     parsed = version_tuple(version)
     if parsed[:2] < TS_MIN:
         raise ValueError(f"TypeScript {version} at {package} is too old (need {TS_MIN[0]}.{TS_MIN[1]}+)")
     if parsed[0] > TS_MAX_MAJOR:
-        raise ValueError(f"TypeScript {version} at {package} isn't supported (need {TS_MIN[0]}.{TS_MIN[1]} to "
-                         f"{TS_MAX_MAJOR}.x; its native compiler lives outside the typescript package): "
-                         f"npm install -g typescript@{TS_MAX_MAJOR}")
+        raise ValueError(
+            f"TypeScript {version} at {package} isn't supported (need {TS_MIN[0]}.{TS_MIN[1]} to "
+            f"{TS_MAX_MAJOR}.x; its native compiler lives outside the typescript package): "
+            f"npm install -g typescript@{TS_MAX_MAJOR}"
+        )
     return package
 
 
@@ -811,12 +991,15 @@ def check_toolchains(tasks):
     # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count, except for
     # HOST_RESOLVED commands: the sandbox gets their resolved toolchain below.
     path = os.pathsep.join(sandbox_path_dirs())
-    missing = sorted(name for name in needed
-                     if shutil.which(name, path=None if name in HOST_RESOLVED else path) is None)
+    missing = sorted(
+        name for name in needed if shutil.which(name, path=None if name in HOST_RESOLVED else path) is None
+    )
     if missing:
-        sys.exit(f"missing toolchains on PATH: {', '.join(missing)}\n"
-                 f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
-                 f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')")
+        sys.exit(
+            f"missing toolchains on PATH: {', '.join(missing)}\n"
+            f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
+            f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')"
+        )
     if "rust" in langs:
         try:
             RUST_SYSROOT = resolve_rust_sysroot()
@@ -849,8 +1032,9 @@ def server_reachable(base, api_key):
 def valid_counts(usage):
     """usage without prompt_tokens and completion_tokens values that aren't non-negative ints: a server that
     reports something else (a string, a fraction, a bool) reports no count, and callers can rely on the rest."""
-    return {k: v for k, v in usage.items()
-            if k not in ("prompt_tokens", "completion_tokens") or (type(v) is int and v >= 0)}
+    return {
+        k: v for k, v in usage.items() if k not in ("prompt_tokens", "completion_tokens") or (type(v) is int and v >= 0)
+    }
 
 
 def http_error_detail(e):
@@ -905,17 +1089,17 @@ def chat(label, base, payload, opts, stop):
         t0 = time.monotonic()
         try:
             resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
-        except urllib.error.HTTPError as e:   # the server answered: model failed to load, crashed, prompt too long
+        except urllib.error.HTTPError as e:  # the server answered: model failed to load, crashed, prompt too long
             log(f"{label}: HTTP {e.code}: {http_error_detail(e) or e.reason}", err=True)
             return "", None, {}, f"http_{e.code}", time.monotonic() - t0
-        except TimeoutError:   # raised directly only while waiting for the reply: the model was too slow
+        except TimeoutError:  # raised directly only while waiting for the reply: the model was too slow
             log(f"{label}: no reply within {opts.timeout}s", err=True)
             return "", None, {}, "timeout", time.monotonic() - t0
         except (OSError, http.client.HTTPException) as e:
             if connection_lost(label, base, opts, e, delay, stop):
                 return "", None, {}, "disconnected", time.monotonic() - t0
             continue
-        except ValueError as e:   # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
+        except ValueError as e:  # invalid JSON, truncated body or a reply over MAX_RESPONSE_BYTES
             log(f"{label}: bad response: {e}", err=True)
             return "", None, {}, "bad_response", time.monotonic() - t0
         return parse_reply(label, resp, time.monotonic() - t0)
@@ -944,7 +1128,7 @@ def add_usage(result, usage, request_seconds, reasoning_complete):
     Returns whether every reply so far reported its reasoning tokens."""
     result["prompt_tokens"] += usage.get("prompt_tokens") or 0
     result["completion_tokens"] += usage.get("completion_tokens") or 0
-    if usage.get("completion_tokens") is not None:   # reported, even if 0: a measurement
+    if usage.get("completion_tokens") is not None:  # reported, even if 0: a measurement
         # Throughput's time base: the requests of the replies that report their tokens, no server waits.
         result["usage_seconds"] += request_seconds
     # The trial's reasoning tokens are known only if every reply reported them: a partial sum would sit next to
@@ -988,7 +1172,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
         try:
             text, finish, usage, error, request_seconds = chat(label, base, payload, opts, stop)
         finally:
-            result["seconds"] += time.monotonic() - t0   # all waiting, including for an unreachable server
+            result["seconds"] += time.monotonic() - t0  # all waiting, including for an unreachable server
         result["attempts"] = attempt
         if error:
             result["finish_reason"], result["fail_stage"] = error, "request"
@@ -1011,7 +1195,7 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             {"role": "user", "content": feedback(stage, fail_cmd, fail_out)},
         ]
     result["seconds"] = round(result["seconds"], 2)
-    result["usage_seconds"] = round(result["usage_seconds"], 4)   # 0.1 ms: fast replies don't round to 0
+    result["usage_seconds"] = round(result["usage_seconds"], 4)  # 0.1 ms: fast replies don't round to 0
     return result
 
 
@@ -1050,21 +1234,30 @@ def check_context(label, base, model, opts, stop, base_tokens):
     prefix = "Reply with OK. Ignore the following text.\n\n"
     _, _, usage, error, _ = probe(label, base, model, prefix + filler(CONTEXT_CALIBRATION_WORDS), opts, stop)
     sample_tokens = usage.get("prompt_tokens")
-    if error and error.startswith("http_"):   # even the short calibration prompt doesn't fit
-        log(f"{label}: warning: the server rejected a ~{CONTEXT_CALIBRATION_WORDS}-word prompt ({error}); the "
-            f"context is far below the {need} tokens needed", err=True)
+    if error and error.startswith("http_"):  # even the short calibration prompt doesn't fit
+        log(
+            f"{label}: warning: the server rejected a ~{CONTEXT_CALIBRATION_WORDS}-word prompt ({error}); the "
+            f"context is far below the {need} tokens needed",
+            err=True,
+        )
         return f"rejected:{error}"
     if error or not base_tokens or not sample_tokens or sample_tokens <= base_tokens:
-        log(f"{label}: warning: can't check the context size ({error or 'the server reports no token usage'})",
-            err=True)
+        log(
+            f"{label}: warning: can't check the context size ({error or 'the server reports no token usage'})", err=True
+        )
         return "unchecked"
     per_word = (sample_tokens - base_tokens) / CONTEXT_CALIBRATION_WORDS
-    counts = (f"the server reports {base_tokens} prompt tokens for a short prompt and {sample_tokens} with "
-              f"{CONTEXT_CALIBRATION_WORDS} words added, {per_word:.3g} tokens per word")
+    counts = (
+        f"the server reports {base_tokens} prompt tokens for a short prompt and {sample_tokens} with "
+        f"{CONTEXT_CALIBRATION_WORDS} words added, {per_word:.3g} tokens per word"
+    )
     low, high = CONTEXT_TOKENS_PER_WORD
-    if per_word < low:   # even the calibration prompt was cut off (or the counts are wrong)
-        log(f"{label}: warning: the context holds only about {sample_tokens} of the {need} tokens needed ({counts}); "
-            f"long replies and retries will be cut off. Raise the server's context length", err=True)
+    if per_word < low:  # even the calibration prompt was cut off (or the counts are wrong)
+        log(
+            f"{label}: warning: the context holds only about {sample_tokens} of the {need} tokens needed ({counts}); "
+            f"long replies and retries will be cut off. Raise the server's context length",
+            err=True,
+        )
         return f"short:{sample_tokens}"
     if per_word > high:
         log(f"{label}: warning: can't check the context size ({counts})", err=True)
@@ -1074,18 +1267,26 @@ def check_context(label, base, model, opts, stop, base_tokens):
     log(f"{label}: checking that the context holds {need} tokens...", err=True)
     _, _, usage, error, _ = probe(label, base, model, prefix + filler(words), opts, stop)
     if error:
-        log(f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
-            f"smaller. Raise the server's context length or lower --max-tokens / --attempts", err=True)
+        log(
+            f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
+            f"smaller. Raise the server's context length or lower --max-tokens / --attempts",
+            err=True,
+        )
         return f"rejected:{error}"
     got = usage.get("prompt_tokens")
-    if got is None:   # no valid count this time: truncation can't be told apart from a working context
-        log(f"{label}: warning: can't check the context size (the server reports no token usage for the "
-            f"{need}-token prompt)", err=True)
+    if got is None:  # no valid count this time: truncation can't be told apart from a working context
+        log(
+            f"{label}: warning: can't check the context size (the server reports no token usage for the "
+            f"{need}-token prompt)",
+            err=True,
+        )
         return "unchecked"
     if got < CONTEXT_TOLERANCE * expected:
-        log(f"{label}: warning: the context holds only about {got} of the {need} tokens needed; long replies and "
+        log(
+            f"{label}: warning: the context holds only about {got} of the {need} tokens needed; long replies and "
             f"retries will be cut off. Raise the server's context length or lower --max-tokens / --attempts",
-            err=True)
+            err=True,
+        )
         return f"short:{got}"
     return "ok"
 
@@ -1107,10 +1308,17 @@ def prepare_model(label, base, model, opts, stop):
 
 def settings_fingerprint(opts):
     """Everything besides the task itself that can change a result."""
-    return {"version": BENCH_VERSION, "system": SYSTEM, "max_tokens": opts.max_tokens, "attempts": opts.attempts,
-            "params": opts.params, "timeout": opts.timeout, "cmd_timeout": CMD_TIMEOUT_S,
-            "feedback_chars": FEEDBACK_CHARS, "sandbox": [SANDBOX_MEMORY_BYTES, SANDBOX_TASKS, SANDBOX_TMP_BYTES,
-                                                         SANDBOX_FILE_BYTES]}
+    return {
+        "version": BENCH_VERSION,
+        "system": SYSTEM,
+        "max_tokens": opts.max_tokens,
+        "attempts": opts.attempts,
+        "params": opts.params,
+        "timeout": opts.timeout,
+        "cmd_timeout": CMD_TIMEOUT_S,
+        "feedback_chars": FEEDBACK_CHARS,
+        "sandbox": [SANDBOX_MEMORY_BYTES, SANDBOX_TASKS, SANDBOX_TMP_BYTES, SANDBOX_FILE_BYTES],
+    }
 
 
 def settings_hash(settings):
@@ -1121,16 +1329,28 @@ def settings_hash(settings):
 def config_hash(settings, task):
     """Short hash of the settings plus this task's prompt, harness and language spec: rows with equal hashes
     were produced under the same conditions."""
-    data = {"settings": settings, "task": {k: task[k] for k in ("name", "lang", "prompt", "test")},
-            "lang": LANGS[task["lang"]]}
+    data = {
+        "settings": settings,
+        "task": {k: task[k] for k in ("name", "lang", "prompt", "test")},
+        "lang": LANGS[task["lang"]],
+    }
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def skipped_result(finish_reason, fail_stage):
     """The result fields of a trial that was skipped without sending a request (also a trial's starting point)."""
-    return {"passed": 0, "passed_on": 0, "attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
-            "reasoning_tokens": None, "seconds": 0.0, "usage_seconds": 0.0, "finish_reason": finish_reason,
-            "fail_stage": fail_stage}
+    return {
+        "passed": 0,
+        "passed_on": 0,
+        "attempts": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": None,
+        "seconds": 0.0,
+        "usage_seconds": 0.0,
+        "finish_reason": finish_reason,
+        "fail_stage": fail_stage,
+    }
 
 
 INT_FIELDS = ("repeat", "passed", "passed_on", "attempts", "prompt_tokens", "completion_tokens")
@@ -1192,9 +1412,19 @@ class EndpointRun:
         """Number the trial, then append its row to the results file and to rows."""
         key = (model, task["name"], task["config"])
         self.numbered[key] += 1
-        row = {"run_id": self.opts.run_id, "endpoint": self.name, "model": model, "task": task["name"],
-               "lang": task["lang"], "repeat": self.numbered[key], **result, **model_info, "params": self.params,
-               "settings": self.opts.settings_hash, "config": task["config"]}
+        row = {
+            "run_id": self.opts.run_id,
+            "endpoint": self.name,
+            "model": model,
+            "task": task["name"],
+            "lang": task["lang"],
+            "repeat": self.numbered[key],
+            **result,
+            **model_info,
+            "params": self.params,
+            "settings": self.opts.settings_hash,
+            "config": task["config"],
+        }
         self.rows.append(row)
         self.w.writerow(row)
         self.f.flush()
@@ -1210,8 +1440,12 @@ class EndpointRun:
         """The model's trials to run, in round-major order: one round (a trial of every task) finishes before
         the next one starts. With --resume, trials already finished in the results file are left out."""
         opts = self.opts
-        return [task for rep in range(opts.repeat) for task in tasks
-                if not opts.resume or self.finished[(model, task["name"], task["config"])] <= rep]
+        return [
+            task
+            for rep in range(opts.repeat)
+            for task in tasks
+            if not opts.resume or self.finished[(model, task["name"], task["config"])] <= rep
+        ]
 
     def run_model(self, model, model_dir, tasks):
         """Load the model and run its remaining trials, stopping early after too many request errors in a row
@@ -1228,16 +1462,18 @@ class EndpointRun:
         if error:
             self.skip_rest(model, todo, f"loading failed ({error})", error, "load", model_info)
             return
-        model_errors = 0     # consecutive trials that ended in a request error
+        model_errors = 0  # consecutive trials that ended in a request error
         length_finishes = 0  # trials whose last reply hit --max-tokens
         for i, task in enumerate(todo):
             if model_errors >= MAX_MODEL_ERRORS:
-                self.skip_rest(model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request",
-                               model_info)
+                self.skip_rest(
+                    model, todo[i:], f"{model_errors} request errors in a row", "skipped", "request", model_info
+                )
                 return
             if opts.max_length_finishes and length_finishes >= opts.max_length_finishes:
-                self.skip_rest(model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped",
-                               "budget", model_info)
+                self.skip_rest(
+                    model, todo[i:], f"{length_finishes} replies hit --max-tokens", "skipped", "budget", model_info
+                )
                 return
             result = self.run_trial(model, model_dir, task)
             model_errors = model_errors + 1 if is_model_error(result["finish_reason"]) else 0
@@ -1291,7 +1527,7 @@ def newest_configs(rows):
     for i, r in enumerate(rows):
         key = (r.get("settings") or "", r["task"])
         run_id = r.get("run_id") or ""
-        if run_id.endswith("Z") and "." not in run_id:   # older versions wrote whole seconds
+        if run_id.endswith("Z") and "." not in run_id:  # older versions wrote whole seconds
             run_id = run_id[:-1] + ".000Z"
         rank = (run_id, i)
         if key not in newest or rank > newest[key][0]:
@@ -1325,8 +1561,11 @@ def newest_rows(rows):
 def throughput(trials):
     """Completion tokens per second of the replies that reported them, or None without any (see summarize)."""
     measured = [(r["completion_tokens"], r["usage_seconds"]) for r in trials if r.get("usage_seconds") is not None]
-    measured += [(r["completion_tokens"], r["seconds"]) for r in trials if r.get("usage_seconds") is None
-                 and ended_with_reply(r) and r["completion_tokens"] > 0]
+    measured += [
+        (r["completion_tokens"], r["seconds"])
+        for r in trials
+        if r.get("usage_seconds") is None and ended_with_reply(r) and r["completion_tokens"] > 0
+    ]
     usage_seconds = sum(sec for _, sec in measured)
     tokens = sum(tokens for tokens, _ in measured)
     return tokens / usage_seconds if usage_seconds and tokens else None
@@ -1342,8 +1581,7 @@ def mean_reasoning_tokens(tasks):
     with_replies = [r for r in trials if ended_with_reply(r) or (r.get("attempts") or 0) > 1]
     if not with_replies or any(r.get("reasoning_tokens") is None for r in with_replies):
         return None
-    return sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows)
-               for task_rows in tasks.values())
+    return sum(sum(r.get("reasoning_tokens") or 0 for r in task_rows) / len(task_rows) for task_rows in tasks.values())
 
 
 def add_task_scores(g, task, task_rows):
@@ -1360,9 +1598,12 @@ def add_task_scores(g, task, task_rows):
     g["pt"] += sum(r["prompt_tokens"] for r in task_rows) / n
     g["ct"] += sum(r["completion_tokens"] for r in task_rows) / n
     g["s"] += sum(r["seconds"] for r in task_rows) / n
-    g["per_task"][task] = {"lang": task_rows[0]["lang"], "trials": n,
-                           "passed": sum(r["passed"] for r in task_rows),
-                           "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows)}
+    g["per_task"][task] = {
+        "lang": task_rows[0]["lang"],
+        "trials": n,
+        "passed": sum(r["passed"] for r in task_rows),
+        "passed_on_first": sum(r["passed_on"] == 1 for r in task_rows),
+    }
     g["load"] = max(g["load"], *(r.get("load_seconds") or 0.0 for r in task_rows))
     lang = g["langs"][task_rows[0]["lang"]]
     lang[0] += p
@@ -1385,11 +1626,27 @@ def summarize(rows):
     tasks_by_group, dropped = newest_rows(rows)
     groups = []
     for (endpoint, model, settings), tasks in tasks_by_group.items():
-        g = {"endpoint": endpoint, "model": model, "settings": settings, "n": len(tasks), "p1": 0.0, "pass": 0.0,
-             "var1": 0.0, "var": 0.0, "pt": 0.0, "ct": 0.0, "s": 0.0, "load": 0.0, "langs": defaultdict(lambda: [0.0, 0]),
-             "trials": [], "tasks": set(tasks), "context": "unchecked", "per_task": {},
-             "tps": throughput([r for task_rows in tasks.values() for r in task_rows]),
-             "rt": mean_reasoning_tokens(tasks)}
+        g = {
+            "endpoint": endpoint,
+            "model": model,
+            "settings": settings,
+            "n": len(tasks),
+            "p1": 0.0,
+            "pass": 0.0,
+            "var1": 0.0,
+            "var": 0.0,
+            "pt": 0.0,
+            "ct": 0.0,
+            "s": 0.0,
+            "load": 0.0,
+            "langs": defaultdict(lambda: [0.0, 0]),
+            "trials": [],
+            "tasks": set(tasks),
+            "context": "unchecked",
+            "per_task": {},
+            "tps": throughput([r for task_rows in tasks.values() for r in task_rows]),
+            "rt": mean_reasoning_tokens(tasks),
+        }
         for task, task_rows in tasks.items():
             add_task_scores(g, task, task_rows)
         groups.append(g)
@@ -1401,8 +1658,9 @@ def task_set_gaps(groups):
     by_settings = defaultdict(set)
     for g in groups:
         by_settings[g["settings"]] |= g["tasks"]
-    return [(g, sorted(by_settings[g["settings"]] - g["tasks"])) for g in groups
-            if by_settings[g["settings"]] - g["tasks"]]
+    return [
+        (g, sorted(by_settings[g["settings"]] - g["tasks"])) for g in groups if by_settings[g["settings"]] - g["tasks"]
+    ]
 
 
 def lang_order(lang):
@@ -1413,10 +1671,12 @@ def lang_order(lang):
 def summary_layout(groups):
     """What the summary tables show: whether there are several rounds, a settings column and reasoning tokens,
     and the languages that were run."""
-    return {"repeated": any(n > 1 for g in groups for n in g["trials"]),
-            "show_settings": len({g["settings"] for g in groups}) > 1,
-            "reasoning": any(g["rt"] is not None for g in groups),
-            "langs": sorted({lang for g in groups for lang in g["langs"]}, key=lang_order)}
+    return {
+        "repeated": any(n > 1 for g in groups for n in g["trials"]),
+        "show_settings": len({g["settings"] for g in groups}) > 1,
+        "reasoning": any(g["rt"] is not None for g in groups),
+        "langs": sorted({lang for g in groups for lang in g["langs"]}, key=lang_order),
+    }
 
 
 def group_label(g, layout):
@@ -1454,13 +1714,19 @@ def summary_row(g, layout):
 def summary_cells(groups, layout):
     """The summary as display strings: (header, rows, number of leading text columns)."""
     text = ["endpoint", "model"] + (["settings"] if layout["show_settings"] else [])
-    header = (text + (["rounds"] if layout["repeated"] else []) + ["pass@1", "passed", *layout["langs"],
-              "prompt_tok", "compl_tok"] + (["reason_tok"] if layout["reasoning"] else []) + ["sec", "tok/s", "load"])
+    header = (
+        text
+        + (["rounds"] if layout["repeated"] else [])
+        + ["pass@1", "passed", *layout["langs"], "prompt_tok", "compl_tok"]
+        + (["reason_tok"] if layout["reasoning"] else [])
+        + ["sec", "tok/s", "load"]
+    )
     return header, [summary_row(g, layout) for g in groups], len(text)
 
 
 def summary_records(groups, layout):
     """The summary as CSV records: plain numbers, empty where a value is unknown (or, with one round, the spread)."""
+
     def num(value, digits):
         return "" if value is None else round(value, digits)
 
@@ -1469,15 +1735,29 @@ def summary_records(groups, layout):
 
     records = []
     for g in groups:
-        rec = {"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "tasks": g["n"],
-               "rounds_min": min(g["trials"]), "rounds_max": max(g["trials"]), "pass1": num(g["p1"], 3),
-               "pass1_sd": spread(g["var1"]), "passed": num(g["pass"], 3), "passed_sd": spread(g["var"])}
+        rec = {
+            "endpoint": g["endpoint"],
+            "model": g["model"],
+            "settings": g["settings"],
+            "tasks": g["n"],
+            "rounds_min": min(g["trials"]),
+            "rounds_max": max(g["trials"]),
+            "pass1": num(g["p1"], 3),
+            "pass1_sd": spread(g["var1"]),
+            "passed": num(g["pass"], 3),
+            "passed_sd": spread(g["var"]),
+        }
         for lang in layout["langs"]:
-            passed, n = g["langs"].get(lang, (None, 0))   # .get: langs is a defaultdict
+            passed, n = g["langs"].get(lang, (None, 0))  # .get: langs is a defaultdict
             rec[lang], rec[f"{lang}_tasks"] = num(passed, 3), n
-        rec |= {"prompt_tokens": num(g["pt"], 1), "completion_tokens": num(g["ct"], 1),
-                "reasoning_tokens": num(g["rt"], 1), "seconds": num(g["s"], 2), "tok_per_s": num(g["tps"], 1),
-                "load_seconds": num(g["load"], 2)}
+        rec |= {
+            "prompt_tokens": num(g["pt"], 1),
+            "completion_tokens": num(g["ct"], 1),
+            "reasoning_tokens": num(g["rt"], 1),
+            "seconds": num(g["s"], 2),
+            "tok_per_s": num(g["tps"], 1),
+            "load_seconds": num(g["load"], 2),
+        }
         records.append(rec)
     return records
 
@@ -1491,32 +1771,45 @@ def task_order(groups):
 def per_task_cells(groups, layout):
     """The task x model table as display strings: passes/trials per task and model, "-" without trials."""
     header = ["task"] + [group_label(g, layout) for g in groups]
-    body = [[task] + [f"{g['per_task'][task]['passed']}/{g['per_task'][task]['trials']}"
-                      if task in g["per_task"] else "-" for g in groups]
-            for task in task_order(groups)]
+    body = [
+        [task]
+        + [
+            f"{g['per_task'][task]['passed']}/{g['per_task'][task]['trials']}" if task in g["per_task"] else "-"
+            for g in groups
+        ]
+        for task in task_order(groups)
+    ]
     return header, body, 1
 
 
 def per_task_records(groups):
     """The task x model table as CSV records in long form: one per model and task."""
-    return [{"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "task": task,
-             **g["per_task"][task]}
-            for g in groups for task in task_order([g])]
+    return [
+        {"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "task": task, **g["per_task"][task]}
+        for g in groups
+        for task in task_order([g])
+    ]
 
 
 def summary_notes(groups, dropped, layout):
     """Explanations and warnings to print under the summary."""
     notes = []
     if layout["repeated"]:
-        notes.append("with several rounds: mean passes per round ± the standard deviation of one round's score; "
-                     "tokens and seconds are means per round")
+        notes.append(
+            "with several rounds: mean passes per round ± the standard deviation of one round's score; "
+            "tokens and seconds are means per round"
+        )
     if dropped:
-        notes.append(f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
-                     "are scored on each task's newest version")
+        notes.append(
+            f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
+            "are scored on each task's newest version"
+        )
     missing = [f"{group_label(g, layout)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:
-        notes.append("warning: models with the same settings were scored on different tasks, so their scores "
-                     f"aren't comparable: {', '.join(missing)}")
+        notes.append(
+            "warning: models with the same settings were scored on different tasks, so their scores "
+            f"aren't comparable: {', '.join(missing)}"
+        )
     failed = [f"{group_label(g, layout)} ({g['context']})" for g in groups if g["context"] not in ("ok", "unchecked")]
     if failed:
         notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")
@@ -1528,15 +1821,19 @@ def text_table(header, body, text_columns):
     widths = [max(len(cells[i]) for cells in (header, *body)) for i in range(len(header))]
 
     def line(cells):
-        return " ".join(c.ljust(w) if i < text_columns else c.rjust(w)
-                        for i, (c, w) in enumerate(zip(cells, widths, strict=True))).rstrip()
+        return " ".join(
+            c.ljust(w) if i < text_columns else c.rjust(w) for i, (c, w) in enumerate(zip(cells, widths, strict=True))
+        ).rstrip()
+
     return "\n".join(line(cells) for cells in (header, *body))
 
 
 def markdown_table(header, body, text_columns):
     """A Markdown (GFM) pipe table: text columns left-aligned, the rest right-aligned."""
+
     def line(cells):
         return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+
     rule = ["---" if i < text_columns else "---:" for i in range(len(header))]
     return "\n".join(line(cells) for cells in (header, rule, *body))
 
@@ -1605,68 +1902,147 @@ def parse_args():
     """Parse and validate the command line (endpoints may also come from LLM_BENCH_ENDPOINTS)."""
     ap = argparse.ArgumentParser(
         description="Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go "
-                    "and Bash coding tasks. Generated code is built and tested in a sandbox.",
-        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("endpoints", nargs="*", metavar="[NAME=]URL",
-                    help="OpenAI-compatible base URL(s), e.g. http://localhost:11434/v1. NAME labels the "
-                         "endpoint in output (default: HOST_PORT). Multiple endpoints run in parallel")
-    ap.add_argument("-m", "--model", action="append", default=[], metavar="PATTERN",
-                    help="run only models whose ID matches PATTERN: an exact ID or a shell glob such as "
-                         "'google/gemma-4-12b*' (quote it). Repeatable. Default: all models except "
-                         "embedding and vision-language (\"vl\") models")
-    ap.add_argument("--task", action="append", default=[], metavar="PATTERN",
-                    help="run only tasks whose name matches PATTERN (shell glob, e.g. 'py_*'). Repeatable")
+        "and Bash coding tasks. Generated code is built and tested in a sandbox.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "endpoints",
+        nargs="*",
+        metavar="[NAME=]URL",
+        help="OpenAI-compatible base URL(s), e.g. http://localhost:11434/v1. NAME labels the "
+        "endpoint in output (default: HOST_PORT). Multiple endpoints run in parallel",
+    )
+    ap.add_argument(
+        "-m",
+        "--model",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="run only models whose ID matches PATTERN: an exact ID or a shell glob such as "
+        "'google/gemma-4-12b*' (quote it). Repeatable. Default: all models except "
+        'embedding and vision-language ("vl") models',
+    )
+    ap.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="run only tasks whose name matches PATTERN (shell glob, e.g. 'py_*'). Repeatable",
+    )
     ap.add_argument("--list-tasks", action="store_true", help="list task names and exit")
-    ap.add_argument("--tasks-dir", action="append", type=Path, default=[], metavar="DIR",
-                    help="load tasks from DIR (same layout as the built-in tasks/ directory) instead of the "
-                         "built-in tasks. Repeatable; also pass the built-in directory to combine them")
+    ap.add_argument(
+        "--tasks-dir",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="DIR",
+        help="load tasks from DIR (same layout as the built-in tasks/ directory) instead of the "
+        "built-in tasks. Repeatable; also pass the built-in directory to combine them",
+    )
     ap.add_argument("--api-key", help="bearer token sent to every endpoint")
-    ap.add_argument("--timeout", type=positive_int, default=DEFAULT_TIMEOUT_S, metavar="SEC",
-                    help="per-request timeout; must cover model load time plus generating max tokens "
-                         "on the slowest model (default: %(default)s)")
-    ap.add_argument("--max-tokens", type=positive_int, default=DEFAULT_MAX_TOKENS, metavar="N",
-                    help="completion token limit per request; prompt (up to ~9k tokens with feedback) + N "
-                         "must fit in the model's context window (default: %(default)s)")
-    ap.add_argument("--attempts", type=positive_int, default=DEFAULT_ATTEMPTS, metavar="N",
-                    help="1 = no feedback; N = first attempt + N-1 retries with build/test output as "
-                         "feedback (default: %(default)s)")
-    ap.add_argument("--temperature", type=float, metavar="T",
-                    help="sampling temperature (default: the server's/model's default); same as --param temperature=T")
-    ap.add_argument("--param", action="append", type=parse_param, default=[], metavar="KEY=VALUE",
-                    help="extra request parameter, e.g. top_p=0.9 or seed=1 (VALUE is parsed as JSON when "
-                         "possible). Repeatable. Recorded in the results")
-    ap.add_argument("--repeat", type=positive_int, default=1, metavar="K",
-                    help="run K rounds: K trials of every task per model, to measure how much results vary "
-                         "(default: 1)")
-    ap.add_argument("--resume", action="store_true",
-                    help="skip trials that already have a finished row with the same settings and task version in "
-                         "the results file; trials that failed on request errors are run again")
-    ap.add_argument("--max-length-finishes", type=positive_int, metavar="K",
-                    help="skip a model's remaining trials after K of its trials ended with a reply cut off at "
-                         "--max-tokens (default: never)")
-    ap.add_argument("--summary", nargs="+", type=Path, metavar="CSV",
-                    help="print the summary table of existing results files and exit (no endpoint needed)")
-    ap.add_argument("--format", choices=("table", "markdown", "csv"),
-                    help="with --summary: print the summary as a terminal table (default), Markdown or CSV")
-    ap.add_argument("--per-task", action="store_true",
-                    help="with --summary: also print a task x model table of passes per trial (with --format csv: "
-                         "instead of the summary, one row per model and task)")
-    ap.add_argument("--no-context-check", dest="context_check", action="store_false",
-                    help="skip checking that each model's context holds a worst-case trial (saves one long "
-                         "prompt per model)")
-    ap.add_argument("-o", "--output-dir", type=Path, default=Path("."), metavar="DIR",
-                    help="where results_<endpoint>.csv and runs/ are written (default: current directory)")
-    ap.add_argument("-t", "--tag",
-                    help="write results_<endpoint>_<TAG>.csv instead of results_<endpoint>.csv")
+    ap.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=DEFAULT_TIMEOUT_S,
+        metavar="SEC",
+        help="per-request timeout; must cover model load time plus generating max tokens "
+        "on the slowest model (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--max-tokens",
+        type=positive_int,
+        default=DEFAULT_MAX_TOKENS,
+        metavar="N",
+        help="completion token limit per request; prompt (up to ~9k tokens with feedback) + N "
+        "must fit in the model's context window (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--attempts",
+        type=positive_int,
+        default=DEFAULT_ATTEMPTS,
+        metavar="N",
+        help="1 = no feedback; N = first attempt + N-1 retries with build/test output as "
+        "feedback (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        metavar="T",
+        help="sampling temperature (default: the server's/model's default); same as --param temperature=T",
+    )
+    ap.add_argument(
+        "--param",
+        action="append",
+        type=parse_param,
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra request parameter, e.g. top_p=0.9 or seed=1 (VALUE is parsed as JSON when "
+        "possible). Repeatable. Recorded in the results",
+    )
+    ap.add_argument(
+        "--repeat",
+        type=positive_int,
+        default=1,
+        metavar="K",
+        help="run K rounds: K trials of every task per model, to measure how much results vary (default: 1)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip trials that already have a finished row with the same settings and task version in "
+        "the results file; trials that failed on request errors are run again",
+    )
+    ap.add_argument(
+        "--max-length-finishes",
+        type=positive_int,
+        metavar="K",
+        help="skip a model's remaining trials after K of its trials ended with a reply cut off at "
+        "--max-tokens (default: never)",
+    )
+    ap.add_argument(
+        "--summary",
+        nargs="+",
+        type=Path,
+        metavar="CSV",
+        help="print the summary table of existing results files and exit (no endpoint needed)",
+    )
+    ap.add_argument(
+        "--format",
+        choices=("table", "markdown", "csv"),
+        help="with --summary: print the summary as a terminal table (default), Markdown or CSV",
+    )
+    ap.add_argument(
+        "--per-task",
+        action="store_true",
+        help="with --summary: also print a task x model table of passes per trial (with --format csv: "
+        "instead of the summary, one row per model and task)",
+    )
+    ap.add_argument(
+        "--no-context-check",
+        dest="context_check",
+        action="store_false",
+        help="skip checking that each model's context holds a worst-case trial (saves one long prompt per model)",
+    )
+    ap.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        default=Path("."),
+        metavar="DIR",
+        help="where results_<endpoint>.csv and runs/ are written (default: current directory)",
+    )
+    ap.add_argument("-t", "--tag", help="write results_<endpoint>_<TAG>.csv instead of results_<endpoint>.csv")
     args = ap.parse_args()
-    if not args.summary and (args.format or args.per_task):   # no default, so an explicit table is caught too
+    if not args.summary and (args.format or args.per_task):  # no default, so an explicit table is caught too
         ap.error("--format and --per-task work only with --summary")
     args.format = args.format or "table"
     if not args.endpoints:
         args.endpoints = os.environ.get("LLM_BENCH_ENDPOINTS", "").split()
     if not args.endpoints and not args.list_tasks and not args.summary:
-        ap.error("no endpoint given (e.g. http://localhost:11434/v1 for Ollama, "
-                 "http://localhost:1234/v1 for LM Studio)")
+        ap.error(
+            "no endpoint given (e.g. http://localhost:11434/v1 for Ollama, http://localhost:1234/v1 for LM Studio)"
+        )
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if args.tag:
         args.tag = safe_name(args.tag)
@@ -1689,11 +2065,13 @@ def check_results_file(path):
     with open(path, newline="") as f:
         header = next(csv.reader(f), [])
     if header != FIELDS and (len(set(header)) != len(header) or not set(header) <= set(FIELDS)):
-        sys.exit(f"{path} has different columns (written by another version?); "
-                 f"move it away or use another --tag or --output-dir")
+        sys.exit(
+            f"{path} has different columns (written by another version?); "
+            f"move it away or use another --tag or --output-dir"
+        )
     try:
         read_results(path)
-    except (ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
+    except (ValueError, csv.Error) as e:  # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot read {path}: {e}")
     if header != FIELDS:
         try:
@@ -1712,12 +2090,12 @@ def upgrade_results_file(path):
             w = csv.DictWriter(dst, fieldnames=FIELDS, restval="")
             w.writeheader()
             for line, row in enumerate(csv.DictReader(src), start=2):
-                if None in row:   # DictReader's key for cells beyond the header
+                if None in row:  # DictReader's key for cells beyond the header
                     raise ValueError(f"line {line} has more cells than the header")
-                if None in row.values():   # DictReader's value for missing cells
+                if None in row.values():  # DictReader's value for missing cells
                     raise ValueError(f"line {line} has fewer cells than the header")
                 w.writerow(row)
-        shutil.copymode(path, tmp)   # mkstemp creates the file readable by its owner only
+        shutil.copymode(path, tmp)  # mkstemp creates the file readable by its owner only
         os.replace(tmp, path)
     except BaseException:
         os.unlink(tmp)
@@ -1729,7 +2107,7 @@ def show_summary(paths, fmt, per_task):
     """--summary mode: print the summary of the given results files."""
     try:
         rows = [r for path in paths for r in read_results(path)]
-    except (OSError, ValueError, csv.Error) as e:   # UnicodeDecodeError is a ValueError
+    except (OSError, ValueError, csv.Error) as e:  # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot read results: {e}")
     print_summary(rows, fmt, per_task)
 
@@ -1738,7 +2116,7 @@ def select_tasks(args):
     """Load the tasks and keep the ones matching --task; warn about patterns that match no task."""
     try:
         all_tasks = load_tasks(args.tasks_dir or [DEFAULT_TASKS_DIR])
-    except (OSError, ValueError) as e:   # UnicodeDecodeError is a ValueError
+    except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
         sys.exit(f"cannot load tasks: {e}")
     tasks = [t for t in all_tasks if not args.task or any(fnmatchcase(t["name"], p) for p in args.task)]
     if not args.list_tasks:
@@ -1788,8 +2166,10 @@ def output_paths(args, plan):
     """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{args.tag}" if args.tag else ""
-    outputs = {name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
-               for name in plan}
+    outputs = {
+        name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
+        for name in plan
+    }
     for csv_path, _ in outputs.values():
         check_results_file(csv_path)
     return outputs
@@ -1839,8 +2219,12 @@ def run_all(args, plan, endpoints, tasks, outputs):
     for name, models in plan.items():
         csv_path, runs_dir = outputs[name]
         # Daemon threads: on Ctrl-C the process exits without waiting for in-flight requests.
-        t = threading.Thread(target=run_endpoint, name=name, daemon=True,
-                             args=(name, endpoints[name], models, tasks, args, csv_path, runs_dir, rows, stop))
+        t = threading.Thread(
+            target=run_endpoint,
+            name=name,
+            daemon=True,
+            args=(name, endpoints[name], models, tasks, args, csv_path, runs_dir, rows, stop),
+        )
         t.start()
         threads.append(t)
     try:
@@ -1853,9 +2237,14 @@ def run_all(args, plan, endpoints, tasks, outputs):
         stop_active_units()
         print_summary(list(rows))
         sys.exit(130)
-    if args.resume:   # show the complete picture, not just the trials added now
-        rows = [r for name, (csv_path, _) in outputs.items() if csv_path.exists()
-                for r in read_results(csv_path) if r["endpoint"] == name]
+    if args.resume:  # show the complete picture, not just the trials added now
+        rows = [
+            r
+            for name, (csv_path, _) in outputs.items()
+            if csv_path.exists()
+            for r in read_results(csv_path)
+            if r["endpoint"] == name
+        ]
     print_summary(rows)
 
 

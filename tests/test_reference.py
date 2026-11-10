@@ -1,6 +1,7 @@
 """Reference solutions: every built-in task has one, and it passes the task's harness in the real sandbox.
 
 This catches broken or over-strict harnesses, which otherwise only show up as models failing."""
+
 import pytest
 
 import llm_bench

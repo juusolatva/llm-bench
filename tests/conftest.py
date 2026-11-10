@@ -17,14 +17,15 @@ MODEL_DIR = llm_bench.model_dirs(["test/model"])["test/model"]
 @dataclass
 class Reply:
     """A scripted chat reply other than a plain successful completion."""
-    text: str = ""            # normal completion text (after an optional sleep)
-    status: int = 200         # with body: raw HTTP status
+
+    text: str = ""  # normal completion text (after an optional sleep)
+    status: int = 200  # with body: raw HTTP status
     body: bytes | None = None  # raw response body instead of a completion
     length: int | None = None  # Content-Length to announce (larger than body = truncated reply)
-    close: bool = False       # drop the connection without a response
-    sleep: float = 0          # delay before answering
+    close: bool = False  # drop the connection without a response
+    sleep: float = 0  # delay before answering
     headers: dict | None = None  # with body: extra response headers (e.g. Location for a redirect)
-    hold: float = 0           # with body: keep the connection open this long after the body (a stalled reply)
+    hold: float = 0  # with body: keep the connection open this long after the body (a stalled reply)
 
 
 class MockServer:
@@ -37,8 +38,16 @@ class MockServer:
     the probes in order, the last one repeating. `models_reply` (a Reply) replaces the answer to GET /models.
     The paths of GET requests are kept in `gets`."""
 
-    def __init__(self, models=("test/model",), replies=(), api_key=None, context=None, reject_over=None,
-                 probe_reply=None, models_reply=None):
+    def __init__(
+        self,
+        models=("test/model",),
+        replies=(),
+        api_key=None,
+        context=None,
+        reject_over=None,
+        probe_reply=None,
+        models_reply=None,
+    ):
         self.models = list(models)
         self.replies = list(replies)
         self.api_key = api_key
@@ -49,7 +58,7 @@ class MockServer:
         self.gets = []
         self.requests = []
         self.probes = []
-        self.stopping = threading.Event()   # ends held replies
+        self.stopping = threading.Event()  # ends held replies
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -74,7 +83,7 @@ class MockServer:
                 """Answer with a scripted Reply; False if it's a plain completion text the caller must send."""
                 if reply.sleep:
                     time.sleep(reply.sleep)
-                if reply.close:   # drop the connection without answering
+                if reply.close:  # drop the connection without answering
                     self.close_connection = True
                     return True
                 if reply.body is None:
@@ -114,8 +123,13 @@ class MockServer:
                             return
                         if server.context:
                             tokens = min(tokens, server.context)
-                        self._send(200, {"choices": [{"message": {"content": "OK"}, "finish_reason": "length"}],
-                                         "usage": {"prompt_tokens": tokens, "completion_tokens": 1}})
+                        self._send(
+                            200,
+                            {
+                                "choices": [{"message": {"content": "OK"}, "finish_reason": "length"}],
+                                "usage": {"prompt_tokens": tokens, "completion_tokens": 1},
+                            },
+                        )
                         return
                     reply = server.probe_reply
                     if isinstance(reply, list):
@@ -127,8 +141,13 @@ class MockServer:
                     if self._send_reply(reply):
                         return
                     reply = reply.text
-                self._send(200, {"choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
-                                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+                self._send(
+                    200,
+                    {
+                        "choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    },
+                )
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1"
@@ -186,7 +205,9 @@ def go_cache():
     with tempfile.TemporaryDirectory(prefix="llm-bench-test-go-") as d:
         llm_bench.prepare_go_cache(d)
         if llm_bench.GO_CACHE is None:
-            pytest.fail("warming the Go build cache failed (see the warning above); without it Go tasks "
-                        "compile the standard library each time and hit the time limit")
+            pytest.fail(
+                "warming the Go build cache failed (see the warning above); without it Go tasks "
+                "compile the standard library each time and hit the time limit"
+            )
         yield
         llm_bench.GO_CACHE = None

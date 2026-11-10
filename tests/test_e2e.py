@@ -1,4 +1,5 @@
 """End-to-end tests against a mock server. They run model "output" in the real sandbox."""
+
 import csv
 import shlex
 import signal
@@ -50,8 +51,7 @@ def test_feedback_loop_passes_on_second_attempt(monkeypatch, tmp_path, mock_serv
     run(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration", "-t", "x")
 
     rows = read_rows(tmp_path / "results_mock_x.csv")
-    assert [(r["model"], r["passed"], r["passed_on"], r["attempts"]) for r in rows] == [
-        ("test/model", "1", "2", "2")]
+    assert [(r["model"], r["passed"], r["passed_on"], r["attempts"]) for r in rows] == [("test/model", "1", "2", "2")]
     # The second request carries the failing test output back to the model.
     assert len(s.requests) == 2
     feedback = s.requests[1]["messages"][-1]["content"]
@@ -63,8 +63,7 @@ def test_feedback_loop_passes_on_second_attempt(monkeypatch, tmp_path, mock_serv
 
 def test_attempts_one_disables_feedback(monkeypatch, tmp_path, mock_server):
     s = mock_server(replies=[BAD, GOOD])
-    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "--attempts", "1",
-        "--temperature", "0")
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "--attempts", "1", "--temperature", "0")
     (row,) = read_rows(tmp_path / "results_m.csv")
     assert (row["passed"], row["attempts"]) == ("0", "1")
     assert len(s.requests) == 1
@@ -98,17 +97,20 @@ def install_must_be_hidden(install, tmp_path):
         for name in ("NODE_BIN", "TS_PACKAGE", "RUST_SYSROOT"):
             mp.setattr(llm_bench, name, None)
         cmd = llm_bench.sandbox_command(tools, "llm-bench-x.service", ["true"], tmp_path, 60, None)
-    args = cmd[cmd.index("/usr/bin/bwrap"):cmd.index("--")]
+    args = cmd[cmd.index("/usr/bin/bwrap") : cmd.index("--")]
     exposed = [args[i + 1] for i, a in enumerate(args) if a == "--ro-bind" and args[i + 2] == args[i + 1]]
     return not any(install.is_relative_to(path) for path in exposed)
 
 
-@pytest.mark.parametrize(("install", "hidden"), [
-    ("/usr", False),                                    # /usr/bin/node: the sandbox mounts /usr anyway
-    ("/usr/local", False),                              # /usr/local/bin/node
-    ("/home/someone/.local/share/fnm/node-versions/v24.22.1/installation", True),
-    ("/opt/node-v24", True),
-])
+@pytest.mark.parametrize(
+    ("install", "hidden"),
+    [
+        ("/usr", False),  # /usr/bin/node: the sandbox mounts /usr anyway
+        ("/usr/local", False),  # /usr/local/bin/node
+        ("/home/someone/.local/share/fnm/node-versions/v24.22.1/installation", True),
+        ("/opt/node-v24", True),
+    ],
+)
 def test_install_must_be_hidden(tmp_path, install, hidden):
     assert install_must_be_hidden(Path(install), tmp_path) is hidden
 
@@ -118,14 +120,18 @@ def test_sandbox_exposes_only_node_and_typescript(tmp_path, monkeypatch):
     else of the Node installation (npm and global packages next to them) or the home directory around it. (The
     directories bwrap creates for the mounts are on the sandbox's private root tmpfs, like /opt itself.)"""
     for name in ("NODE_BIN", "TS_PACKAGE"):
-        monkeypatch.setattr(llm_bench, name, getattr(llm_bench, name))   # restored after the test
+        monkeypatch.setattr(llm_bench, name, getattr(llm_bench, name))  # restored after the test
     try:
         llm_bench.check_toolchains([{"lang": "ts"}])
     except SystemExit as exc:
         pytest.skip(str(exc))
     install = llm_bench.NODE_BIN.parent.parent
     # A system Node's prefix (/usr) is visible by design; a version manager's installation must not be.
-    install_check = f"test -e {shlex.quote(str(install))} && echo INSTALL-VISIBLE" if install_must_be_hidden(install, tmp_path) else ""
+    install_check = (
+        f"test -e {shlex.quote(str(install))} && echo INSTALL-VISIBLE"
+        if install_must_be_hidden(install, tmp_path)
+        else ""
+    )
     script = f"""
 ls -A /opt/node/bin | tr '\\n' ' '; echo
 {install_check}
@@ -152,7 +158,8 @@ def test_sandbox_has_no_network(tmp_path):
         port = srv.getsockname()[1]
         out = llm_bench.run_cmd(
             ["/bin/bash", "-c", f"(exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null && echo OPEN || echo CLOSED"],
-            tmp_path).out
+            tmp_path,
+        ).out
     assert "CLOSED" in out
 
 
@@ -189,7 +196,9 @@ def test_private_tasks_dir(monkeypatch, tmp_path, mock_server):
     run(monkeypatch, tmp_path / "out", f"m={s.url}", "--tasks-dir", str(tmp_path / "tasks"), "--attempts", "1")
     rows = read_rows(tmp_path / "out" / "results_m.csv")
     assert [(r["task"], r["passed"], r["fail_stage"]) for r in rows] == [
-        ("py_double", "1", ""), ("py_legacy", "0", "test")]
+        ("py_double", "1", ""),
+        ("py_legacy", "0", "test"),
+    ]
     assert s.requests[0]["messages"][1]["content"] == "Write `double(x)` in solution.py."
     log = (trial_dir(tmp_path / f"out/runs/m/{MODEL_DIR}/py_legacy") / "attempt_1/log.txt").read_text()
     assert 'its final line "harness: all checks passed" was never printed' in log
@@ -217,17 +226,17 @@ def test_rust_harness_is_a_separate_crate(monkeypatch, tmp_path, mock_server):
     assert "function `topo_order` is private" in feedback
 
 
-EARLY_EXITS = {   # task: a reply that ends the process with status 0 on the first call (Go: at package load)
+EARLY_EXITS = {  # task: a reply that ends the process with status 0 on the first call (Go: at package load)
     "py_parse_duration": "```python\nimport sys\n\ndef parse_duration(s):\n    sys.exit(0)\n```",
     "c_join_path": "```c\n#include <stdlib.h>\nchar *join_path(const char *a, const char *b) {\n"
-                   "    (void)a; (void)b;\n    exit(0);\n}\n```",
+    "    (void)a; (void)b;\n    exit(0);\n}\n```",
     "cpp_top_words": "```cpp\n#include <cstdlib>\n#include <string>\n#include <utility>\n#include <vector>\n"
-                     "inline std::vector<std::pair<std::string, int>> top_words(const std::string&, std::size_t) {\n"
-                     "    std::exit(0);\n}\n```",
+    "inline std::vector<std::pair<std::string, int>> top_words(const std::string&, std::size_t) {\n"
+    "    std::exit(0);\n}\n```",
     "rust_csv_line": "```rust\npub fn parse_csv_line(_line: &str) -> Result<Vec<String>, String> {\n"
-                     "    std::process::exit(0)\n}\n```",
-    "go_word_freq": "```go\npackage solution\n\nimport (\n\t\"io\"\n\t\"os\"\n)\n\nfunc init() { os.Exit(0) }\n\n"
-                    "func WordFreq(r io.Reader) (map[string]int, error) { return nil, nil }\n```",
+    "    std::process::exit(0)\n}\n```",
+    "go_word_freq": '```go\npackage solution\n\nimport (\n\t"io"\n\t"os"\n)\n\nfunc init() { os.Exit(0) }\n\n'
+    "func WordFreq(r io.Reader) (map[string]int, error) { return nil, nil }\n```",
 }
 
 
@@ -262,11 +271,13 @@ def check_early_exit(task, tmp_path):
     assert "exited with status 0 before it finished" in out
 
 
-UNTERMINATED = {   # task: a correct solution whose own output, without a final newline, precedes the final line
-    "py_parse_duration": GOOD.replace("import re\n", "import re\nimport sys\nsys.stderr.write('loading')\n"
-                                      "print('loaded', end='')\n"),
-    "c_join_path": "```c\n" + (llm_bench.DEFAULT_TASKS_DIR / "c/join_path/reference/solution.c").read_text()
-                   + '#include <stdio.h>\n__attribute__((constructor)) static void greet(void) { printf("hi"); }\n```',
+UNTERMINATED = {  # task: a correct solution whose own output, without a final newline, precedes the final line
+    "py_parse_duration": GOOD.replace(
+        "import re\n", "import re\nimport sys\nsys.stderr.write('loading')\nprint('loaded', end='')\n"
+    ),
+    "c_join_path": "```c\n"
+    + (llm_bench.DEFAULT_TASKS_DIR / "c/join_path/reference/solution.c").read_text()
+    + '#include <stdio.h>\n__attribute__((constructor)) static void greet(void) { printf("hi"); }\n```',
 }
 
 
@@ -295,17 +306,20 @@ def test_feedback_names_failing_command(monkeypatch, tmp_path, mock_server):
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration")
     assert "Output of `python3 test_solution.py`:" in s.requests[1]["messages"][-1]["content"]
     (row,) = read_rows(tmp_path / "results_m.csv")
-    assert row["fail_stage"] == ""   # passed in the end
+    assert row["fail_stage"] == ""  # passed in the end
 
 
 C_JOIN_WRONG = "```c\nchar *join_path(const char *a, const char *b) { (void)a; (void)b; return 0; }\n```"
 C_JOIN_BROKEN = "```c\nchar *join_path(const char *a, const char *b) { return a }\n```"
 
 
-@pytest.mark.parametrize(("reply", "stage", "cmd"), [
-    (C_JOIN_BROKEN, "build", "gcc -std=gnu17"),
-    (C_JOIN_WRONG, "test", "./t"),
-])
+@pytest.mark.parametrize(
+    ("reply", "stage", "cmd"),
+    [
+        (C_JOIN_BROKEN, "build", "gcc -std=gnu17"),
+        (C_JOIN_WRONG, "test", "./t"),
+    ],
+)
 def test_fail_stage_build_vs_test(monkeypatch, tmp_path, mock_server, reply, stage, cmd):
     s = mock_server(replies=[reply, reply])
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "c_join_path", "--attempts", "2")
@@ -319,7 +333,7 @@ def test_time_limit_is_reported(monkeypatch, tmp_path, mock_server):
     s = mock_server(replies=["```python\nwhile True:\n    pass\n```", BAD])
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "--attempts", "2")
     (row,) = read_rows(tmp_path / "results_m.csv")
-    assert row["fail_stage"] == "test"   # the last attempt failed normally
+    assert row["fail_stage"] == "test"  # the last attempt failed normally
     first = s.requests[1]["messages"][-1]["content"]
     assert "exceeded the 3 s time limit" in first
     assert "[killed:" in first
@@ -334,17 +348,21 @@ def test_rerun_appends_and_tag_separates_transcripts(monkeypatch, tmp_path, mock
     assert len(read_rows(tmp_path / "results_m.csv")) == 2
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "py_parse_duration", "-t", "x")
     assert trial_dir(tmp_path / f"runs/m/{MODEL_DIR}/py_parse_duration").is_dir()
-    assert trial_dir(tmp_path / f"runs/m/{MODEL_DIR}/py_parse_duration", 2).is_dir()   # re-run: next repeat number
+    assert trial_dir(tmp_path / f"runs/m/{MODEL_DIR}/py_parse_duration", 2).is_dir()  # re-run: next repeat number
     assert trial_dir(tmp_path / f"runs/m_x/{MODEL_DIR}/py_parse_duration").is_dir()
 
 
 def test_ctrl_c_stops_promptly(tmp_path, mock_server):
     s = mock_server(replies=[Reply(text=GOOD, sleep=30)])
     script = Path(llm_bench.__file__)
-    proc = subprocess.Popen([sys.executable, str(script), f"m={s.url}", "--task", "py_parse_duration",
-                             "-o", str(tmp_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        [sys.executable, str(script), f"m={s.url}", "--task", "py_parse_duration", "-o", str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     deadline = time.monotonic() + 30
-    while not s.requests and time.monotonic() < deadline:   # wait until the request is in flight
+    while not s.requests and time.monotonic() < deadline:  # wait until the request is in flight
         time.sleep(0.1)
     assert s.requests, "request never arrived"
     proc.send_signal(signal.SIGINT)
