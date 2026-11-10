@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/juusolatva/llm-bench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/juusolatva/llm-bench/actions/workflows/ci.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_llm-bench&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_llm-bench)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_llm-bench&metric=coverage)](https://sonarcloud.io/summary/new_code?id=juusolatva_llm-bench)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_llm-bench&metric=coverage)](https://sonarcloud.io/summary/overall?id=juusolatva_llm-bench)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Python](https://img.shields.io/badge/python-3.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/github/license/juusolatva/llm-bench)](LICENSE)
