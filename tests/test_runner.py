@@ -424,27 +424,41 @@ def test_before_model_timeout_kills_the_commands_children(tmp_path, monkeypatch)
     child = f"import pathlib, time; time.sleep(1.5); pathlib.Path({str(marker)!r}).write_text('x')"
     cmd = python_cmd(f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])")
     with pytest.raises(llm_bench.BeforeModelFailed, match=r"timed out after 0\.5s"):
-        llm_bench.run_before_model("m/a", cmd, {})
+        llm_bench.run_before_model("m/a", cmd, {}, threading.Event())
     time.sleep(2)
     assert not marker.exists()
 
 
 def test_before_model_keeps_only_the_end_of_its_output():
-    code = "import sys; sys.stdout.write('x' * 100000 + 'END'); sys.exit(1)"
+    cmd = python_cmd("import sys; sys.stdout.write('x' * 100000 + 'END'); sys.exit(1)")
     with pytest.raises(llm_bench.BeforeModelFailed) as exc:
-        llm_bench.run_before_model("m/a", python_cmd(code), {})
+        llm_bench.run_before_model("m/a", cmd, {}, threading.Event())
     message = str(exc.value)
     assert message.endswith("END")
     assert len(message) < llm_bench.BEFORE_MODEL_OUTPUT_BYTES + 200
 
 
-def test_before_model_does_not_wait_for_background_children(monkeypatch):
-    monkeypatch.setattr(llm_bench, "BEFORE_MODEL_OUTPUT_GRACE_S", 0.2)
-    # The child inherits the output pipe and keeps it open after the command exits.
-    code = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])"
+def test_before_model_kills_background_children_when_it_exits(tmp_path):
+    marker = tmp_path / "child-survived"
+    # The child inherits the output pipe and would keep it open after the command exits.
+    child = f"import pathlib, time; time.sleep(1.5); pathlib.Path({str(marker)!r}).write_text('x')"
+    cmd = python_cmd(f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}])")
     t0 = time.monotonic()
-    llm_bench.run_before_model("m/a", python_cmd(code), {})
-    assert time.monotonic() - t0 < 3
+    llm_bench.run_before_model("m/a", cmd, {}, threading.Event())
+    assert time.monotonic() - t0 < 1.5
+    time.sleep(2)
+    assert not marker.exists()
+
+
+def test_before_model_not_started_after_stop(tmp_path):
+    marker = tmp_path / "ran"
+    cmd = python_cmd(f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')")
+    stop = threading.Event()
+    stop.set()  # Ctrl-C came first: run_all sets stop before stop_active_hooks()
+    with pytest.raises(llm_bench.Interrupted):
+        llm_bench.run_before_model("m/a", cmd, {}, stop)
+    assert not marker.exists()
+    assert not llm_bench.ACTIVE_HOOKS
 
 
 def test_stop_active_hooks_kills_a_running_command():
@@ -452,7 +466,7 @@ def test_stop_active_hooks_kills_a_running_command():
 
     def run():
         try:
-            llm_bench.run_before_model("m/a", python_cmd("import time; time.sleep(30)"), {})
+            llm_bench.run_before_model("m/a", python_cmd("import time; time.sleep(30)"), {}, threading.Event())
         except llm_bench.BeforeModelFailed as e:
             errors.append(str(e))
 
