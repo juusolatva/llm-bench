@@ -51,6 +51,8 @@ DEFAULT_MAX_TOKENS = 16384  # worst-case prompt (~9k tokens) + max tokens must f
 DEFAULT_ATTEMPTS = 3  # 1 = no feedback; N = initial attempt + N-1 attempts with build/test feedback
 MAX_MODEL_ERRORS = 3  # skip the rest of a model after this many request errors in a row
 SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server is unreachable, then give up
+BEFORE_MODEL_TIMEOUT_S = 300  # --before-model command (e.g. unloading the previous model)
+BEFORE_MODEL_OUTPUT_BYTES = 2000  # end of a failed --before-model command's output shown in the log
 # Context check: a trial needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
 # (system + task prompt; each retry adds the previous reply and the clipped build/test output).
 CONTEXT_BASE_TOKENS = 1000
@@ -1306,6 +1308,41 @@ def prepare_model(label, base, model, opts, stop):
     return load_seconds, check_context(label, base, model, opts, stop, usage.get("prompt_tokens")), None
 
 
+class BeforeModelFailed(Exception):
+    """The --before-model command failed: the endpoint stops, leaving the trials it didn't run without rows."""
+
+
+def run_before_model(label, cmd, env):
+    """Run the --before-model command (an argv list) and wait for it. It's the user's own command, such as one
+    that unloads the previous model, not model output, so it runs on the host, outside the sandbox. Its output
+    goes to a temporary file, so a background process that inherits it can't block the wait. Raises
+    BeforeModelFailed on a missing program, a timeout or a non-zero exit status."""
+    t0 = time.monotonic()
+    with tempfile.TemporaryFile() as out:
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, **env},
+                timeout=BEFORE_MODEL_TIMEOUT_S,
+                check=False,
+            )
+            problem = f"exit status {proc.returncode}" if proc.returncode else None
+        except subprocess.TimeoutExpired:
+            problem = f"timed out after {BEFORE_MODEL_TIMEOUT_S}s"
+        except OSError as e:
+            raise BeforeModelFailed(f"{label}: --before-model failed ({e})") from e
+        if problem is None:
+            log(f"{label}: --before-model finished in {time.monotonic() - t0:.1f}s", err=True)
+            return
+        size = out.seek(0, os.SEEK_END)
+        out.seek(max(0, size - BEFORE_MODEL_OUTPUT_BYTES))
+        tail = out.read().decode(errors="replace").rstrip()
+    raise BeforeModelFailed(f"{label}: --before-model failed ({problem})" + (f"; its output:\n{tail}" if tail else ""))
+
+
 def settings_fingerprint(opts):
     """Everything besides the task itself that can change a result."""
     return {
@@ -1457,6 +1494,9 @@ class EndpointRun:
             return
         if len(todo) < total:
             log(f"{name}/{model}: resuming, {len(todo)} of {total} trial(s) to go", err=True)
+        if opts.before_model:
+            env = {"LLM_BENCH_ENDPOINT": name, "LLM_BENCH_URL": self.base, "LLM_BENCH_MODEL": model}
+            run_before_model(f"{name}/{model}", opts.before_model, env)
         load_seconds, context, error = prepare_model(f"{name}/{model}", self.base, model, opts, self.stop)
         model_info = {"load_seconds": load_seconds, "context": context}
         if error:
@@ -1509,6 +1549,12 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
                 run.run_model(model, dirs[model], tasks)
         except ServerDown as e:
             log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
+        except BeforeModelFailed as e:
+            log(
+                f"{e}\n{name}: stopping this endpoint; the trials it didn't run have no rows, so --resume runs "
+                "them once the command works",
+                err=True,
+            )
         except Interrupted:
             pass
 
@@ -1876,6 +1922,20 @@ def parse_param(spec):
         return key, value
 
 
+def parse_command(spec):
+    """argparse type for --before-model: split CMD like a POSIX shell would (no shell runs it) and check that
+    the program exists, so a typo fails before the run starts."""
+    try:
+        argv = shlex.split(spec)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{e}: {spec!r}") from e
+    if not argv:
+        raise argparse.ArgumentTypeError("empty command")
+    if shutil.which(argv[0]) is None:
+        raise argparse.ArgumentTypeError(f"program not found: {argv[0]}")
+    return argv
+
+
 def positive_int(value):
     """argparse type: an integer >= 1."""
     n = int(value)
@@ -2023,6 +2083,15 @@ def parse_args():
         dest="context_check",
         action="store_false",
         help="skip checking that each model's context holds a worst-case trial (saves one long prompt per model)",
+    )
+    ap.add_argument(
+        "--before-model",
+        type=parse_command,
+        metavar="CMD",
+        help="run CMD on this machine before each model is loaded and wait for it, e.g. "
+        "'lms unload --all --host gpu-box' so the previous model is out of memory. Split like a shell "
+        "command but run without a shell; gets LLM_BENCH_ENDPOINT, LLM_BENCH_URL and LLM_BENCH_MODEL in its "
+        "environment. A failure stops the endpoint",
     )
     ap.add_argument(
         "-o",

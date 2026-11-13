@@ -5,6 +5,7 @@ import json
 import re
 import shlex
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ def opts(**kwargs):
         "repeat": 1,
         "resume": False,
         "max_length_finishes": None,
+        "before_model": None,
     }
     return SimpleNamespace(**{**defaults, **kwargs})
 
@@ -338,6 +340,78 @@ def test_load_time_is_separate_from_task_time(mock_server, tmp_path):
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
     assert row["load_seconds"] >= 1
     assert row["seconds"] < 1
+
+
+HOOK_CODE = """\
+import os, sys
+e = os.environ
+with open(sys.argv[1], "a") as f:
+    f.write(f"{e['LLM_BENCH_ENDPOINT']} {e['LLM_BENCH_URL']} {e['LLM_BENCH_MODEL']}\\n")
+print("unloading", e["LLM_BENCH_MODEL"])
+sys.exit(3 if e["LLM_BENCH_MODEL"] == sys.argv[2] else 0)
+"""
+
+
+def hook(tmp_path, fail_for=""):
+    """A --before-model command that logs its environment to hook.log and fails for model fail_for."""
+    return [sys.executable, "-c", HOOK_CODE, str(tmp_path / "hook.log"), fail_for]
+
+
+def hook_log(tmp_path):
+    path = tmp_path / "hook.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def test_before_model_runs_before_each_model_loads(mock_server, tmp_path, monkeypatch, capsys):
+    s = mock_server(models=["a", "b"], replies=["", ""])
+    loads, real_prepare = [], llm_bench.prepare_model
+
+    def spy(label, *args, **kwargs):  # what the hook had logged when each model started loading
+        loads.append((label, hook_log(tmp_path)))
+        return real_prepare(label, *args, **kwargs)
+
+    monkeypatch.setattr(llm_bench, "prepare_model", spy)
+    rows = run_endpoint(s, tmp_path, models=["a", "b"], tasks=TASKS[:1], before_model=hook(tmp_path))
+    assert [r["model"] for r in rows] == ["a", "b"]
+    assert loads == [("m/a", [f"m {s.url} a"]), ("m/b", [f"m {s.url} a", f"m {s.url} b"])]
+    assert re.search(r"m/a: --before-model finished in \d+\.\ds", capsys.readouterr().err)
+
+
+def test_before_model_not_run_for_finished_models(mock_server, tmp_path):
+    s = mock_server(replies=[""])
+    run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert run_endpoint(s, tmp_path, tasks=TASKS[:1], resume=True, before_model=hook(tmp_path)) == []
+    assert hook_log(tmp_path) == []
+
+
+def test_before_model_failure_stops_endpoint_without_rows(mock_server, tmp_path, capsys):
+    s = mock_server(models=["a", "b", "c"], replies=["", ""])
+    rows = run_endpoint(s, tmp_path, models=["a", "b", "c"], tasks=TASKS[:1], before_model=hook(tmp_path, "b"))
+    assert [r["model"] for r in rows] == ["a"]  # b and c are left for --resume
+    assert [r["model"] for r in read_csv(tmp_path / "results.csv")] == ["a"]
+    assert {p["model"] for p in s.probes} == {"a"}  # b was never loaded
+    assert len(hook_log(tmp_path)) == 2
+    err = capsys.readouterr().err
+    assert "m/b: --before-model failed (exit status 3)" in err
+    assert "unloading b" in err  # the command's output
+    assert "stopping this endpoint" in err
+
+
+@pytest.mark.parametrize(
+    ("cmd", "message"),
+    [
+        (["/nonexistent/llm-bench-hook"], "No such file or directory"),
+        ([sys.executable, "-c", "import time; time.sleep(30)"], "timed out after 0.5s"),
+    ],
+)
+def test_before_model_missing_program_or_timeout(mock_server, tmp_path, capsys, monkeypatch, cmd, message):
+    monkeypatch.setattr(llm_bench, "BEFORE_MODEL_TIMEOUT_S", 0.5)
+    s = mock_server(replies=[""])
+    assert run_endpoint(s, tmp_path, tasks=TASKS[:1], before_model=cmd) == []
+    assert s.probes == []
+    err = capsys.readouterr().err
+    assert "m/test/model: --before-model failed" in err
+    assert message in err
 
 
 def test_params_metadata_and_config_in_rows(mock_server, tmp_path):
@@ -1049,6 +1123,14 @@ def test_main_runs_the_selected_tasks(monkeypatch, tmp_path, capsys, mock_server
     captured = capsys.readouterr()
     assert "task pattern 'nope_*' matched no task" in captured.err
     assert "test/model" in captured.out  # the summary
+
+
+def test_main_runs_the_before_model_command(monkeypatch, tmp_path, mock_server, no_sandbox):
+    s = mock_server(replies=[GOOD_REPLY])
+    cmd = shlex.join(hook(tmp_path))
+    run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration", "--before-model", cmd)
+    assert hook_log(tmp_path) == [f"mock {s.url} test/model"]
+    assert len(read_csv(tmp_path / "results_mock.csv")) == 1
 
 
 def test_main_resume_summarizes_earlier_rows(monkeypatch, tmp_path, mock_server, no_sandbox):

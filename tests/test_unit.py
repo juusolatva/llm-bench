@@ -639,6 +639,29 @@ def test_cli_rejects_bad_params(monkeypatch, args):
     assert exc.value.code == 2
 
 
+def test_cli_before_model_is_split_like_a_shell_command(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["llm_bench.py", "localhost:1", "--before-model", "sh -c 'a && b' \"x y\""])
+    assert llm_bench.parse_args().before_model == ["sh", "-c", "a && b", "x y"]
+    monkeypatch.setattr(sys, "argv", ["llm_bench.py", "localhost:1"])
+    assert llm_bench.parse_args().before_model is None
+
+
+@pytest.mark.parametrize(
+    ("cmd", "message"),
+    [
+        ("", "empty command"),
+        ("   ", "empty command"),
+        ("sh -c 'unbalanced", "No closing quotation"),
+        ("llm-bench-no-such-program --all", "program not found: llm-bench-no-such-program"),
+    ],
+)
+def test_cli_rejects_bad_before_model(monkeypatch, capsys, cmd, message):
+    with pytest.raises(SystemExit) as exc:
+        run_main(monkeypatch, "localhost:1", "--before-model", cmd)
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 def test_cli_summary_mode(monkeypatch, capsys, tmp_path):
     path = tmp_path / "r.csv"
     path.write_text("endpoint,model,task,lang,passed,passed_on\ne,m,py_a,python,1,1\ne,m,py_b,python,0,0\n")
