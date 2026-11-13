@@ -414,6 +414,75 @@ def test_before_model_missing_program_or_timeout(mock_server, tmp_path, capsys, 
     assert message in err
 
 
+def python_cmd(code):
+    return [sys.executable, "-c", code]
+
+
+def test_before_model_timeout_kills_the_commands_children(tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_bench, "BEFORE_MODEL_TIMEOUT_S", 0.5)
+    marker = tmp_path / "child-survived"
+    child = f"import pathlib, time; time.sleep(1.5); pathlib.Path({str(marker)!r}).write_text('x')"
+    cmd = python_cmd(f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])")
+    with pytest.raises(llm_bench.BeforeModelFailed, match=r"timed out after 0\.5s"):
+        llm_bench.run_before_model("m/a", cmd, {})
+    time.sleep(2)
+    assert not marker.exists()
+
+
+def test_before_model_keeps_only_the_end_of_its_output():
+    code = "import sys; sys.stdout.write('x' * 100000 + 'END'); sys.exit(1)"
+    with pytest.raises(llm_bench.BeforeModelFailed) as exc:
+        llm_bench.run_before_model("m/a", python_cmd(code), {})
+    message = str(exc.value)
+    assert message.endswith("END")
+    assert len(message) < llm_bench.BEFORE_MODEL_OUTPUT_BYTES + 200
+
+
+def test_before_model_does_not_wait_for_background_children(monkeypatch):
+    monkeypatch.setattr(llm_bench, "BEFORE_MODEL_OUTPUT_GRACE_S", 0.2)
+    # The child inherits the output pipe and keeps it open after the command exits.
+    code = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])"
+    t0 = time.monotonic()
+    llm_bench.run_before_model("m/a", python_cmd(code), {})
+    assert time.monotonic() - t0 < 3
+
+
+def test_stop_active_hooks_kills_a_running_command():
+    errors = []
+
+    def run():
+        try:
+            llm_bench.run_before_model("m/a", python_cmd("import time; time.sleep(30)"), {})
+        except llm_bench.BeforeModelFailed as e:
+            errors.append(str(e))
+
+    t = threading.Thread(target=run)
+    t.start()
+    deadline = time.monotonic() + 10
+    while not llm_bench.ACTIVE_HOOKS and time.monotonic() < deadline:
+        time.sleep(0.05)
+    llm_bench.stop_active_hooks()
+    t.join(10)
+    assert errors == ["m/a: --before-model failed (killed by signal 9)"]
+    assert not llm_bench.ACTIVE_HOOKS
+
+
+def test_interrupted_before_model_is_not_reported_as_failed(mock_server, tmp_path, capsys):
+    s, stop = mock_server(replies=[""]), threading.Event()
+    args = ("m", s.url, ["test/model"], TASKS[:1], opts(before_model=python_cmd("import time; time.sleep(30)")))
+    t = threading.Thread(target=llm_bench.run_endpoint, args=(*args, tmp_path / "r.csv", tmp_path / "runs", [], stop))
+    t.start()
+    deadline = time.monotonic() + 10
+    while not llm_bench.ACTIVE_HOOKS and time.monotonic() < deadline:
+        time.sleep(0.05)
+    stop.set()  # what run_all does on Ctrl-C
+    llm_bench.stop_active_hooks()
+    t.join(10)
+    assert not t.is_alive()
+    assert "--before-model failed" not in capsys.readouterr().err
+    assert s.probes == []
+
+
 def test_params_metadata_and_config_in_rows(mock_server, tmp_path):
     s = mock_server(replies=[""])
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], params={"top_p": 0.5, "seed": 1})
@@ -1131,6 +1200,17 @@ def test_main_runs_the_before_model_command(monkeypatch, tmp_path, mock_server, 
     run_main(monkeypatch, tmp_path, f"mock={s.url}", "--task", "py_parse_duration", "--before-model", cmd)
     assert hook_log(tmp_path) == [f"mock {s.url} test/model"]
     assert len(read_csv(tmp_path / "results_mock.csv")) == 1
+
+
+def test_main_notes_that_before_model_runs_per_endpoint(monkeypatch, tmp_path, capsys, mock_server, no_sandbox):
+    s1, s2 = mock_server(replies=[GOOD_REPLY] * 2), mock_server(replies=[GOOD_REPLY])
+    argv = ["--task", "py_parse_duration", "--before-model", shlex.join(python_cmd("pass"))]
+    run_main(monkeypatch, tmp_path, f"one={s1.url}", *argv)
+    assert "LLM_BENCH_URL" not in capsys.readouterr().err
+    run_main(monkeypatch, tmp_path, f"one={s1.url}", f"two={s2.url}", *argv)
+    assert "--before-model runs for each endpoint's models while the other endpoints keep running" in (
+        capsys.readouterr().err
+    )
 
 
 def test_main_resume_summarizes_earlier_rows(monkeypatch, tmp_path, mock_server, no_sandbox):

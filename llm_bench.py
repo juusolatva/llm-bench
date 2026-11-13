@@ -26,6 +26,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,7 @@ MAX_MODEL_ERRORS = 3  # skip the rest of a model after this many request errors 
 SERVER_RETRY_DELAYS_S = (10, 30, 60)  # waits before retrying while the server is unreachable, then give up
 BEFORE_MODEL_TIMEOUT_S = 300  # --before-model command (e.g. unloading the previous model)
 BEFORE_MODEL_OUTPUT_BYTES = 2000  # end of a failed --before-model command's output shown in the log
+BEFORE_MODEL_OUTPUT_GRACE_S = 1  # wait for the rest of its output after the command exits
 # Context check: a trial needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
 # (system + task prompt; each retry adds the previous reply and the clipped build/test output).
 CONTEXT_BASE_TOKENS = 1000
@@ -1312,35 +1314,82 @@ class BeforeModelFailed(Exception):
     """The --before-model command failed: the endpoint stops, leaving the trials it didn't run without rows."""
 
 
+ACTIVE_HOOKS = set()  # running --before-model commands (Popen objects), guarded by ACTIVE_HOOKS_LOCK
+ACTIVE_HOOKS_LOCK = threading.Lock()
+
+
+def kill_process_group(proc):
+    """Kill a --before-model command and every process it started: it runs in its own process group."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def stop_active_hooks():
+    """Kill the --before-model commands that are still running (on Ctrl-C). They run in their own process
+    groups, so the terminal's SIGINT doesn't reach them."""
+    with ACTIVE_HOOKS_LOCK:
+        hooks = list(ACTIVE_HOOKS)
+    for proc in hooks:
+        kill_process_group(proc)
+
+
+def read_tail(pipe, tail, limit):
+    """Read pipe until EOF, keeping only its last `limit` bytes in the bytearray tail."""
+    with pipe:
+        while chunk := os.read(pipe.fileno(), 65536):
+            tail += chunk
+            del tail[:-limit]
+
+
+def wait_hook(proc):
+    """Wait for a started --before-model command; returns what went wrong, or None if it exited with status 0.
+    On a timeout, the command and everything it started are killed."""
+    with ACTIVE_HOOKS_LOCK:
+        ACTIVE_HOOKS.add(proc)
+    try:
+        status = proc.wait(timeout=BEFORE_MODEL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc)
+        proc.wait()
+        return f"timed out after {BEFORE_MODEL_TIMEOUT_S}s"
+    finally:
+        with ACTIVE_HOOKS_LOCK:
+            ACTIVE_HOOKS.discard(proc)
+    if status < 0:
+        return f"killed by signal {-status}"
+    return f"exit status {status}" if status else None
+
+
 def run_before_model(label, cmd, env):
     """Run the --before-model command (an argv list) and wait for it. It's the user's own command, such as one
-    that unloads the previous model, not model output, so it runs on the host, outside the sandbox. Its output
-    goes to a temporary file, so a background process that inherits it can't block the wait. Raises
-    BeforeModelFailed on a missing program, a timeout or a non-zero exit status."""
+    that unloads the previous model, not model output, so it runs on the host, outside the sandbox. It gets
+    its own process group, so a timeout or Ctrl-C (stop_active_hooks) kills everything it started. Only the
+    end of its output is kept, and a background process that keeps the output open isn't waited for. Raises
+    BeforeModelFailed on a missing program, a timeout, a signal or a non-zero exit status."""
     t0 = time.monotonic()
-    with tempfile.TemporaryFile() as out:
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, **env},
-                timeout=BEFORE_MODEL_TIMEOUT_S,
-                check=False,
-            )
-            problem = f"exit status {proc.returncode}" if proc.returncode else None
-        except subprocess.TimeoutExpired:
-            problem = f"timed out after {BEFORE_MODEL_TIMEOUT_S}s"
-        except OSError as e:
-            raise BeforeModelFailed(f"{label}: --before-model failed ({e})") from e
-        if problem is None:
-            log(f"{label}: --before-model finished in {time.monotonic() - t0:.1f}s", err=True)
-            return
-        size = out.seek(0, os.SEEK_END)
-        out.seek(max(0, size - BEFORE_MODEL_OUTPUT_BYTES))
-        tail = out.read().decode(errors="replace").rstrip()
-    raise BeforeModelFailed(f"{label}: --before-model failed ({problem})" + (f"; its output:\n{tail}" if tail else ""))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, **env},
+            process_group=0,
+        )
+    except OSError as e:
+        raise BeforeModelFailed(f"{label}: --before-model failed ({e})") from e
+    tail = bytearray()
+    reader = threading.Thread(target=read_tail, args=(proc.stdout, tail, BEFORE_MODEL_OUTPUT_BYTES), daemon=True)
+    reader.start()
+    problem = wait_hook(proc)
+    reader.join(BEFORE_MODEL_OUTPUT_GRACE_S)
+    if problem is None:
+        log(f"{label}: --before-model finished in {time.monotonic() - t0:.1f}s", err=True)
+        return
+    output = bytes(tail).decode(errors="replace").rstrip()
+    raise BeforeModelFailed(
+        f"{label}: --before-model failed ({problem})" + (f"; its output:\n{output}" if output else "")
+    )
 
 
 def settings_fingerprint(opts):
@@ -1550,6 +1599,8 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
         except ServerDown as e:
             log(f"{name}: server unreachable ({e}); stopping this endpoint", err=True)
         except BeforeModelFailed as e:
+            if stop.is_set():  # killed on Ctrl-C: not a failure of the command
+                return
             log(
                 f"{e}\n{name}: stopping this endpoint; the trials it didn't run have no rows, so --resume runs "
                 "them once the command works",
@@ -2091,7 +2142,8 @@ def parse_args():
         help="run CMD on this machine before each model is loaded and wait for it, e.g. "
         "'lms unload --all --host gpu-box' so the previous model is out of memory. Split like a shell "
         "command but run without a shell; gets LLM_BENCH_ENDPOINT, LLM_BENCH_URL and LLM_BENCH_MODEL in its "
-        "environment. A failure stops the endpoint",
+        "environment; with several endpoints it must act only on that endpoint's server. A failure stops the "
+        "endpoint",
     )
     ap.add_argument(
         "-o",
@@ -2270,6 +2322,13 @@ def main():
     plan = plan_models(args, endpoints)
     if not plan:
         sys.exit("no models selected")
+    if args.before_model and len(plan) > 1:
+        log(
+            "note: --before-model runs for each endpoint's models while the other endpoints keep running, so it "
+            "must act only on the server in LLM_BENCH_URL; a command with a fixed host unloads that host's model "
+            "in the middle of its trials",
+            err=True,
+        )
     outputs = output_paths(args, plan)
     go_tmp = None
     if any(t["lang"] == "go" for t in tasks):
@@ -2304,6 +2363,7 @@ def run_all(args, plan, endpoints, tasks, outputs):
         stop.set()
         log("interrupted; results so far are in the CSV file(s)", err=True)
         stop_active_units()
+        stop_active_hooks()
         print_summary(list(rows))
         sys.exit(130)
     if args.resume:  # show the complete picture, not just the trials added now
