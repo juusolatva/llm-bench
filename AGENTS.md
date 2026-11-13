@@ -27,7 +27,7 @@ Repository layout:
 - **Standard library only, one script.** Users run `llm_bench.py` from a clone with no install step. Don't add dependencies or turn it into a package without being asked. Task content belongs in `tasks/`, not in the script.
 - **Never weaken the sandbox.** All model-generated code must run through `run_cmd`. Don't add an option that runs generated code on the host, don't expose more host paths, the network or the user's home, and don't loosen the resource limits or the cgroup check. Changes in this area need explicit sign-off from the maintainer.
 - **Treat model output as untrusted.** Replies are size-capped before parsing and before anything is written to disk. Paths derived from model, endpoint or tag names go through `safe_name()`, which also turns "." and ".." into safe names. Keep both of these in place.
-- **Server-agnostic.** Use only the OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints. No vendor-specific APIs or code paths.
+- **Server-agnostic.** Use only the OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints. No vendor-specific APIs or code paths. Server-specific actions, such as unloading the previous model, belong in the user's `--before-model` command. It runs on the host, outside the sandbox, by design: it's the user's own command line, not model output.
 - **No personal or environment-specific data.** No hostnames, IPs, hardware details or local paths in code, comments, examples or docs. Use placeholders like `localhost` or `gpu-box`.
 
 ## Task conventions
