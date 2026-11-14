@@ -64,6 +64,6 @@ Assess severity from demonstrated impact and realistic attacker control. Disting
 
 No blanket finding-class exclusions or accepted vulnerabilities are established by this policy. Ordinary wrong answers or failed task tests are benchmark outcomes; assess security impact separately.
 
-A harness's final line (see `GLOSSARY.md`) catches solutions that end the process early by accident. It is not a security boundary: a solution that prints the line on purpose, or otherwise games a harness, affects only its own result, inside the sandbox. Report it as a task issue, not a vulnerability.
+A harness's final line catches solutions that end the process early by accident. It is not a security boundary: a solution that prints the line on purpose, or otherwise games a harness, affects only its own result, inside the sandbox. Report it as a task issue, not a vulnerability.
 
 Sandbox tests can skip when required host facilities are unavailable. Passing unit tests or a CI run with skipped sandbox tests is not evidence that containment works. This policy describes required properties, not a completed security audit.
