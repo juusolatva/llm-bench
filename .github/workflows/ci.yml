@@ -14,6 +14,7 @@ concurrency:
 jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }})
+    # ubuntu-latest is Ubuntu 26.04, where the sandbox (bwrap + a systemd user session) works and its tests run.
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -27,7 +28,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv run --locked --no-build --group dev ruff check .
       - run: uv run --locked --no-build --group dev ruff format --check --diff .
-      # Sandbox (end-to-end) tests skip themselves when bwrap + a systemd user session are unavailable.
+      # Go under /usr for the Go tests: the runner's own Go lives in /opt/hostedtoolcache, which the sandbox doesn't
+      # mount (check_toolchains would skip them). /usr/lib/go/bin goes first on PATH, ahead of the runner's /usr/bin/go.
+      - name: Install Go under /usr
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends golang-go
+          echo /usr/lib/go/bin >> "$GITHUB_PATH"
+      - run: go version && readlink -f "$(command -v go)"
+      # Sandbox (end-to-end) tests skip themselves when bwrap + a systemd user session are unavailable, and a task's
+      # tests skip when its toolchain isn't there for the sandbox (TypeScript here: no tsc).
       - run: uv run --locked --no-build --group dev pytest -rs
 
   sonarqube:
@@ -45,7 +55,15 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
           python-version: "3.14"
-      # Coverage for the quality gate. Sandbox tests skip themselves on CI, as in ci.yml.
+      # Go under /usr for the Go tests: the runner's own Go lives in /opt/hostedtoolcache, which the sandbox doesn't
+      # mount (check_toolchains would skip them). /usr/lib/go/bin goes first on PATH, ahead of the runner's /usr/bin/go.
+      - name: Install Go under /usr
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends golang-go
+          echo /usr/lib/go/bin >> "$GITHUB_PATH"
+      - run: go version && readlink -f "$(command -v go)"
+      # Coverage for the quality gate, from the same tests as the test job.
       - run: uv run --locked --no-build --group dev coverage run -m pytest -q
       - run: uv run --locked --no-build --group dev coverage xml
       - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9  # v8.3.0
