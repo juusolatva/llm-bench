@@ -397,14 +397,14 @@ ASM_EXIT = ASM_GOOD.replace(
 
 
 def test_asm_symbol_check_feedback(monkeypatch, tmp_path, mock_server):
-    """A solution that calls into libc fails at the build stage with check_symbols.sh's message as feedback."""
+    """A solution that calls into libc fails at the build stage with check_solution.sh's message as feedback."""
     builtin_task("asm_sum_above")
     s = mock_server(replies=[ASM_LIBC, ASM_GOOD])
     run(monkeypatch, tmp_path, f"m={s.url}", "--task", "asm_sum_above")
     (row,) = read_rows(tmp_path / "results_m.csv")
     assert (row["passed"], row["passed_on"]) == ("1", "2")
     feedback = s.requests[1]["messages"][-1]["content"]
-    assert "Output of `bash check_symbols.sh solution.o`:" in feedback
+    assert "Output of `bash check_solution.sh solution.s solution.o`:" in feedback
     assert "must not reference symbols defined outside it" in feedback
     assert "U memmove" in feedback
 

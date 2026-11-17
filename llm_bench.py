@@ -125,20 +125,28 @@ TS_CONFIG = """\
   "files": ["solution.ts", "test.ts"]
 }
 """
-# Assembly tasks: solution.s must reference no outside symbol (no libc) and export exactly one global symbol. The
-# harness's reference to the task function pins that symbol's name at link time, so a solution can't replace libc,
-# ASan or harness functions (a global `exit` would make a failing harness exit 0). Runs inside the sandbox with
-# LC_ALL=C, as a separate build step so its message reaches the model as build feedback.
-ASM_SYMBOL_CHECK = """\
+# Assembly tasks: solution.s must not switch to another instruction set with .arch (it would override
+# -march=generic64 and make results depend on the CPU; gas accepts the directive in any case, after a label or a ";"),
+# must reference no outside symbol (no libc) and must export exactly one global symbol. The harness's reference to the
+# task function pins that symbol's name at link time, so a solution can't replace libc, ASan or harness functions (a
+# global `exit` would make a failing harness exit 0). Runs inside the sandbox with LC_ALL=C, as a separate build step
+# so its message reaches the model as build feedback. Arguments: solution.s solution.o.
+ASM_SOLUTION_CHECK = """\
 set -u
-undefined=$(nm -u "$1") || exit 1
+arch=$(sed 's/#.*//' "$1" | grep -inE '(^|[;:])[[:space:]]*[.]arch([[:space:]]|$)')
+if [ -n "$arch" ]; then
+    printf 'solution.s must not change the instruction set with .arch (only baseline x86-64 is allowed):\\n'
+    printf '%s\\n' "$arch" | sed 's/^/line /'
+    exit 1
+fi
+undefined=$(nm -u "$2") || exit 1
 if [ -n "$undefined" ]; then
     printf 'solution.s must not reference symbols defined outside it (no libc or other external functions).\\n'
     printf 'Undefined symbols:\\n%s\\n' "$undefined"
     exit 1
 fi
-globals=$(nm -g --defined-only --format=just-symbols "$1") || exit 1
-count=$(printf '%s' "$globals" | grep -c '')
+globals=$(nm -g --defined-only --format=just-symbols "$2") || exit 1
+count=$(printf '%s\\n' "$globals" | grep -c '^.')
 if [ "$count" -ne 1 ]; then
     printf 'solution.s must export exactly one global symbol, the requested function; it exports %s:\\n%s\\n' \\
         "$count" "${globals:-(none)}"
@@ -232,10 +240,10 @@ LANGS = {
         "sol": "solution.s",
         "test": "test.c",
         "tags": ("asm", "assembly", "gas", "s", "x86asm", "x86", "x86_64", "x86-64", "gnu-as"),
-        "extra": {"check_symbols.sh": ASM_SYMBOL_CHECK},
+        "extra": {"check_solution.sh": ASM_SOLUTION_CHECK},
         "cmds": [
             ["gcc", "-c", "-Wa,-march=generic64+ibt", "solution.s", "-o", "solution.o"],
-            ["bash", "check_symbols.sh", "solution.o"],
+            ["bash", "check_solution.sh", "solution.s", "solution.o"],
             [
                 "gcc",
                 "-std=gnu17",
@@ -253,7 +261,7 @@ LANGS = {
             ["./t"],
         ],
         "final_line": HARNESS_FINAL_LINE,
-        "tools": ("nm",),
+        "tools": ("nm", "grep", "sed"),
     },
     "bash": {
         "prefix": "bash",

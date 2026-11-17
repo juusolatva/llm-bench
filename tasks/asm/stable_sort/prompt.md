@@ -17,6 +17,6 @@ It sorts `a[0..n-1]` in place in the order defined by `less`, so that afterwards
 
 Rules:
 - Write GNU assembler (gas) source for x86-64 Linux, in AT&T syntax or with `.intel_syntax noprefix` (not NASM).
-- Use only baseline x86-64 instructions (up to SSE2): no SSE3 or later, POPCNT, LZCNT/TZCNT, BMI or AVX.
+- Use only baseline x86-64 instructions (up to SSE2): no SSE3 or later, POPCNT, LZCNT/TZCNT, BMI or AVX, and no `.arch` directive.
 - Export only `stable_sort` with `.globl` and keep every other label local. Don't reference any symbol defined outside solution.s (no libc calls).
 - Follow the System V AMD64 ABI: preserve `%rbx`, `%rbp`, `%r12`–`%r15` and `%rsp`, keep `%rsp` 16-byte aligned at every `call`, and return with the direction flag clear.

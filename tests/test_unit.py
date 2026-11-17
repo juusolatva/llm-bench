@@ -1266,15 +1266,23 @@ ASM_HOST = llm_bench.shutil.which("gcc") and llm_bench.shutil.which("nm") and os
         (".text\n.globl f\n.globl g\nf:\ng:\n  ret\n", False, r"exports 2:\nf\ng\n"),
         (".text\n.globl f\nf:\n  ret\n.comm buf,16,8\n", False, r"exports 2:\nbuf\nf\n"),
         (".text\nf:\n  ret\n", False, r"exports 0:\n\(none\)\n"),
+        (".text\n.globl f\nf:\n  ret  # no .arch needed\n", True, ""),
+        (
+            ".arch .popcnt\n.text\n.globl f\nf:\n  popcnt %rax, %rax\n  ret\n",
+            False,
+            r"\.arch.*\nline 1:\.arch \.popcnt\n",
+        ),
+        (".text\n.globl f\nf:\t.ARCH\t.sse4.2\n  ret\n", False, r"line 3:f:\t\.ARCH"),
+        (".text\n.globl f\nf:\n  nop; .arch corei7\n  ret\n", False, r"line 4:  nop; \.arch corei7"),
     ],
 )
 def test_asm_symbol_check(tmp_path, source, ok, message):
-    """check_symbols.sh on objects assembled on the host from these trusted fixtures (no model output involved)."""
-    (tmp_path / "check_symbols.sh").write_text(llm_bench.ASM_SYMBOL_CHECK)
+    """check_solution.sh on objects assembled on the host from these trusted fixtures (no model output involved)."""
+    (tmp_path / "check_solution.sh").write_text(llm_bench.ASM_SOLUTION_CHECK)
     (tmp_path / "solution.s").write_text(source)
     llm_bench.subprocess.run(["gcc", "-c", "solution.s", "-o", "solution.o"], cwd=tmp_path, check=True)
     result = llm_bench.subprocess.run(
-        ["bash", "check_symbols.sh", "solution.o"],
+        ["bash", "check_solution.sh", "solution.s", "solution.o"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
