@@ -629,6 +629,10 @@ def stop_active_units():
         )
 
 
+# Host directories every sandbox sees read-only (sandbox_command), so the only places a system tool may live.
+SANDBOX_SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives")
+
+
 def sandbox_path_dirs():
     """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT) and Node with
     tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
@@ -655,7 +659,7 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
         "--clearenv",
     ]
     # Expose runtime/toolchain files, not all of /etc, /home, /run or the host root.
-    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives"):
+    for path in SANDBOX_SYSTEM_DIRS:
         if Path(path).exists():
             sandbox += ["--ro-bind", path, path]
     if Path(LD_SO_CACHE).is_file():
@@ -1038,8 +1042,9 @@ def check_asm_target(langs):
     Checks the compiler's target, not the kernel's architecture."""
     if "asm" not in langs:
         return
+    gcc = sandbox_tool("gcc")[0] or "gcc"  # the gcc that builds the solutions, not one earlier on the host PATH
     try:
-        result = subprocess.run(["gcc", "-dumpmachine"], check=True, capture_output=True, text=True, timeout=10)
+        result = subprocess.run([gcc, "-dumpmachine"], check=True, capture_output=True, text=True, timeout=10)
         target = result.stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         target, error = None, f"cannot ask gcc for its target: {exc}"
@@ -1051,9 +1056,38 @@ def check_asm_target(langs):
     sys.exit(f"{error}; the assembly tasks need an x86-64 Linux host and gcc\nskip them with {hint}")
 
 
+def sandbox_tool(name):
+    """The path of the `name` a sandbox runs, the first on its PATH (sandbox_path_dirs()), and a note: (path, "") if
+    it's usable, (None, "") if there is none, and (None, note) if it resolves through symlinks to a file outside
+    SANDBOX_SYSTEM_DIRS, which the sandbox would see as a dangling link (a /usr/bin/go linked into /opt, say)."""
+    found = shutil.which(name, path=os.pathsep.join(sandbox_path_dirs()))
+    if found is None:
+        return None, ""
+    real = Path(found).resolve()
+    if any(real.is_relative_to(d) for d in SANDBOX_SYSTEM_DIRS):
+        return found, ""
+    return None, f"{found} resolves to {real}, which the sandbox doesn't mount"
+
+
 # Commands looked up on the host PATH, not only the sandbox's: they may live under a home directory (rustup, fnm,
 # nvm), and check_toolchains resolves the parts the sandbox mounts.
 HOST_RESOLVED = {"rustc", "node", "tsc"}
+
+
+def check_tools_found(needed):
+    """Exit if a command or tool in `needed` isn't there for the sandbox. Sandboxes only see sandbox_path_dirs() and
+    SANDBOX_SYSTEM_DIRS, so a tool found only in a home directory, or linked to one, doesn't count, except for
+    HOST_RESOLVED commands: check_toolchains resolves their toolchains for the sandbox."""
+    found = {name: (shutil.which(name), "") if name in HOST_RESOLVED else sandbox_tool(name) for name in needed}
+    missing = sorted(name for name, (tool, _) in found.items() if tool is None)
+    if missing:
+        notes = "".join(f"{name}: {found[name][1]}\n" for name in missing if found[name][1])
+        path = os.pathsep.join(sandbox_path_dirs())
+        sys.exit(
+            f"missing toolchains on PATH: {', '.join(missing)}\n{notes}"
+            f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
+            f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')"
+        )
 
 
 def check_toolchains(tasks):
@@ -1062,18 +1096,7 @@ def check_toolchains(tasks):
     langs = {t["lang"] for t in tasks}
     needed = {cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"] if not cmd[0].startswith("./")}
     needed |= {tool for lang in langs for tool in LANGS[lang].get("tools", ())}
-    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count, except for
-    # HOST_RESOLVED commands: the sandbox gets their resolved toolchain below.
-    path = os.pathsep.join(sandbox_path_dirs())
-    missing = sorted(
-        name for name in needed if shutil.which(name, path=None if name in HOST_RESOLVED else path) is None
-    )
-    if missing:
-        sys.exit(
-            f"missing toolchains on PATH: {', '.join(missing)}\n"
-            f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
-            f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')"
-        )
+    check_tools_found(needed)
     check_asm_target(langs)
     if "rust" in langs:
         try:

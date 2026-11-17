@@ -1161,7 +1161,61 @@ def fake_gcc_target(monkeypatch, answer):
 def test_check_toolchains_accepts_an_x86_64_gcc(monkeypatch):
     calls = fake_gcc_target(monkeypatch, "x86_64-redhat-linux\n")
     llm_bench.check_toolchains([{"lang": "asm"}])
-    assert calls == [["gcc", "-dumpmachine"]]
+    assert calls == [["/usr/bin/gcc", "-dumpmachine"]]
+
+
+def make_tool(path, target=None):
+    """An executable at `path`, or a symlink at `path` to a new executable at `target`."""
+    real = target or path
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    if target:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
+
+
+def fake_sandbox_dirs(monkeypatch, tmp_path):
+    """tmp_path/usr stands in for the directories the sandbox mounts, tmp_path/usr/bin for its PATH."""
+    monkeypatch.setattr(llm_bench, "SANDBOX_SYSTEM_DIRS", (str(tmp_path / "usr"),))
+    monkeypatch.setattr(llm_bench, "sandbox_path_dirs", lambda: [str(tmp_path / "usr/bin")])
+    return tmp_path / "usr/bin"
+
+
+def test_sandbox_tool_rejects_links_out_of_the_mounts(monkeypatch, tmp_path):
+    """A tool on the sandbox's PATH that links outside the mounted directories (a /usr/bin/go linked into /opt) would
+    be a dangling link inside the sandbox; links within them are fine."""
+    bin_dir = fake_sandbox_dirs(monkeypatch, tmp_path)
+    make_tool(bin_dir / "go", tmp_path / "opt/go/bin/go")
+    make_tool(bin_dir / "gcc", tmp_path / "usr/libexec/gcc-15")
+    make_tool(bin_dir / "nm")
+    assert llm_bench.sandbox_tool("gcc") == (str(bin_dir / "gcc"), "")
+    assert llm_bench.sandbox_tool("nm") == (str(bin_dir / "nm"), "")
+    assert llm_bench.sandbox_tool("rustfmt") == (None, "")
+    path, note = llm_bench.sandbox_tool("go")
+    assert path is None
+    assert note == f"{bin_dir / 'go'} resolves to {tmp_path / 'opt/go/bin/go'}, which the sandbox doesn't mount"
+
+
+def test_check_toolchains_explains_tools_linked_out_of_the_mounts(monkeypatch, tmp_path):
+    bin_dir = fake_sandbox_dirs(monkeypatch, tmp_path)
+    make_tool(bin_dir / "go", tmp_path / "opt/go/bin/go")
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: go\ngo: .* resolves to .*opt/go/bin/go, which"):
+        llm_bench.check_toolchains([{"lang": "go"}])
+
+
+def test_check_asm_target_asks_the_sandbox_gcc(monkeypatch, tmp_path):
+    """The target check asks the gcc that builds the solutions, not a different one earlier on the host PATH."""
+    bin_dir = fake_sandbox_dirs(monkeypatch, tmp_path)
+    make_tool(bin_dir / "gcc")
+    make_tool(tmp_path / "home/bin/gcc")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'home/bin'}{os.pathsep}{bin_dir}")
+    calls = []
+    monkeypatch.setattr(
+        llm_bench.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(stdout="x86_64-linux-gnu\n")
+    )
+    llm_bench.check_asm_target({"asm"})
+    assert calls == [[str(bin_dir / "gcc"), "-dumpmachine"]]
 
 
 @pytest.mark.parametrize(
