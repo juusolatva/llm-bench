@@ -386,3 +386,34 @@ def test_go_cache_overlay_is_private(tmp_path, monkeypatch):
     assert result.out.split()[:2] == ["cached", "/opt/go-cache"]
     assert (cache / "entry").read_text() == "cached\n"
     assert not (cache / "new").exists()
+
+
+ASM_GOOD = "```asm\n" + (llm_bench.DEFAULT_TASKS_DIR / "asm/sum_above/reference/solution.s").read_text() + "```"
+ASM_LIBC = ASM_GOOD.replace("xorl    %eax, %eax\n", "xorl    %eax, %eax\n        call    memmove\n", 1)
+# Ends the process with an exit_group(0) system call, before the harness checks anything.
+ASM_EXIT = ASM_GOOD.replace(
+    "xorl    %eax, %eax\n", "movl    $231, %eax\n        xorl    %edi, %edi\n        syscall\n", 1
+)
+
+
+def test_asm_symbol_check_feedback(monkeypatch, tmp_path, mock_server):
+    """A solution that calls into libc fails at the build stage with check_solution.sh's message as feedback."""
+    builtin_task("asm_sum_above")
+    s = mock_server(replies=[ASM_LIBC, ASM_GOOD])
+    run(monkeypatch, tmp_path, f"m={s.url}", "--task", "asm_sum_above")
+    (row,) = read_rows(tmp_path / "results_m.csv")
+    assert (row["passed"], row["passed_on"]) == ("1", "2")
+    feedback = s.requests[1]["messages"][-1]["content"]
+    assert "Output of `bash check_solution.sh solution.s solution.o`:" in feedback
+    assert "must not reference symbols defined outside it" in feedback
+    assert "U memmove" in feedback
+
+
+def test_asm_exit_syscall_fails_the_case(tmp_path):
+    """The harness runs each case in a child that reports its verdict through a pipe, so a solution that ends the
+    child with status 0 before returning fails instead of passing the case."""
+    task = builtin_task("asm_sum_above")
+    passed, log, stage, cmd, out = llm_bench.run_task(task, llm_bench.extract_code(ASM_EXIT, "asm"), tmp_path / "w")
+    assert (passed, stage, cmd) == (False, "test", "./t"), log
+    assert "the process ended before the function returned (exit system call?)" in out
+    assert "harness: all checks passed" not in out

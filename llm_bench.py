@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, TypeScript, Bash and terminal
-tasks.
+"""Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, TypeScript, x86-64 assembly,
+Bash and terminal tasks.
 
 Works with any server exposing /v1/models and /v1/chat/completions (Ollama, LM Studio,
 llama.cpp server, vLLM, ...). Generated code is built and run against a hidden test harness per task.
@@ -9,7 +9,7 @@ Output: results_<endpoint>.csv (one row per trial: one model on one task) and
 runs/<endpoint>/<model>/<task>/<config>/repeat_<r>/attempt_<n>/ (response.md = raw model reply, log.txt = build/test output).
 Requires Linux, bubblewrap, a user systemd manager with cgroup v2 limits, and
 toolchains on PATH: python3, gcc, g++, rustc, go, node + tsc, bash (+ coreutils/findutils; GNU diffutils, grep, sed
-and gawk for terminal tasks).
+and gawk for terminal tasks; binutils nm and an x86-64 gcc for assembly tasks).
 Run with --help for usage.
 """
 
@@ -125,6 +125,34 @@ TS_CONFIG = """\
   "files": ["solution.ts", "test.ts"]
 }
 """
+# Assembly tasks: solution.s must not switch to another instruction set with .arch (it would override
+# -march=generic64 and make results depend on the CPU; gas accepts the directive in any case, after a label or a ";"),
+# must reference no outside symbol (no libc) and must export exactly one global symbol. The harness's reference to the
+# task function pins that symbol's name at link time, so a solution can't replace libc, ASan or harness functions (a
+# global `exit` would make a failing harness exit 0). Runs inside the sandbox with LC_ALL=C, as a separate build step
+# so its message reaches the model as build feedback. Arguments: solution.s solution.o.
+ASM_SOLUTION_CHECK = """\
+set -u
+arch=$(sed 's/#.*//' "$1" | grep -inE '(^|[;:])[[:space:]]*[.]arch([[:space:]]|$)')
+if [ -n "$arch" ]; then
+    printf 'solution.s must not change the instruction set with .arch (only baseline x86-64 is allowed):\\n'
+    printf '%s\\n' "$arch" | sed 's/^/line /'
+    exit 1
+fi
+undefined=$(nm -u "$2") || exit 1
+if [ -n "$undefined" ]; then
+    printf 'solution.s must not reference symbols defined outside it (no libc or other external functions).\\n'
+    printf 'Undefined symbols:\\n%s\\n' "$undefined"
+    exit 1
+fi
+globals=$(nm -g --defined-only --format=just-symbols "$2") || exit 1
+count=$(printf '%s\\n' "$globals" | grep -c '^.')
+if [ "$count" -ne 1 ]; then
+    printf 'solution.s must export exactly one global symbol, the requested function; it exports %s:\\n%s\\n' \\
+        "$count" "${globals:-(none)}"
+    exit 1
+fi
+"""
 LANGS = {
     "python": {
         "prefix": "py",
@@ -203,6 +231,37 @@ LANGS = {
         "cmds": [["tsc", "--project", "tsconfig.json"], ["node", "out/test.js"]],
         "final_line": HARNESS_FINAL_LINE,
         "strip_ansi": True,
+    },
+    # x86-64 assembly (GNU as) called from a C harness. -march=generic64+ibt allows baseline x86-64 (up to SSE2)
+    # plus endbr64, so results don't depend on the host CPU. -no-pie accepts absolute symbol references, and
+    # -z noexecstack makes a .note.GNU-stack section unnecessary.
+    "asm": {
+        "prefix": "asm",
+        "sol": "solution.s",
+        "test": "test.c",
+        "tags": ("asm", "assembly", "gas", "s", "x86asm", "x86", "x86_64", "x86-64", "gnu-as"),
+        "extra": {"check_solution.sh": ASM_SOLUTION_CHECK},
+        "cmds": [
+            ["gcc", "-c", "-Wa,-march=generic64+ibt", "solution.s", "-o", "solution.o"],
+            ["bash", "check_solution.sh", "solution.s", "solution.o"],
+            [
+                "gcc",
+                "-std=gnu17",
+                "-O1",
+                "-g",
+                "-Wall",
+                *SAN,
+                "-no-pie",
+                "-Wl,-z,noexecstack",
+                "solution.o",
+                "test.c",
+                "-o",
+                "t",
+            ],
+            ["./t"],
+        ],
+        "final_line": HARNESS_FINAL_LINE,
+        "tools": ("nm", "grep", "sed"),
     },
     "bash": {
         "prefix": "bash",
@@ -578,6 +637,10 @@ def stop_active_units():
         )
 
 
+# Host directories every sandbox sees read-only (sandbox_command), so the only places a system tool may live.
+SANDBOX_SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives")
+
+
 def sandbox_path_dirs():
     """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT) and Node with
     tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
@@ -604,7 +667,7 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
         "--clearenv",
     ]
     # Expose runtime/toolchain files, not all of /etc, /home, /run or the host root.
-    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives"):
+    for path in SANDBOX_SYSTEM_DIRS:
         if Path(path).exists():
             sandbox += ["--ro-bind", path, path]
     if Path(LD_SO_CACHE).is_file():
@@ -982,9 +1045,57 @@ def resolve_ts_package():
     return package
 
 
+def check_asm_target(langs):
+    """Exit unless gcc emits x86-64 code (not x32) when assembly tasks are selected (`langs`): they are x86-64 only.
+    Checks the compiler's target, not the kernel's architecture."""
+    if "asm" not in langs:
+        return
+    gcc = sandbox_tool("gcc")[0] or "gcc"  # the gcc that builds the solutions, not one earlier on the host PATH
+    try:
+        result = subprocess.run([gcc, "-dumpmachine"], check=True, capture_output=True, text=True, timeout=10)
+        target = result.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        target, error = None, f"cannot ask gcc for its target: {exc}"
+    if target is not None:
+        if target.startswith("x86_64-") and not target.endswith("x32"):
+            return
+        error = f"gcc targets {target or '(nothing)'}, not x86-64"
+    hint = " ".join(f"--task '{spec['prefix']}_*'" for lang, spec in LANGS.items() if lang != "asm")
+    sys.exit(f"{error}; the assembly tasks need an x86-64 Linux host and gcc\nskip them with {hint}")
+
+
+def sandbox_tool(name):
+    """The path of the `name` a sandbox runs, the first on its PATH (sandbox_path_dirs()), and a note: (path, "") if
+    it's usable, (None, "") if there is none, and (None, note) if it resolves through symlinks to a file outside
+    SANDBOX_SYSTEM_DIRS, which the sandbox would see as a dangling link (a /usr/bin/go linked into /opt, say)."""
+    found = shutil.which(name, path=os.pathsep.join(sandbox_path_dirs()))
+    if found is None:
+        return None, ""
+    real = Path(found).resolve()
+    if any(real.is_relative_to(d) for d in SANDBOX_SYSTEM_DIRS):
+        return found, ""
+    return None, f"{found} resolves to {real}, which the sandbox doesn't mount"
+
+
 # Commands looked up on the host PATH, not only the sandbox's: they may live under a home directory (rustup, fnm,
 # nvm), and check_toolchains resolves the parts the sandbox mounts.
 HOST_RESOLVED = {"rustc", "node", "tsc"}
+
+
+def check_tools_found(needed):
+    """Exit if a command or tool in `needed` isn't there for the sandbox. Sandboxes only see sandbox_path_dirs() and
+    SANDBOX_SYSTEM_DIRS, so a tool found only in a home directory, or linked to one, doesn't count, except for
+    HOST_RESOLVED commands: check_toolchains resolves their toolchains for the sandbox."""
+    found = {name: (shutil.which(name), "") if name in HOST_RESOLVED else sandbox_tool(name) for name in needed}
+    missing = sorted(name for name, (tool, _) in found.items() if tool is None)
+    if missing:
+        notes = "".join(f"{name}: {found[name][1]}\n" for name in missing if found[name][1])
+        path = os.pathsep.join(sandbox_path_dirs())
+        sys.exit(
+            f"missing toolchains on PATH: {', '.join(missing)}\n{notes}"
+            f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
+            f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')"
+        )
 
 
 def check_toolchains(tasks):
@@ -993,18 +1104,8 @@ def check_toolchains(tasks):
     langs = {t["lang"] for t in tasks}
     needed = {cmd[0] for lang in langs for cmd in LANGS[lang]["cmds"] if not cmd[0].startswith("./")}
     needed |= {tool for lang in langs for tool in LANGS[lang].get("tools", ())}
-    # Sandboxes only see sandbox_path_dirs(), so a tool found only in a home directory doesn't count, except for
-    # HOST_RESOLVED commands: the sandbox gets their resolved toolchain below.
-    path = os.pathsep.join(sandbox_path_dirs())
-    missing = sorted(
-        name for name in needed if shutil.which(name, path=None if name in HOST_RESOLVED else path) is None
-    )
-    if missing:
-        sys.exit(
-            f"missing toolchains on PATH: {', '.join(missing)}\n"
-            f"install them under /usr (the sandbox's PATH has only {path}, the Rust toolchain, Node and "
-            f"TypeScript) or skip their tasks with --task (e.g. --task 'py_*' --task 'c_*')"
-        )
+    check_tools_found(needed)
+    check_asm_target(langs)
     if "rust" in langs:
         try:
             RUST_SYSROOT = resolve_rust_sysroot()
@@ -2041,8 +2142,8 @@ The API key is read from --api-key, LLM_BENCH_API_KEY or OPENAI_API_KEY, in that
 def parse_args():
     """Parse and validate the command line (endpoints may also come from LLM_BENCH_ENDPOINTS)."""
     ap = argparse.ArgumentParser(
-        description="Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go "
-        "and Bash coding tasks. Generated code is built and tested in a sandbox.",
+        description="Benchmark LLMs served over an OpenAI-compatible API on Python, C, C++, Rust, Go, TypeScript, "
+        "x86-64 assembly, Bash and terminal tasks. Generated code is built and tested in a sandbox.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

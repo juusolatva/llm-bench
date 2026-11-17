@@ -1135,3 +1135,187 @@ def test_check_ts_sandbox_exits_when_tsc_fails(monkeypatch):
 def test_check_ts_sandbox_skips_without_ts_tasks(monkeypatch):
     monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: pytest.fail("must not run the sandbox"))
     llm_bench.check_ts_sandbox([{"lang": "python"}])
+
+
+def test_extract_code_prefers_the_asm_block():
+    reply = "The C side:\n```c\nuint64_t sum_above(const uint8_t *a, size_t n, uint8_t t);\n```\n"
+    for tag in ("asm", "gas", "x86-64", "s"):
+        assert llm_bench.extract_code(reply + f"```{tag}\n.globl sum_above\n```\n", "asm") == ".globl sum_above\n"
+
+
+def fake_gcc_target(monkeypatch, answer):
+    """Every tool exists; `gcc -dumpmachine` answers `answer` (a string, or an exception to raise)."""
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(stdout=answer)
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", run)
+    return calls
+
+
+def test_check_toolchains_accepts_an_x86_64_gcc(monkeypatch):
+    calls = fake_gcc_target(monkeypatch, "x86_64-redhat-linux\n")
+    llm_bench.check_toolchains([{"lang": "asm"}])
+    assert calls == [["/usr/bin/gcc", "-dumpmachine"]]
+
+
+def make_tool(path, target=None):
+    """An executable at `path`, or a symlink at `path` to a new executable at `target`."""
+    real = target or path
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    if target:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
+
+
+def fake_sandbox_dirs(monkeypatch, tmp_path):
+    """tmp_path/usr stands in for the directories the sandbox mounts, tmp_path/usr/bin for its PATH."""
+    monkeypatch.setattr(llm_bench, "SANDBOX_SYSTEM_DIRS", (str(tmp_path / "usr"),))
+    monkeypatch.setattr(llm_bench, "sandbox_path_dirs", lambda: [str(tmp_path / "usr/bin")])
+    return tmp_path / "usr/bin"
+
+
+def test_sandbox_tool_rejects_links_out_of_the_mounts(monkeypatch, tmp_path):
+    """A tool on the sandbox's PATH that links outside the mounted directories (a /usr/bin/go linked into /opt) would
+    be a dangling link inside the sandbox; links within them are fine."""
+    bin_dir = fake_sandbox_dirs(monkeypatch, tmp_path)
+    make_tool(bin_dir / "go", tmp_path / "opt/go/bin/go")
+    make_tool(bin_dir / "gcc", tmp_path / "usr/libexec/gcc-15")
+    make_tool(bin_dir / "nm")
+    assert llm_bench.sandbox_tool("gcc") == (str(bin_dir / "gcc"), "")
+    assert llm_bench.sandbox_tool("nm") == (str(bin_dir / "nm"), "")
+    assert llm_bench.sandbox_tool("rustfmt") == (None, "")
+    path, note = llm_bench.sandbox_tool("go")
+    assert path is None
+    assert note == f"{bin_dir / 'go'} resolves to {tmp_path / 'opt/go/bin/go'}, which the sandbox doesn't mount"
+
+
+def test_check_toolchains_explains_tools_linked_out_of_the_mounts(monkeypatch, tmp_path):
+    bin_dir = fake_sandbox_dirs(monkeypatch, tmp_path)
+    make_tool(bin_dir / "go", tmp_path / "opt/go/bin/go")
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: go\ngo: .* resolves to .*opt/go/bin/go, which"):
+        llm_bench.check_toolchains([{"lang": "go"}])
+
+
+def test_check_asm_target_asks_the_sandbox_gcc(monkeypatch, tmp_path):
+    """The target check asks the gcc that builds the solutions, not a different one earlier on the host PATH."""
+    bin_dir = fake_sandbox_dirs(monkeypatch, tmp_path)
+    make_tool(bin_dir / "gcc")
+    make_tool(tmp_path / "home/bin/gcc")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'home/bin'}{os.pathsep}{bin_dir}")
+    calls = []
+    monkeypatch.setattr(
+        llm_bench.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(stdout="x86_64-linux-gnu\n")
+    )
+    llm_bench.check_asm_target({"asm"})
+    assert calls == [[str(bin_dir / "gcc"), "-dumpmachine"]]
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        ("aarch64-linux-gnu\n", "gcc targets aarch64-linux-gnu, not x86-64"),
+        ("x86_64-linux-gnux32\n", "gcc targets x86_64-linux-gnux32, not x86-64"),
+        ("\n", r"gcc targets \(nothing\), not x86-64"),
+        (llm_bench.subprocess.CalledProcessError(1, ["gcc"]), "cannot ask gcc for its target"),
+        (llm_bench.subprocess.TimeoutExpired(["gcc"], 10), "cannot ask gcc for its target"),
+        (FileNotFoundError("gcc"), "cannot ask gcc for its target"),
+    ],
+)
+def test_check_toolchains_rejects_other_gcc_targets(monkeypatch, answer, message):
+    """Outside x86-64 the run stops with the --task flags that skip the assembly tasks: every other language."""
+    fake_gcc_target(monkeypatch, answer)
+    with pytest.raises(SystemExit) as exc:
+        llm_bench.check_toolchains([{"lang": "python"}, {"lang": "asm"}])
+    text = str(exc.value)
+    assert re.search(message, text)
+    others = [spec["prefix"] for lang, spec in llm_bench.LANGS.items() if lang != "asm"]
+    assert text.endswith("skip them with " + " ".join(f"--task '{p}_*'" for p in others))
+    assert "'asm_*'" not in text
+
+
+def test_check_toolchains_asks_gcc_only_for_asm_tasks(monkeypatch):
+    fake_gcc_target(monkeypatch, AssertionError("must not run gcc"))
+    llm_bench.check_toolchains([{"lang": "c"}, {"lang": "bash"}])
+
+
+def test_check_toolchains_reports_a_missing_nm(monkeypatch):
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name, path=None: None if name == "nm" else f"/usr/bin/{name}")
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: nm\n"):
+        llm_bench.check_toolchains([{"lang": "asm"}])
+
+
+ASM_HOST = llm_bench.shutil.which("gcc") and llm_bench.shutil.which("nm") and os.uname().machine == "x86_64"
+
+
+@pytest.mark.skipif(not ASM_HOST, reason="needs gcc and nm on an x86-64 host")
+@pytest.mark.parametrize(
+    ("source", "ok", "message"),
+    [
+        (".text\n.globl f\nf:\n  ret\n", True, ""),
+        (".text\n.globl f\nf:\n  call helper\nhelper:\n  ret\n", True, ""),  # local labels are fine
+        (".text\n.globl f\nf:\n  call memmove\n  ret\n", False, r"(?s)outside it.*U memmove"),
+        (".text\n.globl f\n.weak g\nf:\n  movq $g, %rax\n  ret\n", False, r"(?s)outside it.*w g"),
+        (".text\n.globl f\n.globl g\nf:\ng:\n  ret\n", False, r"exports 2:\nf\ng\n"),
+        (".text\n.globl f\nf:\n  ret\n.comm buf,16,8\n", False, r"exports 2:\nbuf\nf\n"),
+        (".text\nf:\n  ret\n", False, r"exports 0:\n\(none\)\n"),
+        (".text\n.globl f\nf:\n  ret  # no .arch needed\n", True, ""),
+        (
+            ".arch .popcnt\n.text\n.globl f\nf:\n  popcnt %rax, %rax\n  ret\n",
+            False,
+            r"\.arch.*\nline 1:\.arch \.popcnt\n",
+        ),
+        (".text\n.globl f\nf:\t.ARCH\t.sse4.2\n  ret\n", False, r"line 3:f:\t\.ARCH"),
+        (".text\n.globl f\nf:\n  nop; .arch corei7\n  ret\n", False, r"line 4:  nop; \.arch corei7"),
+    ],
+)
+def test_asm_symbol_check(tmp_path, source, ok, message):
+    """check_solution.sh on objects assembled on the host from these trusted fixtures (no model output involved)."""
+    (tmp_path / "check_solution.sh").write_text(llm_bench.ASM_SOLUTION_CHECK)
+    (tmp_path / "solution.s").write_text(source)
+    llm_bench.subprocess.run(["gcc", "-c", "solution.s", "-o", "solution.o"], cwd=tmp_path, check=True)
+    result = llm_bench.subprocess.run(
+        ["bash", "check_solution.sh", "solution.s", "solution.o"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    assert (result.returncode == 0) is ok, result.stdout
+    assert re.search(message, result.stdout)
+
+
+ASM_TASKS = [t for t in BUILTIN_TASKS if t["lang"] == "asm"]
+
+
+def test_asm_prompts_share_the_rules_block():
+    """Every assembly prompt ends with the same rules paragraph, apart from the exported function's name."""
+    rules = {re.sub(r"Export only `\w+`", "Export only `NAME`", t["prompt"].rsplit("\n\n", 1)[-1]) for t in ASM_TASKS}
+    assert len(rules) == 1
+    assert next(iter(rules)).startswith("Rules:\n- Write GNU assembler (gas) source for x86-64 Linux")
+
+
+@pytest.mark.skipif(not ASM_HOST, reason="needs gcc and nm on an x86-64 host")
+@pytest.mark.parametrize("task", ASM_TASKS, ids=[t["name"] for t in ASM_TASKS])
+def test_asm_harness_globals_are_prefixed(tmp_path, task):
+    """The harness's global symbols (C and file-scope assembly) carry the harness_ prefix, apart from main, so the
+    solution's one exported function can't collide with them. Compiles the trusted harness only, never runs it."""
+    (tmp_path / "test.c").write_text(task["test"])
+    llm_bench.subprocess.run(["gcc", "-std=gnu17", "-c", "test.c", "-o", "test.o"], cwd=tmp_path, check=True)
+    nm = llm_bench.subprocess.run(
+        ["nm", "-g", "--defined-only", "--format=just-symbols", "test.o"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    names = set(nm.stdout.split())
+    assert "main" in names
+    assert not {n for n in names - {"main"} if not n.startswith("harness_")}
