@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/python-3.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/github/license/juusolatva/llm-bench)](LICENSE)
 
-A dependency-free benchmark for checking how well LLMs write and fix code. It sends 32 small programming and terminal tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
+A dependency-free benchmark for checking how well LLMs write and fix code. It sends 36 small programming and terminal tasks to every model on one or more OpenAI-compatible servers, extracts the code from each reply, and builds and tests it against a hidden harness inside a sandbox. When a solution fails, the build/test output is sent back so the model can try again.
 
 It works with any server that implements `GET /v1/models` and `POST /v1/chat/completions`, including Ollama, LM Studio, the llama.cpp server, vLLM and hosted OpenAI-compatible APIs.
 
@@ -23,6 +23,7 @@ There are 4 tasks per language: 3 "write this" tasks of increasing difficulty an
 | Rust | `rust_version`, `rust_csv_line`, `rust_fix_inventory`, `rust_topo_order` |
 | Go | `go_word_freq`, `go_kv_http`, `go_fix_count_lengths`, `go_parallel_map` (run with `-race`) |
 | TypeScript | `ts_parse_config`, `ts_map_limit`, `ts_fix_route`, `ts_broadcaster` (checked with `tsc --strict`) |
+| x86-64 assembly | `asm_sum_above`, `asm_parse_u64`, `asm_fix_memmove`, `asm_stable_sort` (GNU as, called from C) |
 | Bash | `bash_top_words`, `bash_rotate_backups`, `bash_fix_rename`, `bash_access_log` |
 | Terminal | `term_find_refs`, `term_set_port`, `term_fix_portable`, `term_compare_dirs` |
 
@@ -35,7 +36,7 @@ Each task is a directory under [`tasks/`](tasks):
 ```
 tasks/<lang>/<task>/
   prompt.md          # sent to the model as is
-  test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go, test.ts or test.sh for other languages)
+  test_solution.py   # hidden test harness (test.c, test.cpp, test.rs, solution_test.go, test.ts or test.sh for other languages; test.c for assembly)
   reference/
     solution.py      # a known-correct solution (not sent to the model), named like the model's solution file
 ```
@@ -60,7 +61,7 @@ Their harnesses must print the final line too (Rust harnesses import the solutio
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`); 0.11 or newer for the Go build cache (see [Go tasks](#go-tasks)).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
-- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5 to 6.x), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks. You only need the toolchains for the tasks you select with `--task`.
+- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5 to 6.x), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks; binutils `nm` (installed with `gcc`) and an x86-64 host for the assembly tasks. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
 
@@ -174,6 +175,12 @@ If the server itself becomes unreachable, the benchmark retries the request afte
 ## TypeScript tasks
 
 The solution and harness are compiled with a fixed `tsconfig.json` (`strict`, target ES2023, the ES2023 and DOM libraries, `"types": []`) and run with `node` as ES modules. There is no `@types/node`, so solutions can use the ECMAScript standard library and the web-standard globals Node also provides (`console`, `URL`, `setTimeout`, ...), but no Node modules or globals such as `process`; the prompts say so. `tsc` prints its errors with the offending source line, and the benchmark removes the color codes from that output before sending it back to the model. At startup the benchmark checks that `tsc` runs inside the sandbox, so a TypeScript install that needs files outside its own package stops the run instead of failing every solution.
+
+## Assembly tasks
+
+The assembly tasks ask for one function in `solution.s`, in GNU assembler syntax (AT&T, or Intel with `.intel_syntax noprefix`), that a C harness calls. They need an x86-64 Linux host: at startup the benchmark checks that `gcc` targets x86-64 and otherwise stops with the `--task` flags that skip them. The solution is assembled for baseline x86-64 (up to SSE2, plus `endbr64`), so newer instructions such as AVX or POPCNT fail the build and results don't depend on the CPU. A build step checks with `nm` that the solution references no outside symbol (no libc calls) and exports exactly one global symbol, the requested function.
+
+The harness calls the function through a wrapper that puts sentinels in the callee-saved registers and junk in the others, and reports any System V ABI violation by name (a callee-saved register not preserved, a changed `%rsp`, the direction flag left set). ASan doesn't check hand-written assembly, so inputs sit next to inaccessible pages to catch reads and writes out of bounds. Each case runs in a child process with a time limit, so a crash or an infinite loop fails that case and the output still names it.
 
 ## Sandbox
 
