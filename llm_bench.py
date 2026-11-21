@@ -133,15 +133,15 @@ TS_CONFIG = """\
   "files": ["solution.ts", "test.ts"]
 }
 """
-# Assembly tasks: solution.s must not switch to another instruction set with .arch (it would override
-# -march=generic64 and make results depend on the CPU), must reference no outside symbol (no libc) and must export
-# exactly one global symbol. The .arch check reads the source the way gas does on x86-64: it skips "#" comments, "/"
-# comments at the start of a statement, /* */ comments (also over several lines), strings and character constants
-# ('c, 'c'), and finds the directive in any case at the start of a statement (after labels or a ";"). It catches
-# ordinary use, not a directive name built by macro expansion (.irp, \()). The harness's reference to the
-# task function pins that symbol's name at link time, so a solution can't replace libc, ASan or harness functions (a
-# global `exit` would make a failing harness exit 0). Runs inside the sandbox with LC_ALL=C, as a separate build step
-# so its message reaches the model as build feedback. Arguments: solution.s solution.o.
+# Assembly tasks: solution.s must not switch to another instruction set with .arch (it would override -march=generic64
+# and make results depend on the CPU), must reference no outside symbol (no libc) and must export exactly one global
+# symbol. The .arch check reads the source the way gas does on x86-64: it skips "#" comments, "/" comments at the
+# start of a statement, /* */ comments (also over several lines), strings and character constants ('c, 'c'), and finds
+# the directive in any case at the start of a statement (after labels, also quoted ones like "x":, or a ";"). It
+# catches ordinary use, not a directive name built by macro expansion (.irp, \()). The harness's reference to the task
+# function pins that symbol's name at link time, so a solution can't replace libc, ASan or harness functions (a global
+# `exit` would make a failing harness exit 0). Runs inside the sandbox with LC_ALL=C, as a separate build step so its
+# message reaches the model as build feedback. Arguments: solution.s solution.o.
 ASM_SOLUTION_CHECK = """\
 set -u
 arch=$(awk '
@@ -173,7 +173,7 @@ BEGIN { quote = sprintf("%c", 39); block = 0 }
     count = split(out, statements, ";")
     for (k = 1; k <= count; k++) {
         s = statements[k]
-        while (match(s, /^[ \\t]*[A-Za-z0-9_.$]+[ \\t]*:/)) s = substr(s, RLENGTH + 1)
+        while (match(s, /^[ \\t]*([A-Za-z0-9_.$]+|"")[ \\t]*:/)) s = substr(s, RLENGTH + 1)
         if (tolower(s) ~ /^[ \\t]*[.]arch([ \\t]|$)/) { print "line " NR ":" $0; break }
     }
 }

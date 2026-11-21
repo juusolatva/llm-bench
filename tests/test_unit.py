@@ -1437,6 +1437,8 @@ ASM_HOST = llm_bench.shutil.which("gcc") and llm_bench.shutil.which("nm") and os
         ("/*\n.arch is not used\n*/\n.text\n.globl f\nf:\n  ret\n", True, ""),
         ("/ .arch .popcnt\n.text\n.globl f\nf:\n  ret ; / .arch .popcnt\n", True, ""),
         ('.data\n.ascii ".arch x"\n.text\n.globl f\nf:\n  ret\n', True, ""),
+        ('"local": .arch .popcnt\n.text\n.globl f\nf:\n  ret\n', False, r'line 1:"local": \.arch'),
+        ('"a b": "c": .arch .popcnt\n.text\n.globl f\nf:\n  ret\n', False, r'line 1:"a b": "c": \.arch'),
     ],
 )
 def test_asm_symbol_check(tmp_path, source, ok, message):
