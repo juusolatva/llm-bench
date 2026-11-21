@@ -376,6 +376,13 @@ def test_sandbox_path_dirs_keeps_only_entries_under_usr(monkeypatch):
     assert llm_bench.sandbox_path_dirs() == ["/usr/llm-bench-test/bin", "/usr/bin", "/bin"]
 
 
+def test_sandbox_path_dirs_skips_links_into_usr_and_duplicates(monkeypatch, tmp_path):
+    # A home-directory link to /usr/bin would put a host path the sandbox doesn't mount on its PATH.
+    (tmp_path / "bin-link").symlink_to("/usr/bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(tmp_path / "bin-link"), "/usr/bin", "/usr/local/bin", "/usr/bin"]))
+    assert llm_bench.sandbox_path_dirs() == ["/usr/bin", "/usr/local/bin", "/bin"]
+
+
 BUILTIN_TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
 
 
@@ -999,6 +1006,7 @@ def test_run_cmd_keeps_the_timeout_when_the_killed_process_hangs(monkeypatch, tm
     class Process:
         def __init__(self, *args, **kwargs):
             self.killed = False
+            self.stdout = open(os.devnull, "rb")  # noqa: SIM115 -- run_unit's reader closes it
 
         def wait(self, timeout=None):
             raise subprocess.TimeoutExpired("systemd-run", timeout)
@@ -1022,17 +1030,88 @@ def test_run_cmd_keeps_the_timeout_when_the_killed_process_hangs(monkeypatch, tm
 def test_stop_active_units_stops_every_unit_despite_failures(monkeypatch, capsys):
     stopped = []
 
-    def run(cmd, **kwargs):
+    def run(cmd, **kwargs):  # a stopped unit ends, and its run_cmd removes it from ACTIVE_UNITS
         stopped.append(cmd[-1])
         if len(stopped) == 1:
             raise OSError("systemctl gone")
+        llm_bench.ACTIVE_UNITS.discard(cmd[-1])
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
     monkeypatch.setattr(llm_bench.subprocess, "run", run)
     monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u1.service", "u2.service"})
     llm_bench.stop_active_units()
-    assert sorted(stopped) == ["u1.service", "u2.service"]
+    assert sorted(stopped[:2]) == ["u1.service", "u2.service"]  # the failed one is stopped again in the next round
+    assert not llm_bench.ACTIVE_UNITS
     assert "could not stop sandbox unit" in capsys.readouterr().err
+
+
+def test_stop_active_units_repeats_for_a_unit_that_is_still_starting(monkeypatch):
+    # The first stop reaches a unit before systemd-run created it ("not loaded"); a later one stops it.
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd[-1])
+        if len(calls) >= 3:
+            llm_bench.ACTIVE_UNITS.discard(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0 if len(calls) >= 3 else 5, b"", b"")
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", run)
+    monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u.service"})
+    llm_bench.stop_active_units()
+    assert calls == ["u.service"] * 3
+    assert llm_bench.SANDBOXES_STOPPED.is_set()
+
+
+def test_stop_active_units_gives_up_after_its_timeout(monkeypatch, capsys):
+    monkeypatch.setattr(llm_bench.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 5))
+    monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u.service"})
+    monkeypatch.setattr(llm_bench, "STOP_UNITS_TIMEOUT_S", 0.3)
+    llm_bench.stop_active_units()
+    assert "1 sandbox unit(s) still running; their time limit will end them" in capsys.readouterr().err
+
+
+def test_run_cmd_starts_no_sandbox_after_an_interrupt(monkeypatch, fake_sandbox, tmp_path):
+    llm_bench.SANDBOXES_STOPPED.set()
+    monkeypatch.setattr(llm_bench.subprocess, "Popen", lambda *a, **k: pytest.fail("must not start a sandbox"))
+    assert llm_bench.run_cmd(["x"], tmp_path) == (-1, "interrupted: no new sandbox starts", False)
+    assert not llm_bench.ACTIVE_UNITS
+
+
+def test_run_cmd_output_is_unaffected_by_the_sandbox_changing_its_stdout_flags(fake_sandbox, tmp_path):
+    # The sandbox shares only the pipe's write end: O_NONBLOCK or O_DIRECT on it don't reach the parent's reads.
+    fake_sandbox(
+        "import fcntl, os, sys\n"
+        "flags = fcntl.fcntl(1, fcntl.F_GETFL)\n"
+        "fcntl.fcntl(1, fcntl.F_SETFL, flags | os.O_DIRECT)\n"
+        "os.write(1, b'x' * 3000)\n"
+        "fcntl.fcntl(1, fcntl.F_SETFL, flags | os.O_NONBLOCK)\n"
+        "os.write(1, b'y' * 3000)\n"
+    )
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (0, False)
+    assert out == "x" * 3000 + "y" * 3000
+
+
+def test_run_cmd_drains_output_beyond_the_cap(fake_sandbox, tmp_path, monkeypatch):
+    # Far more output than a pipe holds: it's read and dropped, so the command finishes instead of blocking.
+    monkeypatch.setattr(llm_bench, "MAX_OUTPUT_BYTES", 100)
+    fake_sandbox("import sys; sys.stdout.write('z' * 5_000_000)")
+    start = time.monotonic()
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=20)
+    assert time.monotonic() - start < 10
+    assert (rc, timed_out) == (-1, False)
+    assert out == "z" * 100 + "\n[output limit exceeded]"
+
+
+def test_run_cmd_reports_an_output_read_failure(monkeypatch, fake_sandbox, tmp_path):
+    def failing_read(fd, n):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(llm_bench.os, "read", failing_read)
+    fake_sandbox("print('x')")
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (-1, False)
+    assert out == "sandbox failed: reading the sandbox's output failed: [Errno 5] Input/output error"
 
 
 def test_run_cmd_reports_a_failed_start(monkeypatch, fake_sandbox, tmp_path):

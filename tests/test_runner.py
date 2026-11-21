@@ -540,6 +540,58 @@ def test_stop_active_hooks_kills_a_running_command():
     assert not llm_bench.ACTIVE_HOOKS
 
 
+def test_interrupted_attempt_is_not_recorded(mock_server, tmp_path, monkeypatch):
+    # Ctrl-C stops the sandbox mid-test: that failure says nothing about the solution, so the trial gets no row
+    # (--resume runs it later) instead of a failed one.
+    s, stop = mock_server(replies=["```python\nx = 1\n```"]), threading.Event()
+
+    def check_reply(task, text, adir):
+        stop.set()  # as if Ctrl-C arrived while the attempt was being built and tested
+        return False, "test", "python3 test_solution.py", "Terminated"
+
+    monkeypatch.setattr(llm_bench, "check_reply", check_reply)
+    rows = []
+    llm_bench.run_endpoint(
+        "m", s.url, ["test/model"], TASKS[:1], opts(), tmp_path / "results.csv", tmp_path / "runs", rows, stop
+    )
+    assert rows == []
+    assert llm_bench.read_results(tmp_path / "results.csv") == []
+
+
+@pytest.mark.parametrize(
+    ("resume", "rows", "want"),
+    [
+        (False, [("go_t", "stop")], True),  # without --resume every trial runs
+        (True, [], True),
+        (True, [("go_t", "stop")], False),  # finished
+        (True, [("go_t", "http_500")], True),  # run again
+        (True, [("py_t", "stop")], True),
+    ],
+)
+def test_go_trials_left(tmp_path, resume, rows, want):
+    csv_path = tmp_path / "results_e.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=llm_bench.FIELDS, restval="")
+        w.writeheader()
+        for task, finish in rows:
+            w.writerow(
+                {
+                    "endpoint": "e",
+                    "model": "m",
+                    "task": task,
+                    "lang": "go",
+                    "passed": 1,
+                    "passed_on": 1,
+                    "finish_reason": finish,
+                    "config": "cfg",
+                }
+            )
+    tasks = [{"name": "go_t", "lang": "go", "config": "cfg"}, {"name": "py_t", "lang": "python", "config": "cfg"}]
+    args = SimpleNamespace(resume=resume, repeat=1)
+    assert llm_bench.go_trials_left(args, {"e": ["m"]}, tasks, {"e": (csv_path, tmp_path / "runs")}) is want
+    assert llm_bench.go_trials_left(args, {"e": ["m"]}, tasks[1:], {"e": (csv_path, tmp_path / "runs")}) is False
+
+
 def test_before_model_cleans_up_after_an_unexpected_error(monkeypatch):
     # An error while waiting (e.g. from poll) must still kill the command's process group, reap it and close its output.
     procs = []

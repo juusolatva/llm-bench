@@ -721,6 +721,8 @@ class CmdResult(NamedTuple):
 TIME_LIMIT_MARKER = "[killed: exceeded the {limit} s time limit for building and testing]"
 ACTIVE_UNITS = set()  # systemd units of running sandboxes, stopped on interrupt
 ACTIVE_UNITS_LOCK = threading.Lock()
+SANDBOXES_STOPPED = threading.Event()  # set on Ctrl-C: run_cmd starts no new sandbox
+STOP_UNITS_TIMEOUT_S = 10  # how long stop_active_units keeps stopping units that are still starting
 
 
 SYSTEMCTL_NOT_LOADED = 5  # systemctl's exit status for a unit that is already gone (--collect removes it on exit)
@@ -747,11 +749,23 @@ def stop_unit(unit, systemctl="systemctl"):
 
 
 def stop_active_units():
-    """Stop the transient systemd units of sandboxes that are still running (on Ctrl-C)."""
+    """On Ctrl-C: let no new sandbox start, then stop the transient systemd units of the running ones until each
+    run_cmd has seen its unit end. A unit whose systemd-run was just starting may not exist yet when the first stop
+    reaches it ("not loaded"), so the stop repeats until the unit is gone or STOP_UNITS_TIMEOUT_S passes."""
     with ACTIVE_UNITS_LOCK:
-        units = list(ACTIVE_UNITS)
-    for unit in units:
-        stop_unit(unit)
+        SANDBOXES_STOPPED.set()
+    deadline = time.monotonic() + STOP_UNITS_TIMEOUT_S
+    while True:
+        with ACTIVE_UNITS_LOCK:
+            units = list(ACTIVE_UNITS)
+        if not units:
+            return
+        if time.monotonic() > deadline:
+            log(f"warning: {len(units)} sandbox unit(s) still running; their time limit will end them", err=True)
+            return
+        for unit in units:
+            stop_unit(unit)
+        time.sleep(0.2)
 
 
 # Host directories every sandbox sees read-only (sandbox_command), so the only places a system tool may live.
@@ -762,11 +776,16 @@ def sandbox_path_dirs():
     """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT) and Node with
     tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
     then /usr/bin and /bin. Home, project and relative entries are left out because the sandbox doesn't expose
-    them."""
+    them, and so are entries that only reach /usr through a symlink (the sandbox would see the link's own path, which
+    it doesn't mount) and entries under /usr that resolve to a directory the sandbox doesn't mount. No duplicates."""
     system_path = [
-        path for path in os.get_exec_path() if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")
+        path
+        for path in os.get_exec_path()
+        if Path(path).is_absolute()
+        and Path(path).is_relative_to("/usr")
+        and any(Path(path).resolve().is_relative_to(d) for d in SANDBOX_SYSTEM_DIRS)
     ]
-    return [*system_path, "/usr/bin", "/bin"]
+    return list(dict.fromkeys([*system_path, "/usr/bin", "/bin"]))
 
 
 def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
@@ -872,16 +891,48 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
     return command
 
 
-def run_unit(command, output, timeout, systemctl, unit):
-    """Start the sandbox command with its output going to the file output, wait for it and stop its unit.
-    Returns (exit status, seconds until it exited), the time taken before the unit is stopped, so a slow stop
-    can't turn a normal exit into a time-limit kill. Raises OSError if it can't start and
-    subprocess.TimeoutExpired if it doesn't exit within timeout + 10 s (systemd should end it at timeout)."""
+class OutputReader:
+    """Reads a pipe to its end in a thread, keeping its first `keep` bytes and dropping the rest, so the writer never
+    blocks on a full pipe and the parent never holds more than `keep` bytes."""
+
+    def __init__(self, pipe, keep):
+        self.pipe, self.keep, self.data, self.error = pipe, keep, bytearray(), None
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while chunk := os.read(self.pipe.fileno(), 65536):
+                if len(self.data) < self.keep:
+                    self.data += chunk[: self.keep - len(self.data)]
+        except OSError as e:
+            self.error = e
+
+    def result(self, timeout):
+        """The kept bytes once the pipe has ended (or after timeout s: what was read by then). Raises OSError if
+        reading failed."""
+        self.thread.join(timeout)
+        if self.error:
+            raise OSError(f"reading the sandbox's output failed: {self.error}")
+        if not self.thread.is_alive():
+            self.pipe.close()
+        return bytes(self.data)
+
+
+def run_unit(command, timeout, systemctl, unit):
+    """Start the sandbox command, wait for it, stop its unit and collect its output (stdout and stderr). Returns
+    (exit status, seconds until it exited, the first MAX_OUTPUT_BYTES + 1 bytes of output); the time is taken
+    before the unit is stopped, so a slow stop can't turn a normal exit into a time-limit kill. The output comes
+    through a pipe the parent alone reads: the sandbox holds only its write end, so nothing it does to its stdout
+    (file status flags such as O_DIRECT or O_NONBLOCK) affects the parent's reads. Raises OSError if it can't start
+    or its output can't be read, and subprocess.TimeoutExpired if it doesn't exit within timeout + 10 s (systemd
+    should end it at timeout)."""
     t0 = time.monotonic()
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    reader = OutputReader(process.stdout, MAX_OUTPUT_BYTES + 1)
     try:
         rc = process.wait(timeout=timeout + 10)
-        return rc, time.monotonic() - t0
+        elapsed = time.monotonic() - t0
     finally:
         stop_unit(unit, systemctl)  # also kills detached descendants after a normal exit or an interruption
         if process.poll() is None:
@@ -889,6 +940,7 @@ def run_unit(command, output, timeout, systemctl, unit):
             # A process that doesn't die (uninterruptible sleep) must not replace the exception being raised.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=5)
+    return rc, elapsed, reader.result(timeout=5)  # stopping the unit ended every writer of the pipe
 
 
 def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
@@ -902,22 +954,19 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
         return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
     unit = f"llm-bench-{uuid.uuid4().hex}.service"
     command = sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw)
-    # A regular file plus hard LimitFSIZE bounds output without an unbounded
-    # communicate() buffer. Read only a bounded prefix back into the parent.
-    with tempfile.TemporaryFile() as output:
-        with ACTIVE_UNITS_LOCK:
-            ACTIVE_UNITS.add(unit)
-        try:
-            rc, elapsed = run_unit(command, output, timeout, tools["systemctl"], unit)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
-        finally:
-            with ACTIVE_UNITS_LOCK:  # also when the unit never started (Popen failed)
-                ACTIVE_UNITS.discard(unit)
-        # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
-        timed_out = rc != 0 and elapsed >= timeout
-        output.seek(0)
-        data = output.read(MAX_OUTPUT_BYTES + 1)
+    with ACTIVE_UNITS_LOCK:  # the same lock as stop_active_units: no sandbox starts after it began
+        if SANDBOXES_STOPPED.is_set():
+            return CmdResult(-1, "interrupted: no new sandbox starts", False)
+        ACTIVE_UNITS.add(unit)
+    try:
+        rc, elapsed, data = run_unit(command, timeout, tools["systemctl"], unit)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
+    finally:
+        with ACTIVE_UNITS_LOCK:  # also when the unit never started (Popen failed)
+            ACTIVE_UNITS.discard(unit)
+    # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
+    timed_out = rc != 0 and elapsed >= timeout
     text = data[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     if len(data) > MAX_OUTPUT_BYTES:
         return CmdResult(-1, text + "\n[output limit exceeded]", False)
@@ -1417,6 +1466,8 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
             break
         passed, stage, fail_cmd, fail_out = check_reply(task, text, taskdir / f"attempt_{attempt}")
+        if stop.is_set():  # Ctrl-C may have stopped its sandbox: the result says nothing about the solution
+            raise Interrupted
         result["fail_stage"] = stage
         if passed:
             result["passed"], result["passed_on"] = 1, attempt
@@ -2660,6 +2711,7 @@ def output_paths(args, plan):
 
 def main():
     """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
+    global GO_CACHE
     args = parse_args()
     if args.summary:
         show_summary(args.summary, args.format, args.per_task)
@@ -2693,14 +2745,36 @@ def main():
         )
     outputs = output_paths(args, plan)
     go_tmp = None
-    if any(t["lang"] == "go" for t in tasks):
-        go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
-        prepare_go_cache(go_tmp.name)
     try:
+        if go_trials_left(args, plan, tasks, outputs):
+            go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
+            prepare_go_cache(go_tmp.name)
         run_all(args, plan, endpoints, tasks, outputs)
     finally:
+        GO_CACHE = None  # it pointed into go_tmp
         if go_tmp is not None:
             go_tmp.cleanup()
+
+
+def finished_trials(csv_path, endpoint):
+    """Counter of the endpoint's finished trials in a results file per (model, task, config); empty without one."""
+    if not csv_path.exists() or not csv_path.stat().st_size:
+        return Counter()
+    rows = read_results(csv_path)
+    return Counter((r["model"], r["task"], r["config"]) for r in rows if r["endpoint"] == endpoint and is_finished(r))
+
+
+def go_trials_left(args, plan, tasks, outputs):
+    """Whether any Go trial will run: with --resume, one not yet finished in the results file (so a run with nothing
+    left doesn't spend a minute warming the Go build cache)."""
+    go_tasks = [t for t in tasks if t["lang"] == "go"]
+    if not go_tasks or not args.resume:
+        return bool(go_tasks)
+    for name, models in plan.items():
+        finished = finished_trials(outputs[name][0], name)
+        if any(finished[(m, t["name"], t["config"])] < args.repeat for m in models for t in go_tasks):
+            return True
+    return False
 
 
 def run_all(args, plan, endpoints, tasks, outputs):
