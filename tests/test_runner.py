@@ -131,9 +131,20 @@ def test_chat_replaces_lone_surrogates(mock_server):
     text.encode()
 
 
-def test_chat_deeply_nested_reply_is_a_bad_response(mock_server):
-    s = mock_server(replies=[Reply(body=b"[" * 100000)])
+def test_chat_deeply_nested_reply_is_a_bad_response(mock_server, monkeypatch, capsys):
+    # Whether json.loads runs out of stack depends on the machine, so the parse failure is simulated.
+    real = llm_bench.json.loads
+    nested = b"[" * 100000
+
+    def loads(data, *args, **kwargs):
+        if data == nested:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(data, *args, **kwargs)
+
+    monkeypatch.setattr(llm_bench.json, "loads", loads)
+    s = mock_server(replies=[Reply(body=nested)])
     assert chat(s)[3] == "bad_response"
+    assert "nested too deeply" in capsys.readouterr().err
 
 
 def test_chat_timeout(mock_server):
@@ -611,6 +622,8 @@ def test_length_budget_skips_rest_of_model(mock_server, tmp_path):
         ("b", "length", "no_code"),
         ("b", "skipped", "budget"),
     ]
+    # Trials skipped by the budget are final: --resume doesn't give the model a new budget for them.
+    assert run_endpoint(s, tmp_path, models=["a", "b"], tasks=TASKS[:3], max_length_finishes=2, resume=True) == []
 
 
 def row(task, passed_on, **extra):
@@ -640,13 +653,16 @@ def test_summarize_repeats():
     assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)  # means per round, summed over tasks
 
 
+RUN1, RUN2, RUN3 = "20261101T100000.000Z", "20261101T120000Z", "20261102T090000.000Z"  # RUN2: whole seconds
+
+
 def test_summarize_leaves_out_request_errors_that_were_run_again():
     # A trial that hit http_500, then passed on --resume: one round, not a failed and a passed one.
     rows = [
-        row("py_a", 0, finish_reason="http_500", prompt_tokens=0, completion_tokens=0, seconds=0.0),
-        row("py_b", 1),
-        row("py_a", 1),
-        row("py_c", 0, finish_reason="skipped", fail_stage="request"),  # no finished trial: counts, as failed
+        row("py_a", 0, run_id=RUN1, finish_reason="http_500", prompt_tokens=0, completion_tokens=0, seconds=0.0),
+        row("py_b", 1, run_id=RUN1),
+        row("py_c", 0, run_id=RUN1, finish_reason="skipped", fail_stage="request"),  # nothing replaced it
+        row("py_a", 1, run_id=RUN2),
     ]
     (g,) = llm_bench.summarize(rows)[0]
     assert (g["n"], g["pass"], g["trials"], g["retried"]) == (3, 2.0, [1, 1, 1], 1)
@@ -654,8 +670,25 @@ def test_summarize_leaves_out_request_errors_that_were_run_again():
     assert g["per_task"]["py_a"] == {"lang": "python", "trials": 1, "passed": 1, "passed_on_first": 1}
 
 
+def test_summarize_counts_request_errors_that_nothing_replaced():
+    # Within one run a request error is a failed round; a later run replaces only as many as it has trials,
+    # oldest first, and a retry that failed again can be replaced by a still later one.
+    rows = [row("py_a", 1, run_id=RUN1), row("py_a", 0, run_id=RUN1, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (0.5, [2], 0)
+    errors = [row("py_a", 0, run_id=RUN1, finish_reason="disconnected", seconds=float(i)) for i in range(3)]
+    (g,) = llm_bench.summarize([*errors, row("py_a", 1, run_id=RUN2)])[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (pytest.approx(1 / 3), [3], 1)
+    assert g["s"] == pytest.approx((1 + 2 + 1) / 3)  # the oldest error (0 s) was replaced
+    retry_failed = [row("py_a", 0, run_id=r, finish_reason="http_500") for r in (RUN1, RUN2)]
+    (g,) = llm_bench.summarize(retry_failed)[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (0.0, [1], 1)  # one round that failed, not two
+    (g,) = llm_bench.summarize([*retry_failed, row("py_a", 1, run_id=RUN3)])[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (1.0, [1], 2)
+
+
 def test_print_summary_notes_left_out_request_errors(capsys):
-    llm_bench.print_summary([row("py_a", 0, finish_reason="disconnected"), row("py_a", 1)])
+    llm_bench.print_summary([row("py_a", 0, run_id=RUN1, finish_reason="disconnected"), row("py_a", 1, run_id=RUN2)])
     out = capsys.readouterr().out
     assert "1 row(s) of trials that ended in a request error or were skipped were left out" in out
     assert "rounds" not in out

@@ -389,6 +389,7 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n")
 # A closing fence: a run of 3+ backticks followed only by whitespace up to the end of the line.
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
+FENCE_RUN_RE = re.compile(r"[ \t]*+(`++)")  # the backticks of an opening fence, from where FENCE_OPEN_RE matched
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")  # terminal color/style sequences (CSI)
@@ -585,12 +586,17 @@ def _outside_code(blocks, positions):
 def _closes_open_fence(text, blocks, pos):
     """Whether the </think> at pos is inside a block (from _code_blocks) only because the reasoning before it left
     a fence open: the fence that closes that block, read without the text up to pos, closes a block that opens
-    after pos. A </think> in real code fails this, since the fence closing its block then opens one instead."""
+    after pos with a fence at least as long as the block's own. A </think> in real code fails this: the fence
+    closing its block then opens one instead, and a shorter fence inside the block is part of the code."""
     i = bisect.bisect_right([b[0] for b in blocks], pos) - 1
     if i < 0 or pos >= blocks[i][1]:
         return False
     after = pos + len(THINK_CLOSE)
-    return any(after + b[1] == blocks[i][1] for b in _code_blocks(text[after:]))
+    fence = len(FENCE_RUN_RE.match(text, blocks[i][0]).group(1))
+    return any(
+        after + b[1] == blocks[i][1] and len(FENCE_RUN_RE.match(text, after + b[0]).group(1)) >= fence
+        for b in _code_blocks(text[after:])
+    )
 
 
 def strip_think(text):
@@ -676,19 +682,27 @@ ACTIVE_UNITS = set()  # systemd units of running sandboxes, stopped on interrupt
 ACTIVE_UNITS_LOCK = threading.Lock()
 
 
+SYSTEMCTL_NOT_LOADED = 5  # systemctl's exit status for a unit that is already gone (--collect removes it on exit)
+
+
 def stop_unit(unit, systemctl="systemctl"):
-    """Stop a sandbox's transient systemd unit, which kills everything left in it. A stop that fails or takes over
-    5 s is logged, not raised: the unit's RuntimeMaxSec still ends it."""
+    """Stop a sandbox's transient systemd unit, which kills everything left in it. A stop that fails (other than
+    for a unit that is already gone) or takes over 5 s is logged, not raised: the unit's RuntimeMaxSec still ends
+    it."""
     try:
-        subprocess.run(
+        done = subprocess.run(
             [systemctl, "--user", "stop", unit],
             check=False,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as e:
         log(f"warning: could not stop sandbox unit {unit}: {e}", err=True)
+        return
+    if done.returncode not in (0, SYSTEMCTL_NOT_LOADED):
+        detail = done.stderr.decode(errors="replace").strip()[:500]
+        log(f"warning: could not stop sandbox unit {unit}: exit status {done.returncode}: {detail}", err=True)
 
 
 def stop_active_units():
@@ -831,7 +845,9 @@ def run_unit(command, output, timeout, systemctl, unit):
         stop_unit(unit, systemctl)  # also kills detached descendants after a normal exit or an interruption
         if process.poll() is None:
             process.kill()
-            process.wait(timeout=5)
+            # A process that doesn't die (uninterruptible sleep) must not replace the exception being raised.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
 
 
 def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
@@ -1645,7 +1661,8 @@ INT_FIELDS = ("repeat", "passed", "passed_on", "attempts")
 # Token count columns and their value when empty: a missing reasoning count is unknown (None), not zero.
 TOKEN_FIELDS = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": None}
 FLOAT_FIELDS = ("seconds", "load_seconds")
-# Trials with these finish reasons failed for reasons outside the model's reply; --resume runs them again.
+# Trials with these finish reasons failed for reasons outside the model's reply; --resume runs them again (apart from
+# trials skipped by --max-length-finishes, see is_finished).
 RETRY_FINISHES = ("bad_response", "disconnected", "skipped")
 
 
@@ -1688,8 +1705,12 @@ def read_results(path):
 
 
 def is_finished(row):
-    """Whether a results row is final; --resume runs trials that failed for reasons outside the model again."""
+    """Whether a results row is final; --resume runs trials that failed for reasons outside the model again. A
+    trial skipped by --max-length-finishes is final: the model used up its budget, and another run would only
+    give it a new one."""
     finish = row.get("finish_reason") or ""
+    if finish == "skipped" and row.get("fail_stage") == "budget":
+        return True
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
 
@@ -1827,16 +1848,21 @@ def new_run_id(now=None):
     return f"{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}Z"
 
 
+def run_order(row):
+    """A row's run_id in a form that sorts by time ("" without one): older versions wrote whole seconds."""
+    run_id = row.get("run_id") or ""
+    if run_id.endswith("Z") and "." not in run_id:
+        run_id = run_id[:-1] + ".000Z"
+    return run_id
+
+
 def newest_configs(rows):
     """{(settings, task): config of the task's newest version}: the config of its rows from the latest run_id
     (row order breaks ties, e.g. for old files without run_id)."""
     newest = {}
     for i, r in enumerate(rows):
         key = (r.get("settings") or "", r["task"])
-        run_id = r.get("run_id") or ""
-        if run_id.endswith("Z") and "." not in run_id:  # older versions wrote whole seconds
-            run_id = run_id[:-1] + ".000Z"
-        rank = (run_id, i)
+        rank = (run_order(r), i)
         if key not in newest or rank > newest[key][0]:
             newest[key] = (rank, r.get("config"))
     return {key: config for key, (_, config) in newest.items()}
@@ -1919,11 +1945,19 @@ def add_task_scores(g, task, task_rows):
 
 
 def scored_trials(task_rows):
-    """The trials a task is scored on: the finished ones. Rows of trials that failed for reasons outside the model's
-    reply (request errors, skipped trials) are placeholders that --resume runs again, so they count only while a
-    task has no finished trial: then the task still counts, as failed, instead of dropping out of the score."""
-    finished = [r for r in task_rows if is_finished(r)]
-    return finished or task_rows
+    """The trials a task is scored on. A row of a trial that failed for reasons outside the model's reply (a request
+    error, a skipped trial: the ones --resume runs again) is left out when a later run has a trial of the task to
+    take its place, as --resume's retry does; each later trial replaces one such row, the oldest first. Otherwise
+    it counts, as failed: within one run, or with nothing to replace it, it's a round the model didn't pass."""
+    by_run = defaultdict(list)
+    for r in task_rows:
+        by_run[run_order(r)].append(r)
+    unfinished, replaced = [], set()
+    for run in sorted(by_run):
+        run_rows = by_run[run]
+        replaced.update(id(r) for r, _ in zip(unfinished, run_rows, strict=False))
+        unfinished = unfinished[len(run_rows) :] + [r for r in run_rows if not is_finished(r)]
+    return [r for r in task_rows if id(r) not in replaced]
 
 
 def context_status(trials):
@@ -1945,7 +1979,7 @@ def summarize(rows):
     (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
     Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
     reported them (otherwise None: a partial count would be on another scale than completion tokens).
-    Each task is scored on its finished trials (scored_trials); "retried" counts the unfinished rows left out.
+    Rows of failed requests that a later run replaced are left out (scored_trials); "retried" counts them.
     Returns (groups, dropped row count)."""
     tasks_by_group, dropped = newest_rows(rows)
     groups = []
@@ -2134,8 +2168,8 @@ def summary_notes(groups, dropped, layout):
     retried = sum(g["retried"] for g in groups)
     if retried:
         notes.append(
-            f"{retried} row(s) of trials that ended in a request error or were skipped were left out: their tasks "
-            "have finished trials (e.g. from --resume)"
+            f"{retried} row(s) of trials that ended in a request error or were skipped were left out: a later run "
+            "(e.g. --resume) ran those trials again"
         )
     missing = [f"{group_label(g, layout)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:

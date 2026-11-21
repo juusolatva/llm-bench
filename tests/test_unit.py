@@ -272,6 +272,9 @@ def test_extract_code_keeps_think_tags_inside_code():
     # Without the opening tag, and with another block after the one holding the tag: the tag is still code.
     text = "```python\ns = '</think>'\nt = 1\n```\nUsage:\n```python\nprint(s)\n```"
     assert llm_bench.strip_think(text) == text
+    # Nor does a shorter fence after the tag, inside a block with a longer fence, make it reasoning.
+    text = '````python\ndef render():\n    return """</think>\n```text\nhello\n"""\n````'
+    assert llm_bench.strip_think(text) == text
 
 
 def test_strip_think_is_linear(monkeypatch):
@@ -550,8 +553,17 @@ def test_list_models_drops_duplicates_and_invalid_ids(mock_server, capsys):
     )
 
 
-def test_list_models_skips_a_deeply_nested_reply(mock_server, capsys):
-    # json.loads raises RecursionError, which isn't a ValueError: it must not escape and end the whole run.
+def test_list_models_skips_a_deeply_nested_reply(mock_server, monkeypatch, capsys):
+    # json.loads raises RecursionError, which isn't a ValueError: it must not escape and end the whole run. Whether
+    # it runs out of stack depends on the machine, so the parse failure is simulated.
+    real = llm_bench.json.loads
+
+    def loads(data, *args, **kwargs):
+        if data[:3] == b"[[[":
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(data, *args, **kwargs)
+
+    monkeypatch.setattr(llm_bench.json, "loads", loads)
     s = mock_server(models_reply=Reply(body=b"[" * 100000))
     assert llm_bench.list_models("m", s.url, None) == []
     assert "nested too deeply" in capsys.readouterr().err
@@ -948,6 +960,43 @@ def test_run_cmd_survives_a_failed_unit_stop(monkeypatch, fake_sandbox, tmp_path
     assert not llm_bench.ACTIVE_UNITS
 
 
+@pytest.mark.parametrize(("status", "warned"), [(0, False), (5, False), (1, True)])
+def test_stop_unit_reports_a_failed_stop(monkeypatch, capsys, status, warned):
+    # 5: the unit is already gone (normal: --collect removes it once its command exits).
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, status, b"", b"Failed to connect to bus")
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", run)
+    llm_bench.stop_unit("u.service")
+    err = capsys.readouterr().err
+    assert ("could not stop sandbox unit u.service: exit status 1: Failed to connect to bus" in err) == warned
+
+
+def test_run_cmd_keeps_the_timeout_when_the_killed_process_hangs(monkeypatch, tmp_path):
+    # A sandbox launcher that outlives its limit and then doesn't die after kill() is still reported as a timeout.
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.killed = False
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("systemd-run", timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench, "sandbox_command", lambda *args: ["x"])
+    monkeypatch.setattr(llm_bench, "stop_unit", lambda unit, systemctl="systemctl": None)
+    monkeypatch.setattr(llm_bench.subprocess, "Popen", Process)
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=1)
+    assert (rc, timed_out) == (-1, True)
+    assert out == "sandbox failed: Command 'systemd-run' timed out after 11 seconds"
+    assert not llm_bench.ACTIVE_UNITS
+
+
 def test_stop_active_units_stops_every_unit_despite_failures(monkeypatch, capsys):
     stopped = []
 
@@ -955,6 +1004,7 @@ def test_stop_active_units_stops_every_unit_despite_failures(monkeypatch, capsys
         stopped.append(cmd[-1])
         if len(stopped) == 1:
             raise OSError("systemctl gone")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
     monkeypatch.setattr(llm_bench.subprocess, "run", run)
     monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u1.service", "u2.service"})
