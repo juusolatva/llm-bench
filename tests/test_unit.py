@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.request
 from collections import Counter
 from types import SimpleNamespace
 
@@ -539,6 +541,87 @@ def test_http_json_refuses_redirects(mock_server, status, location, target):
     assert f"; {target.format(base=s.url.removesuffix('/v1'))} not followed (use the final URL" in e.value.reason
     assert e.value.read() == b""
     assert s.gets == ["/v1/models"]
+
+
+def harness_drip_server(head, body_bytes, delay):
+    """A one-request HTTP server that sends head at once, then body_bytes bytes of "x" one every delay seconds."""
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn, contextlib.suppress(OSError):
+            conn.recv(65536)
+            conn.sendall(head)
+            for _ in range(body_bytes):
+                time.sleep(delay)
+                conn.sendall(b"x")
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.getsockname()[1]}/v1/models"
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",  # the body trickles in
+        b"HTTP/1.1 200 OK\r\nX-Slow: ",  # a header trickles in
+    ],
+)
+def test_http_json_stops_a_trickling_reply_at_its_timeout(head):
+    # Each byte comes well within the socket timeout, so only the overall deadline ends the request.
+    srv, url = harness_drip_server(head, 100, 0.1)
+    with srv:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            llm_bench.http_json(url, timeout=1)
+        assert time.monotonic() - start < 3
+
+
+@pytest.mark.parametrize(
+    ("host", "local"),
+    [
+        ("localhost", True),
+        ("127.0.0.1", True),
+        ("::1", True),
+        ("192.168.1.20", True),
+        ("10.0.0.5", True),
+        ("fe80::1", True),
+        ("gpu-box", True),
+        ("gpu-box.lan", True),
+        ("gpu-box.local.", True),
+        ("api.example.com", False),
+        ("8.8.8.8", False),
+        ("2001:4860::8888", False),
+    ],
+)
+def test_is_local_host(host, local):
+    assert llm_bench.is_local_host(host) is local
+
+
+def test_http_json_skips_proxies_only_for_local_hosts(mock_server, monkeypatch):
+    # A proxy from the environment (here a dead one) mustn't break requests to this machine or the LAN.
+    dead_proxy = urllib.request.ProxyHandler({"http": "http://127.0.0.1:9"})
+    monkeypatch.setattr(llm_bench, "HTTP_OPENER", urllib.request.build_opener(dead_proxy, *llm_bench.HTTP_HANDLERS))
+    s = mock_server()
+    assert llm_bench.list_models("m", s.url, None) == ["test/model"]
+    with pytest.raises(urllib.error.URLError, match="Connection refused"):  # went to the proxy, not to DNS
+        llm_bench.http_json("http://api.example.invalid/v1/models", timeout=5)
+
+
+def test_warn_plaintext_api_key(capsys):
+    endpoints = {
+        "lan": "http://192.168.1.20:1234/v1",
+        "remote": "http://api.example.com/v1",
+        "tls": "https://api.example.com/v1",
+    }
+    llm_bench.warn_plaintext_api_key(endpoints, None)
+    assert capsys.readouterr().err == ""
+    llm_bench.warn_plaintext_api_key(endpoints, "sekrit")
+    err = capsys.readouterr().err
+    assert err == (
+        "warning: remote: the API key is sent to api.example.com over plain HTTP, readable on the network path; "
+        "use https:// or a tunnel\n"
+    )
 
 
 def test_list_models_reports_redirect(mock_server, capsys):

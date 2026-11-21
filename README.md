@@ -89,7 +89,7 @@ Node and TypeScript can come from a version manager such as fnm or nvm, or from 
 ./llm_bench.py --summary results_*.csv --format markdown --per-task   # for a README or an issue
 ```
 
-Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files (default: `HOST_PORT`). If no endpoint is given on the command line, they are read from the space-separated `LLM_BENCH_ENDPOINTS` environment variable. HTTP redirects are never followed (a redirect would send the API key to another location), so give the final URL.
+Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files (default: `HOST_PORT`). If no endpoint is given on the command line, they are read from the space-separated `LLM_BENCH_ENDPOINTS` environment variable. HTTP redirects are never followed (a redirect would send the API key to another location), so give the final URL. Proxies set in the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) apply only to endpoints outside the local network: requests to `localhost`, loopback, private and link-local addresses, names without a dot (`gpu-box`) and names ending in `.local`, `.lan`, `.internal`, `.home.arpa` or `.localhost` go directly.
 
 | Option | Default | Description |
 |---|---|---|
@@ -97,8 +97,8 @@ Endpoints are given as `[NAME=]URL`. `NAME` labels the endpoint in output files 
 | `--task PATTERN` | all | Only tasks whose name matches a shell glob, e.g. `'py_*'`. Repeatable. |
 | `--list-tasks` | | List tasks and exit. |
 | `--tasks-dir DIR` | `tasks/` | Load tasks from `DIR` instead of the built-in ones. Repeatable. |
-| `--api-key KEY` | | Bearer token sent to every endpoint. Also read from `LLM_BENCH_API_KEY` or `OPENAI_API_KEY`. |
-| `--timeout SEC` | 1800 | Per-request timeout. It must cover model load time plus generating `--max-tokens` tokens on your slowest model. |
+| `--api-key KEY` | | Bearer token sent to every endpoint. Prefer setting `LLM_BENCH_API_KEY` or `OPENAI_API_KEY` (read when `--api-key` isn't given): other users on the machine can see command-line arguments in the process list. A warning names each endpoint the key would reach over plain `http://` outside the local network. |
+| `--timeout SEC` | 1800 | Per-request timeout, from connecting to the end of the reply (a server that keeps sending slowly can't stretch it). It must cover model load time plus generating `--max-tokens` tokens on your slowest model. |
 | `--max-tokens N` | 16384 | Completion token limit. The prompt (up to ~9k tokens with feedback) plus `N` must fit in the model's context window. |
 | `--attempts N` | 3 | `1` = single shot; `N` = first attempt plus `N-1` retries with build/test feedback. |
 | `--temperature T` | server default | Sampling temperature. Same as `--param temperature=T`. |

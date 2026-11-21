@@ -19,6 +19,8 @@ import contextlib
 import csv
 import hashlib
 import http.client
+import io
+import ipaddress
 import json
 import math
 import os
@@ -28,6 +30,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -483,7 +486,88 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
-HTTP_OPENER = urllib.request.build_opener(NoRedirects)
+class DeadlineSocketIO(socket.SocketIO):
+    """A socket reader that stops at a deadline: each read waits at most until then (and at most the socket's own
+    timeout), so a server that keeps sending a little at a time can't stretch a request past its timeout, which
+    the socket timeout alone limits only per wait."""
+
+    def __init__(self, sock, deadline):
+        super().__init__(sock, "rb")
+        self._deadline, self._wait = deadline, sock.gettimeout()
+
+    def readinto(self, b):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")  # what the socket raises for one wait that takes too long
+        self._sock.settimeout(min(remaining, self._wait) if self._wait else remaining)
+        return super().readinto(b)
+
+
+class DeadlineSocket:
+    """A connected socket whose binary reader (what http.client reads the status line, headers and body from) is a
+    DeadlineSocketIO; everything else goes to the socket itself."""
+
+    def __init__(self, sock, deadline):
+        self._sock, self._deadline = sock, deadline
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+    def makefile(self, mode="r", buffering=None, **kwargs):
+        if mode != "rb":
+            return self._sock.makefile(mode, buffering, **kwargs)
+        self._sock._io_refs += 1  # as socket.makefile does; the reader's close() releases it
+        return io.BufferedReader(DeadlineSocketIO(self._sock, self._deadline), io.DEFAULT_BUFFER_SIZE)
+
+
+class DeadlineConnection:
+    """Mixin for http.client connections: the request's timeout is also one deadline from the start of the
+    connection to the end of the response (status line, headers and body, also of an HTTP error)."""
+
+    def connect(self):
+        timeout = self.timeout if isinstance(self.timeout, int | float) else None
+        deadline = time.monotonic() + timeout if timeout else None
+        super().connect()
+        if deadline is not None:
+            self.sock = DeadlineSocket(self.sock, deadline)
+
+
+class DeadlineHTTPConnection(DeadlineConnection, http.client.HTTPConnection):
+    pass
+
+
+class DeadlineHTTPSConnection(DeadlineConnection, http.client.HTTPSConnection):
+    pass
+
+
+class DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(DeadlineHTTPConnection, req)
+
+
+class DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(DeadlineHTTPSConnection, req, context=self._context)
+
+
+HTTP_HANDLERS = (NoRedirects, DeadlineHTTPHandler, DeadlineHTTPSHandler)
+HTTP_OPENER = urllib.request.build_opener(*HTTP_HANDLERS)  # uses proxies from the environment (HTTP_PROXY, ...)
+LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), *HTTP_HANDLERS)  # no proxy
+# Host name endings of the local network, whose servers a proxy usually can't reach.
+LOCAL_DOMAINS = (".localhost", ".local", ".lan", ".internal", ".home.arpa")
+
+
+def is_local_host(host):
+    """Whether host is this machine or on the local network: a loopback, private or link-local address, localhost,
+    a name without a dot (gpu-box) or one under LOCAL_DOMAINS. Requests to these skip proxies."""
+    host = (host or "").lower().rstrip(".")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "." not in host or host == "localhost" or host.endswith(LOCAL_DOMAINS)
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
 HTTP_READ_PIECE_BYTES = 64 * 1024
 
 
@@ -499,15 +583,18 @@ def read_capped(r, limit):
 
 def http_json(url, payload=None, timeout=60, api_key=None):
     """GET url (or POST payload as JSON) and return the decoded JSON reply. Raises ValueError if the reply
-    exceeds MAX_RESPONSE_BYTES or isn't JSON, and urllib/http.client errors on HTTP or connection failures
-    (urllib.error.HTTPError for a redirect, which is never followed)."""
+    exceeds MAX_RESPONSE_BYTES or isn't JSON, TimeoutError if the reply isn't complete within timeout seconds of
+    connecting (DeadlineConnection), and urllib/http.client errors on HTTP or connection failures
+    (urllib.error.HTTPError for a redirect, which is never followed). Requests to local hosts (is_local_host) skip
+    proxies set in the environment."""
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with HTTP_OPENER.open(req, timeout=timeout) as r:
+        opener = LOCAL_HTTP_OPENER if is_local_host(urllib.parse.urlsplit(url).hostname) else HTTP_OPENER
+        with opener.open(req, timeout=timeout) as r:
             # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
             body = read_capped(r, MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as e:
@@ -2660,6 +2747,21 @@ def select_tasks(args):
     return tasks
 
 
+def warn_plaintext_api_key(endpoints, api_key):
+    """Warn about each endpoint the API key would reach over plain HTTP outside the local network (is_local_host),
+    where anyone on the network path can read it."""
+    if not api_key:
+        return
+    for name, base in endpoints.items():
+        parts = urllib.parse.urlsplit(base)
+        if parts.scheme == "http" and not is_local_host(parts.hostname):
+            log(
+                f"warning: {name}: the API key is sent to {parts.hostname} over plain HTTP, readable on the "
+                "network path; use https:// or a tunnel",
+                err=True,
+            )
+
+
 def parse_endpoints(specs):
     """Map endpoint name -> base URL for the endpoint arguments; exit on a bad or duplicate one."""
     endpoints = {}
@@ -2724,6 +2826,7 @@ def main():
     if not tasks:
         sys.exit("no tasks selected")
     endpoints = parse_endpoints(args.endpoints)
+    warn_plaintext_api_key(endpoints, args.api_key)
 
     check_toolchains(tasks)
     check_sandbox()
