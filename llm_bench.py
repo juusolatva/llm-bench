@@ -133,18 +133,53 @@ TS_CONFIG = """\
   "files": ["solution.ts", "test.ts"]
 }
 """
-# Assembly tasks: solution.s must not switch to another instruction set with .arch (it would override
-# -march=generic64 and make results depend on the CPU; gas accepts the directive in any case, after a label or a ";"),
-# must reference no outside symbol (no libc) and must export exactly one global symbol. The harness's reference to the
-# task function pins that symbol's name at link time, so a solution can't replace libc, ASan or harness functions (a
-# global `exit` would make a failing harness exit 0). Runs inside the sandbox with LC_ALL=C, as a separate build step
-# so its message reaches the model as build feedback. Arguments: solution.s solution.o.
+# Assembly tasks: solution.s must not switch to another instruction set with .arch (it would override -march=generic64
+# and make results depend on the CPU), must reference no outside symbol (no libc) and must export exactly one global
+# symbol. The .arch check reads the source the way gas does on x86-64: it skips "#" comments, "/" comments at the
+# start of a statement, /* */ comments (also over several lines), strings and character constants ('c, 'c'), and finds
+# the directive in any case at the start of a statement (after labels, also quoted ones like "x":, or a ";"). It
+# catches ordinary use, not a directive name built by macro expansion (.irp, \()). The harness's reference to the task
+# function pins that symbol's name at link time, so a solution can't replace libc, ASan or harness functions (a global
+# `exit` would make a failing harness exit 0). Runs inside the sandbox with LC_ALL=C, as a separate build step so its
+# message reaches the model as build feedback. Arguments: solution.s solution.o.
 ASM_SOLUTION_CHECK = """\
 set -u
-arch=$(sed 's/#.*//' "$1" | grep -inE '(^|[;:])[[:space:]]*[.]arch([[:space:]]|$)')
+arch=$(awk '
+BEGIN { quote = sprintf("%c", 39); block = 0 }
+{
+    out = ""; n = length($0); i = 1; first = 1
+    while (i <= n) {
+        c = substr($0, i, 1)
+        if (block) {
+            if (c == "*" && substr($0, i + 1, 1) == "/") { block = 0; i++; out = out " " }
+        } else if (c == "/" && substr($0, i + 1, 1) == "*") {
+            block = 1; i++
+        } else if (c == "#" || (c == "/" && first)) {
+            break
+        } else if (c == "\\"") {
+            for (i++; i <= n && substr($0, i, 1) != "\\""; i++) if (substr($0, i, 1) == "\\\\") i++
+            out = out "\\"\\""; first = 0
+        } else if (c == quote) {
+            i += substr($0, i + 1, 1) == "\\\\" ? 2 : 1
+            if (substr($0, i + 1, 1) == quote) i++
+            out = out "0"; first = 0
+        } else {
+            out = out c
+            if (c == ";") first = 1
+            else if (c != " " && c != "\\t") first = 0
+        }
+        i++
+    }
+    count = split(out, statements, ";")
+    for (k = 1; k <= count; k++) {
+        s = statements[k]
+        while (match(s, /^[ \\t]*([A-Za-z0-9_.$]+|"")[ \\t]*:/)) s = substr(s, RLENGTH + 1)
+        if (tolower(s) ~ /^[ \\t]*[.]arch([ \\t]|$)/) { print "line " NR ":" $0; break }
+    }
+}
+' "$1")
 if [ -n "$arch" ]; then
-    printf 'solution.s must not change the instruction set with .arch (only baseline x86-64 is allowed):\\n'
-    printf '%s\\n' "$arch" | sed 's/^/line /'
+    printf 'solution.s must not change the instruction set with .arch (only baseline x86-64 is allowed):\\n%s\\n' "$arch"
     exit 1
 fi
 undefined=$(nm -u "$2") || exit 1
@@ -269,7 +304,7 @@ LANGS = {
             ["./t"],
         ],
         "final_line": HARNESS_FINAL_LINE,
-        "tools": ("nm", "grep", "sed"),
+        "tools": ("nm", "grep", "awk"),
     },
     "bash": {
         "prefix": "bash",

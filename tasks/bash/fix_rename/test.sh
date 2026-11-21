@@ -18,6 +18,6 @@ cmp -s got want || { diff want got >&2; fail "$case1: wrong files in 'my dir' af
 case2="bash solution.sh empty txt log, with no files in the directory 'empty'"
 bash "$SOL" empty txt log > out 2> err < /dev/null
 rc=$?
-[ "$rc" -eq 0 ] || fail "$case2: exit status $rc, want 0"
+[ "$rc" -eq 0 ] || fail "$case2: exit status $rc, want 0 (stderr: $(cat err))"
 [ ! -s err ] || fail "$case2: stderr not empty: $(cat err)"
 echo 'harness: all checks passed'

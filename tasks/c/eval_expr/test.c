@@ -40,6 +40,11 @@ int main(void) {
     harness_t("0", 0, 0);
     harness_t("((42))", 0, 42);
     harness_t("007", 0, 7);
+    harness_t("010", 0, 10);
+    harness_t("08", 0, 8);
+    harness_t("-2+3", 0, 1);
+    harness_t("2*-3+1", 0, -5);
+    harness_t("20/-4*2", 0, -10);
     harness_t("3000000000 * 2", 0, 6000000000L);
     harness_t("1 + 2 * (3 - 4) / 2 - 8", 0, -8);
     harness_t("", -1, 0);

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -88,8 +87,9 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	const cs = "ParallelMap(inputs 0..999, workers 4) with f failing on input 10 after 20 ms and inputs > 10 running until canceled"
 	boom := errors.New("boom")
 	var h harnessTracker
-	var mu sync.Mutex
-	canceled := 0
+	// Atomic: a solution that returns early leaves calls running, and the checks below must not race with them.
+	var canceled atomic.Int64
+	var tenStarted atomic.Int64 // when input 10's call started, in ns after ParallelMap was called (0: never)
 	inputs := make([]int, 1000)
 	for i := range inputs {
 		inputs[i] = i
@@ -112,14 +112,13 @@ func TestErrorCancelsAndStops(t *testing.T) {
 		case x < 10:
 			return x, nil
 		case x == 10:
+			tenStarted.Store(int64(time.Since(start)))
 			time.Sleep(20 * time.Millisecond)
 			return 0, boom
 		default:
 			select {
 			case <-ctx.Done():
-				mu.Lock()
-				canceled++
-				mu.Unlock()
+				canceled.Add(1)
 				return 0, ctx.Err()
 			case <-watchdog:
 				return x, nil
@@ -127,6 +126,10 @@ func TestErrorCancelsAndStops(t *testing.T) {
 		}
 	})
 	elapsed := time.Since(start)
+	if ten := time.Duration(tenStarted.Load()); ten == 0 || ten > 500*time.Millisecond {
+		t.Fatalf("%s: input 10 started only after %v (0: never): later inputs took the workers first; inputs must "+
+			"claim workers in order", cs, ten)
+	}
 	if elapsed > time.Second {
 		t.Fatalf("%s: took %v; the context passed to running calls was not canceled after the error", cs, elapsed)
 	}
@@ -145,7 +148,7 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	if s > 15 {
 		t.Fatalf("%s: f was called %d times, want at most 15 (inputs 0-13 can start before input 10 fails; no new calls may start after the error)", cs, s)
 	}
-	if s > 11 && canceled == 0 {
+	if s > 11 && canceled.Load() == 0 {
 		t.Fatalf("%s: no running call saw its context canceled", cs)
 	}
 }

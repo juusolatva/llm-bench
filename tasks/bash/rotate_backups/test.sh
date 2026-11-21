@@ -36,6 +36,9 @@ bash "$SOL" d 0 > out 2> err < /dev/null || fail "bash solution.sh d 0 with $fil
 printf '%s\n' './notes.bak.txt' './notes.txt' './sub/old.bak' './xbak' > want
 listing > got
 cmp -s got want || { diff want got >&2; fail "bash solution.sh d 0 with $files: wrong files left in d, want every .bak directly in d deleted (diff above: < want, > got)"; }
+sort out > got
+printf '%s\n' 'd/db 1.bak' 'd/db 2.bak' 'd/db 3.bak' 'd/db 4.bak' > want
+cmp -s got want || { diff want got >&2; fail "bash solution.sh d 0 with $files: wrong deleted paths printed, sorted here (diff above: < want, > got)"; }
 
 setup
 bash "$SOL" d 10 > out 2> err < /dev/null || fail "bash solution.sh d 10 with $files: exit status $?, want 0 (stderr: $(cat err))"

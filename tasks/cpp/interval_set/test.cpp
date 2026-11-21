@@ -16,23 +16,33 @@ static std::string harness_str(const harness_vec& v) {
     for (auto& p : v) s += " [" + std::to_string(p.first) + "," + std::to_string(p.second) + ")";
     return s + " }";
 }
-// Check s.intervals() against want after the operations described by `after`.
-static void harness_expect(const IntervalSet& s, const harness_vec& want, const char* after) {
-    auto got = s.intervals();
-    if (got != want) {
-        std::fprintf(stderr, "after %s: intervals() = %s, want %s\n", after, harness_str(got).c_str(),
-                     harness_str(want).c_str());
-        harness_fails++;
+// Runs calls on one IntervalSet s and records them, so a failure can show every call made so far. Stops at the
+// first failure: later checks would depend on a state the solution got wrong.
+struct harness_set {
+    IntervalSet s;
+    std::string log = "IntervalSet s";
+    void fail(const std::string& what) {
+        std::fprintf(stderr, "FAIL: after %s: %s\n", log.c_str(), what.c_str());
+        std::exit(1);
     }
-}
-// Check s.contains(x) against want.
-static void harness_contains(const IntervalSet& s, long x, bool want, const char* after) {
-    if (s.contains(x) != want) {
-        std::fprintf(stderr, "after %s: contains(%ld) = %s, want %s (intervals() = %s)\n", after, x,
-                     want ? "false" : "true", want ? "true" : "false", harness_str(s.intervals()).c_str());
-        harness_fails++;
+    void add(long lo, long hi) {
+        s.add(lo, hi);
+        log += ", s.add(" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
     }
-}
+    void remove(long lo, long hi) {
+        s.remove(lo, hi);
+        log += ", s.remove(" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
+    }
+    void expect(const harness_vec& want) {
+        auto got = s.intervals();
+        if (got != want) fail("s.intervals() = " + harness_str(got) + ", want " + harness_str(want));
+    }
+    void contains(long x, bool want) {
+        if (s.contains(x) != want)
+            fail("s.contains(" + std::to_string(x) + ") = " + (want ? "false" : "true") + ", want " +
+                 (want ? "true" : "false") + " (s.intervals() = " + harness_str(s.intervals()) + ")");
+    }
+};
 
 // The large-set test: called after each call, so a slow solution fails as soon as the test has taken 20 s, well
 // before the sandbox's time limit. `call` is the call that just returned, with i its loop index (-1: none).
@@ -51,42 +61,45 @@ static void harness_check_time(const char* call, long i) {
 }
 
 int main() {
-    IntervalSet s;
-    harness_expect(s, {}, "construction");
-    harness_contains(s, 0, false, "construction");
-    s.add(5, 5);
-    s.add(7, 3);
-    harness_expect(s, {}, "add(5, 5), add(7, 3)");
-    s.add(1, 3);
-    s.add(3, 5);
-    harness_expect(s, {{1, 5}}, "add(1, 3), add(3, 5)");
-    s.add(10, 20);
-    s.add(-5, -2);
-    harness_expect(s, {{-5, -2}, {1, 5}, {10, 20}}, "add(10, 20), add(-5, -2)");
-    for (long x : {-5L, -3L, 1L, 4L, 10L, 19L}) harness_contains(s, x, true, "add(10, 20), add(-5, -2)");
-    for (long x : {-6L, -2L, 0L, 5L, 9L, 20L}) harness_contains(s, x, false, "add(10, 20), add(-5, -2)");
-    s.add(4, 11);
-    harness_expect(s, {{-5, -2}, {1, 20}}, "add(4, 11)");
-    s.add(2, 8);
-    harness_expect(s, {{-5, -2}, {1, 20}}, "add(2, 8) inside an interval");
-    s.remove(5, 7);
-    harness_expect(s, {{-5, -2}, {1, 5}, {7, 20}}, "remove(5, 7)");
-    s.remove(-10, 2);
-    harness_expect(s, {{2, 5}, {7, 20}}, "remove(-10, 2)");
-    s.remove(4, 8);
-    harness_expect(s, {{2, 4}, {8, 20}}, "remove(4, 8)");
-    s.remove(30, 40);
-    s.remove(9, 9);
-    harness_expect(s, {{2, 4}, {8, 20}}, "remove(30, 40), remove(9, 9)");
-    s.remove(8, 20);
-    harness_expect(s, {{2, 4}}, "remove(8, 20)");
-    s.add(-3, 100);
-    s.remove(-100, 200);
-    harness_expect(s, {}, "add(-3, 100), remove(-100, 200)");
-    s.add(0, 10);
-    s.remove(3, 4);
-    s.add(3, 4);
-    harness_expect(s, {{0, 10}}, "remove(3, 4) then add(3, 4)");
+    harness_set h;
+    h.expect({});
+    h.contains(0, false);
+    h.add(5, 5);
+    h.add(7, 3);
+    h.expect({});
+    h.add(1, 3);
+    h.add(3, 5);
+    h.expect({{1, 5}});
+    h.add(10, 20);
+    h.add(-5, -2);
+    h.expect({{-5, -2}, {1, 5}, {10, 20}});
+    for (long x : {-5L, -3L, 1L, 4L, 10L, 19L}) h.contains(x, true);
+    for (long x : {-6L, -2L, 0L, 5L, 9L, 20L}) h.contains(x, false);
+    h.add(4, 11);
+    h.expect({{-5, -2}, {1, 20}});
+    h.add(2, 8);                                       // inside an interval
+    h.expect({{-5, -2}, {1, 20}});
+    h.remove(5, 7);
+    h.expect({{-5, -2}, {1, 5}, {7, 20}});
+    h.remove(-10, 2);
+    h.expect({{2, 5}, {7, 20}});
+    h.remove(4, 8);
+    h.expect({{2, 4}, {8, 20}});
+    h.remove(30, 40);
+    h.remove(9, 9);
+    h.expect({{2, 4}, {8, 20}});
+    h.remove(15, 10);                                  // lo > hi inside an interval: nothing happens
+    h.expect({{2, 4}, {8, 20}});
+    h.contains(12, true);
+    h.remove(8, 20);
+    h.expect({{2, 4}});
+    h.add(-3, 100);
+    h.remove(-100, 200);
+    h.expect({});
+    h.add(0, 10);
+    h.remove(3, 4);
+    h.add(3, 4);
+    h.expect({{0, 10}});
 
     // Large set: add [3i, 3i+1) for i < 200000, remove the even i, then add [3i, 3i+7) for i = 1, 5, 9, ...
     // which merges each with the interval starting at 3(i+2). Expected: n/4 intervals [3i, 3i+7).
