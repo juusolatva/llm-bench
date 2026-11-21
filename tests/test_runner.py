@@ -1117,6 +1117,40 @@ def test_print_summary_markdown_escapes_pipes(capsys):
     assert "| org\\|model |" in capsys.readouterr().out
 
 
+def test_print_summary_markdown_renders_names_as_written(capsys):
+    # A model name from a results file can't add links, images or HTML to a summary pasted into a README.
+    name = "![x](https://e.invalid/p.png)<img src=x>[link](u)"
+    llm_bench.print_summary(
+        [row("py_a", 1, model=name, context="short:4000"), row("py_b", 1, model="other")], fmt="markdown"
+    )
+    out = capsys.readouterr().out
+    escaped = "\\!\\[x\\]\\(https://e.invalid/p.png\\)\\<img src=x\\>\\[link\\]\\(u\\)"
+    assert f"| e | {escaped} |" in out
+    assert f"e/{escaped} (missing py_b)" in out  # the notes too
+    assert "](" not in out.replace("\\](", "")
+
+
+def test_print_summary_table_escapes_and_caps_names(capsys):
+    # Terminal control sequences are shown, not run, and one huge name doesn't widen every row.
+    llm_bench.print_summary([row("py_a", 1, model="evil\x1b[2J" + "x" * 5000), row("py_a", 1, model="m2")])
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "evil\\x1b[2J" in out
+    assert max(len(line) for line in out.splitlines()) < 200
+    assert "…" in out
+
+
+def test_print_summary_csv_keeps_formulas_as_text(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="=HYPERLINK(1)"), row("py_a", 1, model="@m")], fmt="csv")
+    models = [r["model"] for r in csv.DictReader(capsys.readouterr().out.splitlines())]
+    assert sorted(models) == ["'=HYPERLINK(1)", "'@m"]
+
+
+def test_log_escapes_control_characters(capsys):
+    llm_bench.log("server said: \x1b]0;title\x07 \u202eevil\nnext\tline", err=True)
+    assert capsys.readouterr().err == "server said: \\x1b]0;title\\x07 \\u202eevil\nnext\tline\n"
+
+
 def test_print_summary_csv(capsys):
     rows = [
         row("go_b", 0, lang="go", completion_tokens=900, seconds=2.0, config="old"),  # left out

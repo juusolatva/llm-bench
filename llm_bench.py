@@ -466,11 +466,21 @@ def model_dirs(models):
 PRINT_LOCK = threading.Lock()
 
 
+def printable(text, keep="\n\t"):
+    """text with each character that isn't printable (control characters such as terminal escape sequences,
+    invisible or direction-changing ones, lone surrogates) shown as a Python escape (\\x1b, \\u202e), apart from
+    those in keep. Server text (model IDs, error replies) goes through it before reaching the terminal."""
+    if "".join(c for c in text if c not in keep).isprintable():
+        return text
+    return "".join(c if c.isprintable() or c in keep else repr(c)[1:-1] for c in text)
+
+
 def log(msg, err=False):
-    """Thread-safe line output (one write per line, so lines from different endpoints never interleave)."""
+    """Thread-safe line output (one write per line, so lines from different endpoints never interleave). Characters
+    that aren't printable, apart from newlines and tabs, are escaped (printable)."""
     with PRINT_LOCK:
         f = sys.stderr if err else sys.stdout
-        f.write(msg + "\n")
+        f.write(printable(msg) + "\n")
         f.flush()
 
 
@@ -2249,9 +2259,34 @@ def summary_layout(groups):
     }
 
 
+MAX_LABEL_CHARS = 60  # longest endpoint or model name shown in summary tables and notes; longer ones end in "…"
+# Characters Markdown would read as markup in a table cell: links, images, HTML, code, emphasis (an "_" only at a word
+# boundary, since GFM ignores it inside words), strikethrough, entities and the cell separator.
+MARKDOWN_SPECIAL_RE = re.compile(r"[\\`*\[\]<>()!|~&]|(?<![0-9A-Za-z])_|_(?![0-9A-Za-z])")
+
+
+def display_label(text):
+    """An endpoint or model name for the summary: characters that aren't printable escaped (printable) and cut to
+    MAX_LABEL_CHARS, so names from results files can't change the terminal or blow up every row's width."""
+    text = printable(text, keep="")
+    return text if len(text) <= MAX_LABEL_CHARS else text[: MAX_LABEL_CHARS - 1] + "…"
+
+
+def markdown_escape(text):
+    """text with each character Markdown would read as markup backslash-escaped, so it renders as written."""
+    return MARKDOWN_SPECIAL_RE.sub(lambda m: "\\" + m.group(), text)
+
+
+def spreadsheet_safe(text):
+    """A text cell for the summary CSV: a leading "'" when it starts with a character spreadsheets read as the start
+    of a formula (=, +, -, @, tab, carriage return), so they show it as text."""
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
 def group_label(g, layout):
     """A model in notes and column headers: endpoint/model, plus [settings] when the table has a settings column."""
-    return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if layout["show_settings"] else "")
+    label = f"{display_label(g['endpoint'])}/{display_label(g['model'])}"
+    return label + (f" [{g['settings']}]" if layout["show_settings"] else "")
 
 
 def score_cell(value, var, n, repeated):
@@ -2268,7 +2303,9 @@ def lang_cell(lang_counts, repeated):
 def summary_row(g, layout):
     """One model's row of the summary table as display strings."""
     repeated = layout["repeated"]
-    cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
+    cells = [display_label(g["endpoint"]), display_label(g["model"])] + (
+        [g["settings"]] if layout["show_settings"] else []
+    )
     if repeated:
         lo, hi = min(g["trials"]), max(g["trials"])
         cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
@@ -2306,8 +2343,8 @@ def summary_records(groups, layout):
     records = []
     for g in groups:
         rec = {
-            "endpoint": g["endpoint"],
-            "model": g["model"],
+            "endpoint": spreadsheet_safe(g["endpoint"]),
+            "model": spreadsheet_safe(g["model"]),
             "settings": g["settings"],
             "tasks": g["n"],
             "rounds_min": min(g["trials"]),
@@ -2355,14 +2392,21 @@ def per_task_cells(groups, layout):
 def per_task_records(groups):
     """The task x model table as CSV records in long form: one per model and task."""
     return [
-        {"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "task": task, **g["per_task"][task]}
+        {
+            "endpoint": spreadsheet_safe(g["endpoint"]),
+            "model": spreadsheet_safe(g["model"]),
+            "settings": g["settings"],
+            "task": task,
+            **g["per_task"][task],
+        }
         for g in groups
         for task in task_order([g])
     ]
 
 
-def summary_notes(groups, dropped, layout):
-    """Explanations and warnings to print under the summary."""
+def summary_notes(groups, dropped, layout, escape=str):
+    """Explanations and warnings to print under the summary; escape is applied to the model labels in them (for
+    Markdown)."""
     notes = []
     if layout["repeated"]:
         notes.append(
@@ -2380,13 +2424,15 @@ def summary_notes(groups, dropped, layout):
             f"{retried} row(s) of trials that ended in a request error or were skipped were left out: a later run "
             "(e.g. --resume) ran those trials again"
         )
-    missing = [f"{group_label(g, layout)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
+    missing = [f"{escape(group_label(g, layout))} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:
         notes.append(
             "warning: models with the same settings were scored on different tasks, so their scores "
             f"aren't comparable: {', '.join(missing)}"
         )
-    failed = [f"{group_label(g, layout)} ({g['context']})" for g in groups if g["context"] not in ("ok", "unchecked")]
+    failed = [
+        f"{escape(group_label(g, layout))} ({g['context']})" for g in groups if g["context"] not in ("ok", "unchecked")
+    ]
     if failed:
         notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")
     return notes
@@ -2405,13 +2451,14 @@ def text_table(header, body, text_columns):
 
 
 def markdown_table(header, body, text_columns):
-    """A Markdown (GFM) pipe table: text columns left-aligned, the rest right-aligned."""
+    """A Markdown (GFM) pipe table: text columns left-aligned, the rest right-aligned. The header and the text
+    columns are escaped (markdown_escape), so names render as written; the numbers need no escaping."""
 
-    def line(cells):
-        return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+    def line(cells, text):
+        return "| " + " | ".join(markdown_escape(c) if i < text else c for i, c in enumerate(cells)) + " |"
 
     rule = ["---" if i < text_columns else "---:" for i in range(len(header))]
-    return "\n".join(line(cells) for cells in (header, rule, *body))
+    return "\n".join([line(header, len(header)), line(rule, 0), *(line(cells, text_columns) for cells in body)])
 
 
 def print_summary(rows, fmt="table", per_task=False):
@@ -2424,7 +2471,7 @@ def print_summary(rows, fmt="table", per_task=False):
     groups, dropped = summarize(rows)
     groups.sort(key=lambda g: (-g["pass"], -g["p1"], g["ct"]))
     layout = summary_layout(groups)
-    notes = summary_notes(groups, dropped, layout)
+    notes = summary_notes(groups, dropped, layout, markdown_escape if fmt == "markdown" else str)
     if fmt == "csv":
         records = per_task_records(groups) if per_task else summary_records(groups, layout)
         w = csv.DictWriter(sys.stdout, fieldnames=list(records[0]), lineterminator="\n")
