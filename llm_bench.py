@@ -2599,7 +2599,11 @@ def parse_args():
         help="load tasks from DIR (same layout as the built-in tasks/ directory) instead of the "
         "built-in tasks. Repeatable; also pass the built-in directory to combine them",
     )
-    ap.add_argument("--api-key", help="bearer token sent to every endpoint")
+    ap.add_argument(
+        "--api-key",
+        help="bearer token sent to every endpoint; other local users can see command-line arguments, so prefer "
+        "LLM_BENCH_API_KEY",
+    )
     ap.add_argument(
         "--timeout",
         type=positive_int,
@@ -2845,9 +2849,22 @@ def plan_models(args, endpoints):
     return plan
 
 
+def make_private_dirs(path):
+    """Create path and its missing parents readable only by their owner (mode 0o700). Directories that already exist
+    keep their permissions, which may share them on purpose."""
+    missing = []
+    while not path.exists():
+        missing.append(path)
+        path = path.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
 def output_paths(args, plan):
-    """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV."""
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV. The output and
+    transcript directories are created private (make_private_dirs): transcripts hold the harnesses, which may come
+    from a private --tasks-dir, and the replies."""
+    make_private_dirs(args.output_dir / "runs")
     suffix = f"_{args.tag}" if args.tag else ""
     outputs = {
         name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")

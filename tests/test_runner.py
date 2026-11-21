@@ -592,6 +592,21 @@ def test_go_trials_left(tmp_path, resume, rows, want):
     assert llm_bench.go_trials_left(args, {"e": ["m"]}, tasks[1:], {"e": (csv_path, tmp_path / "runs")}) is False
 
 
+def test_output_paths_creates_private_directories(tmp_path):
+    # New output and transcript directories are the owner's alone; an existing directory keeps its mode.
+    args = SimpleNamespace(output_dir=tmp_path / "new" / "out", tag=None)
+    ((csv_path, runs_dir),) = llm_bench.output_paths(args, {"e": ["m"]}).values()
+    for d in (tmp_path / "new", tmp_path / "new" / "out", tmp_path / "new" / "out" / "runs"):
+        assert d.stat().st_mode & 0o077 == 0, d
+    assert (csv_path, runs_dir) == (args.output_dir / "results_e.csv", args.output_dir / "runs" / "e")
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    llm_bench.output_paths(SimpleNamespace(output_dir=shared, tag="t"), {"e": ["m"]})
+    assert shared.stat().st_mode & 0o777 == 0o755
+    assert (shared / "runs").stat().st_mode & 0o077 == 0
+
+
 def test_before_model_cleans_up_after_an_unexpected_error(monkeypatch):
     # An error while waiting (e.g. from poll) must still kill the command's process group, reap it and close its output.
     procs = []
