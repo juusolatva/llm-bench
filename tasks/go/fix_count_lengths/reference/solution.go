@@ -2,7 +2,7 @@ package solution
 
 import "sync"
 
-// CountLengths returns how many strings of each length are in words, computed concurrently.
+// CountLengths returns how many strings of each length are in words.
 func CountLengths(words []string) map[int]int {
 	counts := map[int]int{}
 	var mu sync.Mutex

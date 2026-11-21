@@ -27,44 +27,63 @@ func harnessDo(h http.Handler, method, path, body string) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
-func harnessExpect(t *testing.T, h http.Handler, method, path, body string, code int, want string) {
-	t.Helper()
-	got, b := harnessDo(h, method, path, body)
-	if got != code || (want != "" && b != want) {
+// harnessSession makes handlers with NewHandler and sends them requests, recording every step, so a failure can
+// show everything that happened before it.
+type harnessSession struct {
+	t   *testing.T
+	log []string
+}
+
+type harnessHandler struct {
+	name string
+	h    http.Handler
+}
+
+func (s *harnessSession) newHandler(name string) *harnessHandler {
+	s.log = append(s.log, name+" := NewHandler()")
+	return &harnessHandler{name, NewHandler()}
+}
+
+// expect sends a request to hh and checks the status code and, if want is given, the body.
+func (s *harnessSession) expect(hh *harnessHandler, method, path, body string, code int, want ...string) {
+	s.t.Helper()
+	step := fmt.Sprintf("%s: %s %s with body %q", hh.name, method, path, body)
+	got, b := harnessDo(hh.h, method, path, body)
+	if got != code || (len(want) > 0 && b != want[0]) {
 		wantBody := ""
-		if want != "" {
-			wantBody = fmt.Sprintf(" %q", want)
+		if len(want) > 0 {
+			wantBody = fmt.Sprintf(" %q", want[0])
 		}
-		t.Fatalf("%s %s with body %q: got %d %q, want %d%s", method, path, body, got, b, code, wantBody)
+		s.t.Fatalf("after %s: %s: got %d %q, want %d%s", strings.Join(s.log, "; "), step, got, b, code, wantBody)
 	}
+	s.log = append(s.log, step)
 }
 
 func TestCRUD(t *testing.T) {
-	h := NewHandler()
-	harnessExpect(t, h, "GET", "/kv/a", "", 404, "")
-	harnessExpect(t, h, "PUT", "/kv/a", "hello", 204, "")
-	harnessExpect(t, h, "GET", "/kv/a", "", 200, "hello")
-	harnessExpect(t, h, "PUT", "/kv/a", "world", 204, "")
-	harnessExpect(t, h, "GET", "/kv/a", "", 200, "world")
-	harnessExpect(t, h, "DELETE", "/kv/a", "", 204, "")
-	harnessExpect(t, h, "GET", "/kv/a", "", 404, "")
-	harnessExpect(t, h, "DELETE", "/kv/a", "", 404, "")
-	harnessExpect(t, h, "POST", "/kv/a", "x", 405, "")
-	harnessExpect(t, h, "PATCH", "/kv/a", "x", 405, "")
-	harnessExpect(t, h, "POST", "/kv/", "x", 404, "")
-	harnessExpect(t, h, "POST", "/other", "x", 404, "")
-	harnessExpect(t, h, "DELETE", "/kv/a/b", "", 404, "")
-	harnessExpect(t, h, "GET", "/kv/", "", 404, "")
-	harnessExpect(t, h, "GET", "/other", "", 404, "")
-	harnessExpect(t, h, "GET", "/kv/a/b", "", 404, "")
-	harnessExpect(t, h, "GET", "/kv", "", 404, "")
-	harnessExpect(t, h, "PUT", "/kv/empty", "", 204, "")
-	if c, b := harnessDo(h, "GET", "/kv/empty", ""); c != 200 || b != "" {
-		t.Fatalf("GET /kv/empty after PUT /kv/empty with body \"\": got %d %q, want 200 \"\"", c, b)
-	}
-	h2 := NewHandler()
-	harnessExpect(t, h, "PUT", "/kv/x", "1", 204, "")
-	harnessExpect(t, h2, "GET", "/kv/x", "", 404, "")
+	s := &harnessSession{t: t}
+	h := s.newHandler("h")
+	s.expect(h, "GET", "/kv/a", "", 404)
+	s.expect(h, "PUT", "/kv/a", "hello", 204)
+	s.expect(h, "GET", "/kv/a", "", 200, "hello")
+	s.expect(h, "PUT", "/kv/a", "world", 204)
+	s.expect(h, "GET", "/kv/a", "", 200, "world")
+	s.expect(h, "DELETE", "/kv/a", "", 204)
+	s.expect(h, "GET", "/kv/a", "", 404)
+	s.expect(h, "DELETE", "/kv/a", "", 404)
+	s.expect(h, "POST", "/kv/a", "x", 405)
+	s.expect(h, "PATCH", "/kv/a", "x", 405)
+	s.expect(h, "POST", "/kv/", "x", 404)
+	s.expect(h, "POST", "/other", "x", 404)
+	s.expect(h, "DELETE", "/kv/a/b", "", 404)
+	s.expect(h, "GET", "/kv/", "", 404)
+	s.expect(h, "GET", "/other", "", 404)
+	s.expect(h, "GET", "/kv/a/b", "", 404)
+	s.expect(h, "GET", "/kv", "", 404)
+	s.expect(h, "PUT", "/kv/empty", "", 204)
+	s.expect(h, "GET", "/kv/empty", "", 200, "")
+	h2 := s.newHandler("h2")
+	s.expect(h, "PUT", "/kv/x", "1", 204)
+	s.expect(h2, "GET", "/kv/x", "", 404)
 }
 
 func TestConcurrent(t *testing.T) {

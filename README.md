@@ -61,7 +61,7 @@ Their harnesses must print the final line too (Rust harnesses import the solutio
 - Linux with cgroup v2 and a user systemd manager (`systemd-run --user` must work). This is the default on current Fedora, Ubuntu, Debian, Arch etc. desktop and server installs.
 - [bubblewrap](https://github.com/containers/bubblewrap) 0.8 or newer (`bwrap`); 0.11 or newer for the Go build cache (see [Go tasks](#go-tasks)).
 - Python 3.13+ (standard library only, nothing to `pip install`). Run the script from a clone of this repository so it finds `tasks/`.
-- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5 to 6.x), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks; binutils `nm` (installed with `gcc`) and an x86-64 host for the assembly tasks. You only need the toolchains for the tasks you select with `--task`.
+- The toolchains for the languages you benchmark, on `PATH`: `python3`, `gcc`, `g++` (C++17), `rustc` (edition 2021), `go` (1.22+), `node` (22+) and `tsc` (TypeScript 5.5 to 6.x), `bash`, plus coreutils/findutils; GNU diffutils (`diff`, `cmp`), `grep`, `sed` and `gawk` for the terminal tasks; binutils `nm` (installed with `gcc`), `awk` and an x86-64 host for the assembly tasks. You only need the toolchains for the tasks you select with `--task`.
 
 Example installs:
 

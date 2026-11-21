@@ -134,7 +134,7 @@ static int harness_fails, harness_crashes, harness_stopped, harness_verdict_fd =
 static size_t harness_page;
 
 static void harness_alloc_failed(void) {
-    fputs("harness: allocation failed\n", stderr);
+    fputs("harness: allocation failed\n", harness_err ? harness_err : stderr); /* stderr is silenced after a crash */
     if (harness_verdict_fd >= 0 && write(harness_verdict_fd, "A", 1) == 1) _exit(0);
     exit(1);
 }
@@ -394,14 +394,16 @@ static int harness_ss_cmp_asc(const void *p, const void *q) {
     uint64_t x = *(const uint64_t *)p, y = *(const uint64_t *)q;
     uint32_t kx = harness_ss_key(x), ky = harness_ss_key(y);
     if (kx != ky) return kx < ky ? -1 : 1;
-    return harness_ss_index(x) < harness_ss_index(y) ? -1 : 1;
+    uint32_t ix = harness_ss_index(x), iy = harness_ss_index(y);
+    return (ix > iy) - (ix < iy); /* 0 for an element compared with itself, as qsort requires */
 }
 
 static int harness_ss_cmp_desc(const void *p, const void *q) {
     uint64_t x = *(const uint64_t *)p, y = *(const uint64_t *)q;
     uint32_t kx = harness_ss_key(x), ky = harness_ss_key(y);
     if (kx != ky) return kx > ky ? -1 : 1;
-    return harness_ss_index(x) < harness_ss_index(y) ? -1 : 1;
+    uint32_t ix = harness_ss_index(x), iy = harness_ss_index(y);
+    return (ix > iy) - (ix < iy); /* 0 for an element compared with itself, as qsort requires */
 }
 
 static void harness_ss_fmt(char *buf, size_t size, const uint64_t *a, size_t n) {

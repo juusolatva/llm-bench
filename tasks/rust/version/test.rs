@@ -1,15 +1,17 @@
 #[cfg(test)]
 mod harness_tests {
     use solution::Version;
-    fn v(a: u64, b: u64, c: u64) -> Version { Version { major: a, minor: b, patch: c } }
+    fn harness_v(a: u64, b: u64, c: u64) -> Version { Version { major: a, minor: b, patch: c } }
     /// Compiles only if Version implements the traits the prompt lists (Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash).
     fn harness_has_traits<T: std::fmt::Debug + Clone + Copy + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash>() {}
+    /// Compiles only if Version implements std::str::FromStr with type Err = String, as the prompt requires.
+    fn harness_parses_with_string_err<T: std::str::FromStr<Err = String>>() {}
 
     #[test] fn parse_ok() {
-        for (s, want) in [("1.2.3", v(1, 2, 3)), ("v10.0.1", v(10, 0, 1)), ("0.0.0", v(0, 0, 0)),
-                          ("18446744073709551615.4294967296.0", v(u64::MAX, 4294967296, 0)),
-                          ("0.18446744073709551615.4294967296", v(0, u64::MAX, 4294967296)),
-                          ("4294967296.0.18446744073709551615", v(4294967296, 0, u64::MAX))] {
+        for (s, want) in [("1.2.3", harness_v(1, 2, 3)), ("v10.0.1", harness_v(10, 0, 1)), ("0.0.0", harness_v(0, 0, 0)),
+                          ("18446744073709551615.4294967296.0", harness_v(u64::MAX, 4294967296, 0)),
+                          ("0.18446744073709551615.4294967296", harness_v(0, u64::MAX, 4294967296)),
+                          ("4294967296.0.18446744073709551615", harness_v(4294967296, 0, u64::MAX))] {
             let got = s.parse::<Version>();
             assert!(got == Ok(want), "{:?}.parse::<Version>(): got {:?}, want Ok({:?})", s, got, want);
         }
@@ -23,7 +25,8 @@ mod harness_tests {
     }
     #[test] fn display_and_order() {
         harness_has_traits::<Version>();
-        let got = v(1, 2, 3).to_string();
+        harness_parses_with_string_err::<Version>();
+        let got = harness_v(1, 2, 3).to_string();
         assert!(got == "1.2.3", "Version {{ major: 1, minor: 2, patch: 3 }}.to_string(): got {:?}, want \"1.2.3\"", got);
         let got = "v4.5.6".parse::<Version>().map(|x| x.to_string());
         assert!(got == Ok("4.5.6".to_string()), "\"v4.5.6\" parsed and printed with Display: got {:?}, want Ok(\"4.5.6\")", got);

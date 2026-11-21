@@ -134,7 +134,7 @@ static int harness_fails, harness_crashes, harness_stopped, harness_verdict_fd =
 static size_t harness_page;
 
 static void harness_alloc_failed(void) {
-    fputs("harness: allocation failed\n", stderr);
+    fputs("harness: allocation failed\n", harness_err ? harness_err : stderr); /* stderr is silenced after a crash */
     if (harness_verdict_fd >= 0 && write(harness_verdict_fd, "A", 1) == 1) _exit(0);
     exit(1);
 }

@@ -134,7 +134,7 @@ static int harness_fails, harness_crashes, harness_stopped, harness_verdict_fd =
 static size_t harness_page;
 
 static void harness_alloc_failed(void) {
-    fputs("harness: allocation failed\n", stderr);
+    fputs("harness: allocation failed\n", harness_err ? harness_err : stderr); /* stderr is silenced after a crash */
     if (harness_verdict_fd >= 0 && write(harness_verdict_fd, "A", 1) == 1) _exit(0);
     exit(1);
 }
@@ -309,9 +309,12 @@ static int harness_mm_compare(const unsigned char *block, const unsigned char *w
         harness_fmt_bytes(want_s, sizeof want_s, want + (dst - block) + from, to - from);
         fprintf(harness_err, "FAIL: %s: wrong bytes in dst; first at dst[%td]: dst[%zu..%zu] = %s afterwards, want %s\n",
                 harness_desc, pos, from, to - 1, got_s, want_s);
+    } else if (n == 0) {
+        fprintf(harness_err, "FAIL: %s: %s the byte at dst[%td] (n is 0, so no byte may change): 0x%02x afterwards, "
+                "was 0x%02x\n", harness_desc, what, pos, block[i], want[i]);
     } else {
         fprintf(harness_err, "FAIL: %s: %s the byte at dst[%td] (outside dst[0..%zu]): 0x%02x afterwards, was 0x%02x\n",
-                harness_desc, what, pos, n ? n - 1 : 0, block[i], want[i]);
+                harness_desc, what, pos, n - 1, block[i], want[i]);
     }
     return 1;
 }
@@ -323,7 +326,7 @@ static int harness_mm_body(const void *ctx) {
     if (c->kind == HARNESS_INACCESSIBLE) {
         dst = harness_guarded(0, HARNESS_AT_END);
         src = harness_guarded(0, HARNESS_AT_END);
-        if ((dst > src) != c->dst_above) { unsigned char *t = dst; dst = src; src = t; }
+        if (((uintptr_t)dst > (uintptr_t)src) != c->dst_above) { unsigned char *t = dst; dst = src; src = t; }
     } else if (c->kind == HARNESS_SPAN) {
         size_t span = (c->dst_off > c->src_off ? c->dst_off : c->src_off) + c->n;
         unsigned char *p = harness_mm_buffer(span, c->where, 0, &block, &len);
@@ -335,7 +338,7 @@ static int harness_mm_body(const void *ctx) {
     } else if (c->kind == HARNESS_DISJOINT) {
         dst = harness_mm_buffer(c->n, c->where, 100, &block, &len);
         src = harness_mm_buffer(c->n, c->where, 0, &block2, &len2);
-        if ((dst > src) != c->dst_above) {
+        if (((uintptr_t)dst > (uintptr_t)src) != c->dst_above) {
             unsigned char *t = dst; dst = src; src = t;
             t = block; block = block2; block2 = t;
             size_t l = len; len = len2; len2 = l;

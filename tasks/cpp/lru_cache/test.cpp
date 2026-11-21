@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <string>
 #include "solution.hpp"
@@ -8,6 +9,18 @@
 static std::string harness_text(const std::string& s) { return "\"" + s + "\""; }
 static std::string harness_text(int x) { return std::to_string(x); }
 static std::string harness_text(const std::optional<int>& o) { return o ? std::to_string(*o) : "std::nullopt"; }
+
+// A key type with only == and std::hash, all the prompt promises: it has no operator<, so a cache built on an ordered
+// container (std::map, std::set) doesn't compile with it.
+struct harness_key {
+    int id;
+    bool operator==(const harness_key& other) const { return id == other.id; }
+};
+template <>
+struct std::hash<harness_key> {
+    std::size_t operator()(const harness_key& k) const noexcept { return std::hash<int>()(k.id); }
+};
+static std::string harness_text(const harness_key& k) { return "harness_key{" + std::to_string(k.id) + "}"; }
 
 // Runs calls on an LruCache<K, int> and records them, so a failure can show every call made so far.
 template <typename K>
@@ -68,6 +81,15 @@ int main() {
     one.get(1, std::nullopt);
     one.get(2, 2);
     one.size(1);
+
+    harness_cache<harness_key> h(2);
+    h.put(harness_key{1}, 1);
+    h.put(harness_key{2}, 2);
+    h.get(harness_key{1}, 1);
+    h.put(harness_key{3}, 3);                          // evicts harness_key{2}
+    h.get(harness_key{2}, std::nullopt);
+    h.get(harness_key{3}, 3);
+    h.size(2);
 
     // Timing: put(i, i) for i < n; from i = capacity / 2 on, every third step also get(i - capacity / 2), which is
     // still cached. The elapsed time is checked every 1000 puts, so an O(capacity) get or put fails here quickly.

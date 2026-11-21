@@ -61,7 +61,7 @@ int main(void) {
     HARNESS_CHECK(f.len == 100, "after pushing 0..99: len = %zu, want 100", f.len);
     for (int round = 0; round < 2; round++) {
         int *shrunk = realloc(f.data, f.len * sizeof *f.data);
-        HARNESS_CHECK(shrunk != NULL, "harness: realloc failed");
+        if (!shrunk) { fputs("harness: allocation failed\n", stderr); exit(2); }
         f.data = shrunk;
         f.cap = n = f.len;
         size_t i = round == 0 ? 0 : n - 1;

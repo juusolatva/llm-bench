@@ -1429,6 +1429,14 @@ ASM_HOST = llm_bench.shutil.which("gcc") and llm_bench.shutil.which("nm") and os
         ),
         (".text\n.globl f\nf:\t.ARCH\t.sse4.2\n  ret\n", False, r"line 3:f:\t\.ARCH"),
         (".text\n.globl f\nf:\n  nop; .arch corei7\n  ret\n", False, r"line 4:  nop; \.arch corei7"),
+        # Comments, strings and character constants are skipped the way gas reads them.
+        ("/* ok */ .arch .popcnt\n.text\n.globl f\nf:\n  ret\n", False, r"line 1:/\* ok \*/ \.arch"),
+        ('.data\n.ascii "#"; .arch .popcnt\n.text\n.globl f\nf:\n  ret\n', False, r'line 2:\.ascii "#"; \.arch'),
+        (".data\n.byte '#'; .arch .popcnt\n.text\n.globl f\nf:\n  ret\n", False, r"line 2:\.byte '#'; \.arch"),
+        ('.data\n.ascii "/*"; .arch .popcnt\n.text\n.globl f\nf:\n  ret\n', False, r"line 2:"),
+        ("/*\n.arch is not used\n*/\n.text\n.globl f\nf:\n  ret\n", True, ""),
+        ("/ .arch .popcnt\n.text\n.globl f\nf:\n  ret ; / .arch .popcnt\n", True, ""),
+        ('.data\n.ascii ".arch x"\n.text\n.globl f\nf:\n  ret\n', True, ""),
     ],
 )
 def test_asm_symbol_check(tmp_path, source, ok, message):
