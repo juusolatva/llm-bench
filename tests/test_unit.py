@@ -581,7 +581,8 @@ def test_read_capped_reads_in_pieces():
 
     body = Body(b"x" * 200_000)
     assert llm_bench.read_capped(body, 150_001) == b"x" * 150_001
-    assert max(body.reads) == llm_bench.HTTP_READ_PIECE_BYTES and body.reads[-1] == 150_001 - 2 * 65536
+    piece = llm_bench.HTTP_READ_PIECE_BYTES
+    assert body.reads == [piece, piece, 150_001 - 2 * piece]  # never more than one piece per read
     body = Body(b"short")
     assert llm_bench.read_capped(body, 100) == b"short"
     assert body.reads == [100, 95]  # stops at the end of the body
