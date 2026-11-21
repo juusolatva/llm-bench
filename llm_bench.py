@@ -365,10 +365,10 @@ def _load_task(taskdir, lang, seen):
     if name in seen:
         raise ValueError(f"duplicate task {name}: {seen[name]} and {taskdir}")
     seen[name] = taskdir
-    prompt = prompt_file.read_text().strip()
+    prompt = prompt_file.read_text(encoding="utf-8").strip()
     if not prompt:
         raise ValueError(f"{prompt_file}: empty prompt")
-    return {"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text()}
+    return {"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text(encoding="utf-8")}
 
 
 def load_tasks(roots):
@@ -564,15 +564,21 @@ def default_model_filter(model_id):
 
 
 def parse_endpoint(spec):
-    """'[NAME=]URL' -> (name, base URL). A missing scheme becomes http://, a missing path /v1."""
+    """'[NAME=]URL' -> (name, base URL). A missing scheme becomes http://, a missing path /v1. The text before the
+    first "=" is a NAME only if it has no ":" or "?" (so an "=" in a URL's query doesn't make one)."""
     name, sep, url = spec.partition("=")
-    if not sep or "://" in name:
+    if not sep or re.search(r"[:?]", name):
         name, url = "", spec
     if "://" not in url:
         url = "http://" + url
     parts = urllib.parse.urlsplit(url)
+    error = f"invalid endpoint {spec!r}: expected [NAME=]http(s)://HOST[:PORT][/PATH]"
+    try:
+        parts.port  # noqa: B018 -- raises ValueError for a port that isn't a number from 0 to 65535
+    except ValueError:
+        raise ValueError(error) from None
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ValueError(f"invalid endpoint {spec!r}: expected [NAME=]http(s)://HOST[:PORT][/PATH]")
+        raise ValueError(error)
     path = parts.path.rstrip("/") or "/v1"
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     if not name:
@@ -963,8 +969,8 @@ def prepare_go_cache(directory):
     work.mkdir()
     cache.mkdir()
     for name, content in LANGS["go"].get("extra", {}).items():
-        (work / name).write_text(content)
-    (work / "solution_test.go").write_text(GO_WARM_TEST)
+        (work / name).write_text(content, encoding="utf-8")
+    (work / "solution_test.go").write_text(GO_WARM_TEST, encoding="utf-8")
     log("go: warming the build cache (race-instrumented standard library), this takes a minute...", err=True)
     t0 = time.monotonic()
     warm = run_cmd(
@@ -1042,10 +1048,10 @@ def run_task(task, code, workdir):
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
-    (workdir / lang["sol"]).write_text(code)
-    (workdir / lang["test"]).write_text(task["test"])
+    (workdir / lang["sol"]).write_text(code, encoding="utf-8")
+    (workdir / lang["test"]).write_text(task["test"], encoding="utf-8")
     for name, content in lang.get("extra", {}).items():
-        (workdir / name).write_text(content)
+        (workdir / name).write_text(content, encoding="utf-8")
     rendered = [shlex.join(cmd) for cmd in lang["cmds"]]
     script = []
     for r in rendered:
@@ -1136,7 +1142,7 @@ def resolve_ts_package():
     tsc = Path(shutil.which("tsc")).resolve(strict=True)
     package = tsc.parent.parent
     try:
-        meta = json.loads((package / "package.json").read_text())
+        meta = json.loads((package / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = None
     if tsc.name != "tsc" or tsc.parent.name != "bin" or not isinstance(meta, dict) or meta.get("name") != "typescript":
@@ -1375,8 +1381,8 @@ def check_reply(task, text, adir):
     else:
         adir.mkdir(parents=True)
         passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
-    (adir / "response.md").write_text(text)
-    (adir / "log.txt").write_text(run_log)
+    (adir / "response.md").write_text(text, encoding="utf-8")
+    (adir / "log.txt").write_text(run_log, encoding="utf-8")
     return passed, stage, fail_cmd, fail_out
 
 
@@ -1458,6 +1464,8 @@ def check_context(label, base, model, opts, stop, base_tokens):
     measure tokens per filler word, then send a prompt of the needed size and compare the prompt tokens
     the server reports. Returns "ok", "short:<reported tokens>", "rejected:<error>" or "unchecked"."""
     need = context_needed(opts)
+    if base_tokens and base_tokens >= need:  # the short prompt alone already took that much context
+        return "ok"
     prefix = "Reply with OK. Ignore the following text.\n\n"
     _, _, usage, error, _ = probe(label, base, model, prefix + filler(CONTEXT_CALIBRATION_WORDS), opts, stop)
     sample_tokens = usage.get("prompt_tokens")
@@ -1493,6 +1501,9 @@ def check_context(label, base, model, opts, stop, base_tokens):
     expected = base_tokens + per_word * words
     log(f"{label}: checking that the context holds {need} tokens...", err=True)
     _, _, usage, error, _ = probe(label, base, model, prefix + filler(words), opts, stop)
+    if error and not error.startswith("http_"):  # no answer to judge (timeout, dropped connection, bad reply)
+        log(f"{label}: warning: can't check the context size (the {need}-token prompt failed: {error})", err=True)
+        return "unchecked"
     if error:
         log(
             f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
@@ -1587,7 +1598,9 @@ def hook_exited(proc):
 def read_some(fd, tail, timeout):
     """Wait up to timeout for output on fd and append it to the bytearray tail, keeping only its last
     BEFORE_MODEL_OUTPUT_BYTES. Returns False at EOF."""
-    if not select.select([fd], [], [], timeout)[0]:
+    poller = select.poll()  # not select.select, which fails for descriptors above 1023
+    poller.register(fd, select.POLLIN)
+    if not poller.poll(timeout * 1000):
         return True
     chunk = os.read(fd, 65536)
     tail += chunk
@@ -1602,22 +1615,26 @@ def wait_hook(proc):
     fd, tail, is_open = proc.stdout.fileno(), bytearray(), True
     deadline = time.monotonic() + BEFORE_MODEL_TIMEOUT_S
     timed_out = False
-    while not hook_exited(proc):
-        if time.monotonic() > deadline:
-            timed_out = True
-            break
-        if is_open:
-            is_open = read_some(fd, tail, 0.1)
-        else:
-            time.sleep(0.1)
-    kill_process_group(proc)
-    with ACTIVE_HOOKS_LOCK:
-        ACTIVE_HOOKS.discard(proc)
-    status = proc.wait()
-    grace = time.monotonic() + BEFORE_MODEL_OUTPUT_GRACE_S  # the rest of the output, unless a process that
-    while is_open and time.monotonic() < grace:  # left the group keeps it open
-        is_open = read_some(fd, tail, max(0.0, grace - time.monotonic()))
-    proc.stdout.close()
+    try:
+        while not hook_exited(proc):
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            if is_open:
+                is_open = read_some(fd, tail, 0.1)
+            else:
+                time.sleep(0.1)
+    finally:  # also after an unexpected error: nothing the command started may keep running
+        kill_process_group(proc)
+        with ACTIVE_HOOKS_LOCK:
+            ACTIVE_HOOKS.discard(proc)
+        status = proc.wait()
+        try:
+            grace = time.monotonic() + BEFORE_MODEL_OUTPUT_GRACE_S  # the rest of the output, unless a process
+            while is_open and time.monotonic() < grace:  # that left the group keeps it open
+                is_open = read_some(fd, tail, max(0.0, grace - time.monotonic()))
+        finally:
+            proc.stdout.close()
     if timed_out:
         return tail, f"timed out after {BEFORE_MODEL_TIMEOUT_S}s"
     if status < 0:
@@ -1709,15 +1726,31 @@ def token_count(cell, empty):
     return count if count is not None and count <= MAX_ROW_TOKEN_COUNT else empty
 
 
-def results_row(raw, path):
-    """One results CSV record as a row: numeric fields converted, defaults for columns of newer versions, and
-    an old "backend" column renamed to "endpoint". Raises ValueError if a required column is missing."""
-    row = {k: v for k, v in raw.items() if k is not None}
+# Columns every version of the results file has (an old "backend" column counts as "endpoint").
+RESULT_COLUMNS = {"endpoint", "model", "task", "lang", "passed", "passed_on"}
+
+
+def check_columns(fieldnames):
+    """Raise ValueError unless a results CSV header has RESULT_COLUMNS: also a file without rows must be one."""
+    columns = set(fieldnames or ())
+    if "backend" in columns:
+        columns.add("endpoint")
+    missing = RESULT_COLUMNS - columns
+    if missing:
+        raise ValueError(f"not a results file (missing columns: {', '.join(sorted(missing))})")
+
+
+def results_row(raw, where):
+    """One results CSV record (from csv.DictReader) as a row: numeric fields converted, defaults for columns of
+    newer versions, and an old "backend" column renamed to "endpoint". Raises ValueError for a record with more or
+    fewer cells than the header (where names it in the message)."""
+    if None in raw:  # DictReader's key for cells beyond the header
+        raise ValueError(f"{where} has more cells than the header")
+    if None in raw.values():  # DictReader's value for missing cells
+        raise ValueError(f"{where} has fewer cells than the header")
+    row = dict(raw)
     if "endpoint" not in row and "backend" in row:
         row["endpoint"] = row.pop("backend")
-    missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
-    if missing:
-        raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
     for k in INT_FIELDS:
         row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
     for k in FLOAT_FIELDS:
@@ -1734,9 +1767,12 @@ def results_row(raw, path):
 
 def read_results(path):
     """Rows of a results CSV, numeric fields converted. Files from older versions are accepted: missing
-    columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint"."""
-    with open(path, newline="") as f:
-        return [results_row(raw, path) for raw in csv.DictReader(f)]
+    columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint". Raises
+    ValueError for a file without RESULT_COLUMNS or with a record whose cell count doesn't match the header."""
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        check_columns(reader.fieldnames)
+        return [results_row(raw, f"line {reader.line_num}") for raw in reader]
 
 
 def is_finished(row):
@@ -1855,7 +1891,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
         existing = [r for r in read_results(out_path) if r["endpoint"] == name]
     new_file = not existing and (not out_path.exists() or out_path.stat().st_size == 0)
     # Rows are written as they complete, so an aborted run keeps every finished trial.
-    with open(out_path, "a", newline="") as f:
+    with open(out_path, "a", newline="", encoding="utf-8") as f:
         run = EndpointRun(name, base, opts, f, out_path, runs_dir, existing, rows, stop)
         if new_file:
             run.w.writeheader()
@@ -2267,13 +2303,35 @@ def print_summary(rows, fmt="table", per_task=False):
         print("\n" + render(*per_task_cells(groups, layout)))
 
 
+def finite_float(value):
+    """argparse type: a finite float (JSON has no NaN or infinity)."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {value!r}")
+    return number
+
+
+def same_json_value(a, b):
+    """Whether two request parameter values are the same JSON value: False and 0 (or True and 1) aren't."""
+    numbers = (int, float)
+    if type(a) in numbers and type(b) in numbers:
+        return a == b
+    return type(a) is type(b) and a == b
+
+
+def reject_constant(name):
+    """json.loads parse_constant hook: NaN and Infinity aren't JSON, and a server can't parse them."""
+    raise argparse.ArgumentTypeError(f"{name} isn't valid JSON (use a finite number or a string)")
+
+
 def parse_param(spec):
-    """KEY=VALUE -> (key, value); VALUE is parsed as JSON if possible (numbers, true/false, lists), else a string."""
+    """KEY=VALUE -> (key, value); VALUE is parsed as JSON if possible (numbers, true/false, lists), else a string.
+    NaN and Infinity are refused: they would make the request invalid JSON."""
     key, sep, value = spec.partition("=")
     if not sep or not key:
         raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {spec!r}")
     try:
-        return key, json.loads(value)
+        return key, json.loads(value, parse_constant=reject_constant)
     except json.JSONDecodeError:
         return key, value
 
@@ -2383,7 +2441,7 @@ def parse_args():
     )
     ap.add_argument(
         "--temperature",
-        type=float,
+        type=finite_float,
         metavar="T",
         help="sampling temperature (default: the server's/model's default); same as --param temperature=T",
     )
@@ -2473,7 +2531,9 @@ def parse_args():
     if args.tag:
         args.tag = safe_name(args.tag)
     args.params = dict(args.param)
-    if args.temperature is not None and args.params.get("temperature", args.temperature) != args.temperature:
+    if args.temperature is not None and not same_json_value(
+        args.params.get("temperature", args.temperature), args.temperature
+    ):
         ap.error("--temperature conflicts with --param temperature=...")
     if args.temperature is not None:
         args.params["temperature"] = args.temperature
@@ -2488,7 +2548,7 @@ def check_results_file(path):
     older version whose columns are all still in FIELDS is upgraded: rewritten with empty cells in the new ones."""
     if not path.exists() or path.stat().st_size == 0:
         return
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         header = next(csv.reader(f), [])
     if header != FIELDS and (len(set(header)) != len(header) or not set(header) <= set(FIELDS)):
         sys.exit(
@@ -2512,15 +2572,10 @@ def upgrade_results_file(path):
     error the old file is left as it was."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".upgrade")
     try:
-        with os.fdopen(fd, "w", newline="") as dst, open(path, newline="") as src:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as dst, open(path, newline="", encoding="utf-8") as src:
             w = csv.DictWriter(dst, fieldnames=FIELDS, restval="")
             w.writeheader()
-            for line, row in enumerate(csv.DictReader(src), start=2):
-                if None in row:  # DictReader's key for cells beyond the header
-                    raise ValueError(f"line {line} has more cells than the header")
-                if None in row.values():  # DictReader's value for missing cells
-                    raise ValueError(f"line {line} has fewer cells than the header")
-                w.writerow(row)
+            w.writerows(csv.DictReader(src))  # check_results_file read it first: every row fits the header
         shutil.copymode(path, tmp)  # mkstemp creates the file readable by its owner only
         os.replace(tmp, path)
     except BaseException:
@@ -2531,10 +2586,12 @@ def upgrade_results_file(path):
 
 def show_summary(paths, fmt, per_task):
     """--summary mode: print the summary of the given results files."""
-    try:
-        rows = [r for path in paths for r in read_results(path)]
-    except (OSError, ValueError, csv.Error) as e:  # UnicodeDecodeError is a ValueError
-        sys.exit(f"cannot read results: {e}")
+    rows = []
+    for path in paths:
+        try:
+            rows += read_results(path)
+        except (OSError, ValueError, csv.Error) as e:  # UnicodeDecodeError is a ValueError
+            sys.exit(f"cannot read {path}: {e}")
     print_summary(rows, fmt, per_task)
 
 

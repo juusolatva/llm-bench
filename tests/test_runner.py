@@ -355,6 +355,26 @@ def test_context_check_unchecked_without_full_size_count(mock_server, tmp_path, 
     assert "no token usage for the" in capsys.readouterr().err
 
 
+def test_context_check_ok_when_the_short_prompt_already_fills_the_need(mock_server, tmp_path):
+    # A server whose own prompt makes even the warm-up need more tokens than required: no filler prompt to build.
+    need = llm_bench.context_needed(opts())
+    s = mock_server(replies=[""], probe_reply=[probe_usage(need + 5)])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == "ok"
+    assert len(s.probes) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"), [(Reply(close=True), "disconnected"), (Reply(body=b"{"), "bad_response")]
+)
+def test_context_check_unchecked_when_the_full_size_prompt_fails(mock_server, tmp_path, capsys, failure, error):
+    # Only an HTTP error is the server rejecting the prompt; a dropped connection or a bad reply says nothing.
+    s = mock_server(replies=[""], probe_reply=[probe_usage(10), probe_usage(2010), failure])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == "unchecked"
+    assert f"failed: {error})" in capsys.readouterr().err
+
+
 def test_context_check_disabled(mock_server, tmp_path):
     s = mock_server(replies=[""], context=500)
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], context_check=False)
@@ -517,6 +537,23 @@ def test_stop_active_hooks_kills_a_running_command():
     llm_bench.stop_active_hooks()
     t.join(10)
     assert errors == ["m/a: --before-model failed (killed by signal 9)"]
+    assert not llm_bench.ACTIVE_HOOKS
+
+
+def test_before_model_cleans_up_after_an_unexpected_error(monkeypatch):
+    # An error while waiting (e.g. from poll) must still kill the command's process group, reap it and close its output.
+    procs = []
+
+    def failing_read(fd, tail, timeout):
+        procs.extend(llm_bench.ACTIVE_HOOKS)
+        raise ValueError("boom")
+
+    monkeypatch.setattr(llm_bench, "read_some", failing_read)
+    with pytest.raises(ValueError, match="boom"):
+        llm_bench.run_before_model("m/a", python_cmd("import time; time.sleep(30)"), {}, threading.Event())
+    (proc,) = procs
+    assert proc.returncode is not None  # killed and reaped, not left running
+    assert proc.stdout.closed
     assert not llm_bench.ACTIVE_HOOKS
 
 
@@ -1130,7 +1167,7 @@ def test_check_results_file_refuses_upgrade_of_rows_with_extra_cells(tmp_path):
     path = tmp_path / "results.csv"
     write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1,extra")
     before = path.read_text()
-    with pytest.raises(SystemExit, match="cannot upgrade"):
+    with pytest.raises(SystemExit, match=r"cannot read .*results\.csv: line 2 has more cells than the header$"):
         llm_bench.check_results_file(path)
     assert path.read_text() == before
     assert list(tmp_path.iterdir()) == [path]  # temp file removed
@@ -1184,6 +1221,21 @@ def test_upgrade_keeps_file_permissions(tmp_path):
     llm_bench.check_results_file(path)
     assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
     assert path.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (",".join(llm_bench.FIELDS) + "\ne,m\n", "line 2 has fewer cells than the header"),  # current columns too
+        ("model\n", "not a results file"),  # no rows, but its columns are a subset of FIELDS: no upgrade
+    ],
+)
+def test_check_results_file_refuses_malformed_files(tmp_path, content, message):
+    path = tmp_path / "results.csv"
+    path.write_text(content)
+    with pytest.raises(SystemExit, match=message):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == content
 
 
 def test_check_results_file_refuses_upgrade_of_short_rows(tmp_path):

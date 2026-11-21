@@ -28,13 +28,16 @@ import llm_bench
         ("my box=localhost:8080", ("my_box", "http://localhost:8080/v1")),
         ("http://[::1]:8080", ("__1_8080", "http://[::1]:8080/v1")),
         ("http://host:1/v1?a=b", ("host_1", "http://host:1/v1")),
+        ("localhost:8080/v1?a=b", ("localhost_8080", "http://localhost:8080/v1")),  # "=" in the query: no NAME
     ],
 )
 def test_parse_endpoint(spec, want):
     assert llm_bench.parse_endpoint(spec) == want
 
 
-@pytest.mark.parametrize("spec", ["ftp://host", "http://", "x=", "file:///etc"])
+@pytest.mark.parametrize(
+    "spec", ["ftp://host", "http://", "x=", "file:///etc", "box=http://localhost:abc/v1", "localhost:99999"]
+)
 def test_parse_endpoint_rejects(spec):
     with pytest.raises(ValueError):
         llm_bench.parse_endpoint(spec)
@@ -705,6 +708,14 @@ def test_parse_param(spec, want):
     assert llm_bench.parse_param(spec) == want
 
 
+@pytest.mark.parametrize(("temperature", "param"), [("0.5", "0.5"), ("1", "1")])  # 1 and 1.0: the same number
+def test_cli_accepts_a_matching_temperature_param(monkeypatch, temperature, param):
+    monkeypatch.setattr(
+        sys, "argv", ["llm_bench.py", "localhost:1", "--temperature", temperature, "--param", f"temperature={param}"]
+    )
+    assert llm_bench.parse_args().params == {"temperature": float(temperature)}
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -712,6 +723,12 @@ def test_parse_param(spec, want):
         ["--param", "max_tokens=5"],
         ["--param", "model=x"],
         ["--temperature", "0.2", "--param", "temperature=0.5"],
+        ["--temperature", "0", "--param", "temperature=false"],  # False == 0 in Python, not in JSON
+        ["--temperature", "1", "--param", "temperature=true"],
+        ["--temperature", "nan"],  # not JSON: the request would be invalid
+        ["--temperature", "inf"],
+        ["--param", "x=NaN"],
+        ["--param", "x=[1, -Infinity]"],
     ],
 )
 def test_cli_rejects_bad_params(monkeypatch, args):
@@ -752,8 +769,12 @@ def test_cli_summary_mode(monkeypatch, capsys, tmp_path):
 
 
 def test_cli_summary_bad_file(monkeypatch, tmp_path):
-    with pytest.raises(SystemExit, match="cannot read results"):
+    with pytest.raises(SystemExit, match=r"cannot read .*missing\.csv"):
         run_main(monkeypatch, "--summary", str(tmp_path / "missing.csv"))
+    other = tmp_path / "other.csv"
+    other.write_text("foo,bar\n")  # header only: still not a results file
+    with pytest.raises(SystemExit, match=r"cannot read .*other\.csv: not a results file"):
+        run_main(monkeypatch, "--summary", str(other))
 
 
 def test_cli_summary_formats(monkeypatch, capsys, tmp_path):
