@@ -46,7 +46,7 @@ from typing import NamedTuple
 # --- CONFIGURATION ---
 # Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
 # code extraction, build/test handling), so rows from different versions are never mixed.
-BENCH_VERSION = "0.5.0"
+BENCH_VERSION = "0.6.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800  # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384  # worst-case prompt (~9k tokens) + max tokens must fit in the context window
@@ -73,6 +73,14 @@ SANDBOX_TMP_BYTES = 512 * 1024**2
 SANDBOX_FILE_BYTES = 64 * 1024**2
 MAX_OUTPUT_BYTES = 1024**2
 MAX_RESPONSE_BYTES = 8 * 1024**2  # API reply body cap, enforced before JSON parsing
+# Longest model ID and finish reason accepted from a server: far longer than real ones, far below the CSV reader's
+# 128 KiB field limit (csv.field_size_limit), so a results file stays readable.
+MAX_MODEL_ID_CHARS = 1000
+MAX_FINISH_REASON_CHARS = 100
+# Largest token count accepted from a server, per reply: larger ones are treated as not reported, so sums and
+# means stay within float range.
+MAX_TOKEN_COUNT = 10**9
+MAX_ROW_TOKEN_COUNT = 10**15  # per results row (all attempts); larger counts in a results file are read as unknown
 MAX_CONTENT_CHARS = 1024**2  # completion text cap, enforced before anything is written under runs/
 # Only the resolved Rust toolchain is exposed, never ~/.cargo or all of ~/.rustup.
 RUST_SYSROOT = None
@@ -381,6 +389,7 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 FENCE_OPEN_RE = re.compile(r"(?<![^\n])[ \t]*+(`{3,}+)[ \t]*+([\w+-]*+)[^\n`]*+\n|(?<!`)(`{3,}+)([\w+-]++)[ \t]*+\n")
 # A closing fence: a run of 3+ backticks followed only by whitespace up to the end of the line.
 FENCE_CLOSE_RE = re.compile(r"(?<!`)(`{3,}+)[ \t]*+$", re.MULTILINE)
+FENCE_RUN_RE = re.compile(r"[ \t]*+(`++)")  # the backticks of an opening fence, from where FENCE_OPEN_RE matched
 VL_RE = re.compile(r"(?<![a-z0-9])vl(?![a-z0-9])")
 UNSAFE_NAME_RE = re.compile(r"[^\w.-]")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")  # terminal color/style sequences (CSI)
@@ -440,6 +449,17 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
 
 
 HTTP_OPENER = urllib.request.build_opener(NoRedirects)
+HTTP_READ_PIECE_BYTES = 64 * 1024
+
+
+def read_capped(r, limit):
+    """Up to limit bytes of the response body r, read in pieces: http.client keeps each chunk of a chunked body as
+    a separate bytes object until one read() returns, so a single read of 8 MiB sent in 1-byte chunks would hold
+    millions of them (several hundred MiB) at once."""
+    body = bytearray()
+    while len(body) < limit and (piece := r.read(min(HTTP_READ_PIECE_BYTES, limit - len(body)))):
+        body += piece
+    return bytes(body)
 
 
 def http_json(url, payload=None, timeout=60, api_key=None):
@@ -454,7 +474,7 @@ def http_json(url, payload=None, timeout=60, api_key=None):
     try:
         with HTTP_OPENER.open(req, timeout=timeout) as r:
             # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
-            body = r.read(MAX_RESPONSE_BYTES + 1)
+            body = read_capped(r, MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as e:
         if not 300 <= e.code < 400:
             raise
@@ -471,16 +491,35 @@ def http_json(url, payload=None, timeout=60, api_key=None):
         ) from None
     if len(body) > MAX_RESPONSE_BYTES:
         raise ValueError(f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes")
-    return json.loads(body)
+    try:
+        return json.loads(body)
+    except RecursionError:  # not a ValueError, so it would escape every caller's bad-response handling
+        raise ValueError(f"response from {url} is nested too deeply") from None
+
+
+def valid_label(value, max_chars):
+    """Whether a value from the server (a model ID, a finish reason) is a printable string of 1 to max_chars
+    characters: no control characters or lone surrogates (which can't be written as UTF-8)."""
+    return isinstance(value, str) and 0 < len(value) <= max_chars and value.isprintable()
 
 
 def list_models(name, base, api_key):
-    """The model IDs the endpoint serves, or [] (with a message) if they can't be listed."""
+    """The model IDs the endpoint serves, in order and without duplicates, or [] (with a message) if they can't be
+    listed. IDs that aren't printable strings of at most MAX_MODEL_ID_CHARS characters are left out (with a
+    message): they would break transcript paths, the results file or the summary."""
     try:
-        return [m["id"] for m in http_json(f"{base}/models", timeout=10, api_key=api_key)["data"]]
+        ids = [m["id"] for m in http_json(f"{base}/models", timeout=10, api_key=api_key)["data"]]
     except (OSError, http.client.HTTPException, KeyError, TypeError, ValueError) as e:
         log(f"{name}: skipping, cannot list models at {base}/models: {e}", err=True)
         return []
+    valid = [m for m in ids if valid_label(m, MAX_MODEL_ID_CHARS)]
+    if len(valid) < len(ids):
+        log(
+            f"{name}: ignoring {len(ids) - len(valid)} model ID(s) that aren't printable strings of at most "
+            f"{MAX_MODEL_ID_CHARS} characters",
+            err=True,
+        )
+    return list(dict.fromkeys(valid))
 
 
 def default_model_filter(model_id):
@@ -544,12 +583,29 @@ def _outside_code(blocks, positions):
     return keep
 
 
+def _closes_open_fence(text, blocks, pos):
+    """Whether the </think> at pos is inside a block (from _code_blocks) only because the reasoning before it left
+    a fence open: the fence that closes that block, read without the text up to pos, closes a block that opens
+    after pos with a fence at least as long as the block's own. A </think> in real code fails this: the fence
+    closing its block then opens one instead, and a shorter fence inside the block is part of the code."""
+    i = bisect.bisect_right([b[0] for b in blocks], pos) - 1
+    if i < 0 or pos >= blocks[i][1]:
+        return False
+    after = pos + len(THINK_CLOSE)
+    fence = len(FENCE_RUN_RE.match(text, blocks[i][0]).group(1))
+    return any(
+        after + b[1] == blocks[i][1] and len(FENCE_RUN_RE.match(text, after + b[0]).group(1)) >= fence
+        for b in _code_blocks(text[after:])
+    )
+
+
 def strip_think(text):
     """Remove reasoning and return the rest of the reply:
     - <think>...</think> blocks;
     - for servers that drop the opening tag, everything up to the last unpaired </think> that is followed
       by a code block (if the reply has no code block, up to the first one; if code blocks exist but none
-      follows a </think>, nothing, so a tag mentioned after the answer can't erase it);
+      follows a </think>, nothing, so a tag mentioned after the answer can't erase it), also when the
+      reasoning left a fence open that would otherwise pair with the answer's closing fence (_closes_open_fence);
     - a reply that starts with a <think> that never closes (reasoning cut off by max_tokens) becomes "".
     Tags inside fenced code blocks are part of the code, and an unpaired <think> later in the reply is text.
     CRLF line endings become LF first (the fence patterns and the build tools, bash especially, expect LF)."""
@@ -568,7 +624,10 @@ def strip_think(text):
     blocks = _code_blocks(text)
     closes = _outside_code(blocks, [m.start() for m in re.finditer(THINK_CLOSE, text)])
     followed = [c for c in closes if blocks and blocks[-1][0] > c]
-    if followed:
+    last = text.rfind(THINK_CLOSE)
+    if last >= 0 and last not in closes and _closes_open_fence(text, blocks, last):
+        text = text[last + len(THINK_CLOSE) :]
+    elif followed:
         text = text[followed[-1] + len(THINK_CLOSE) :]
     elif closes and not blocks:
         text = text[closes[0] + len(THINK_CLOSE) :]
@@ -623,18 +682,35 @@ ACTIVE_UNITS = set()  # systemd units of running sandboxes, stopped on interrupt
 ACTIVE_UNITS_LOCK = threading.Lock()
 
 
+SYSTEMCTL_NOT_LOADED = 5  # systemctl's exit status for a unit that is already gone (--collect removes it on exit)
+
+
+def stop_unit(unit, systemctl="systemctl"):
+    """Stop a sandbox's transient systemd unit, which kills everything left in it. A stop that fails (other than
+    for a unit that is already gone) or takes over 5 s is logged, not raised: the unit's RuntimeMaxSec still ends
+    it."""
+    try:
+        done = subprocess.run(
+            [systemctl, "--user", "stop", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"warning: could not stop sandbox unit {unit}: {e}", err=True)
+        return
+    if done.returncode not in (0, SYSTEMCTL_NOT_LOADED):
+        detail = done.stderr.decode(errors="replace").strip()[:500]
+        log(f"warning: could not stop sandbox unit {unit}: exit status {done.returncode}: {detail}", err=True)
+
+
 def stop_active_units():
     """Stop the transient systemd units of sandboxes that are still running (on Ctrl-C)."""
     with ACTIVE_UNITS_LOCK:
         units = list(ACTIVE_UNITS)
     for unit in units:
-        subprocess.run(
-            ["systemctl", "--user", "stop", unit],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
+        stop_unit(unit)
 
 
 # Host directories every sandbox sees read-only (sandbox_command), so the only places a system tool may live.
@@ -755,6 +831,25 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
     return command
 
 
+def run_unit(command, output, timeout, systemctl, unit):
+    """Start the sandbox command with its output going to the file output, wait for it and stop its unit.
+    Returns (exit status, seconds until it exited), the time taken before the unit is stopped, so a slow stop
+    can't turn a normal exit into a time-limit kill. Raises OSError if it can't start and
+    subprocess.TimeoutExpired if it doesn't exit within timeout + 10 s (systemd should end it at timeout)."""
+    t0 = time.monotonic()
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+    try:
+        rc = process.wait(timeout=timeout + 10)
+        return rc, time.monotonic() - t0
+    finally:
+        stop_unit(unit, systemctl)  # also kills detached descendants after a normal exit or an interruption
+        if process.poll() is None:
+            process.kill()
+            # A process that doesn't die (uninterruptible sleep) must not replace the exception being raised.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+
+
 def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     """Run only inside a mandatory namespace sandbox and bounded systemd unit.
     timeout: run time limit (default CMD_TIMEOUT_S). go_cache_rw: host directory mounted writable as the Go
@@ -771,33 +866,15 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     with tempfile.TemporaryFile() as output:
         with ACTIVE_UNITS_LOCK:
             ACTIVE_UNITS.add(unit)
-        t0 = time.monotonic()
         try:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
-            try:
-                rc = process.wait(timeout=timeout + 10)
-            finally:
-                # Also kill detached descendants after normal completion or interruption.
-                try:
-                    subprocess.run(
-                        [tools["systemctl"], "--user", "stop", unit],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=5,
-                    )
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                    process.wait(timeout=5)
-                    with ACTIVE_UNITS_LOCK:
-                        ACTIVE_UNITS.discard(unit)
+            rc, elapsed = run_unit(command, output, timeout, tools["systemctl"], unit)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
+        finally:
             with ACTIVE_UNITS_LOCK:  # also when the unit never started (Popen failed)
                 ACTIVE_UNITS.discard(unit)
-            return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
         # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
-        timed_out = rc != 0 and time.monotonic() - t0 >= timeout
+        timed_out = rc != 0 and elapsed >= timeout
         output.seek(0)
         data = output.read(MAX_OUTPUT_BYTES + 1)
     text = data[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
@@ -1135,12 +1212,16 @@ def server_reachable(base, api_key):
         return False
 
 
+def valid_count(value):
+    """Whether a token count from the server is usable: an int (not a bool) from 0 to MAX_TOKEN_COUNT."""
+    return type(value) is int and 0 <= value <= MAX_TOKEN_COUNT
+
+
 def valid_counts(usage):
-    """usage without prompt_tokens and completion_tokens values that aren't non-negative ints: a server that
-    reports something else (a string, a fraction, a bool) reports no count, and callers can rely on the rest."""
-    return {
-        k: v for k, v in usage.items() if k not in ("prompt_tokens", "completion_tokens") or (type(v) is int and v >= 0)
-    }
+    """usage without prompt_tokens and completion_tokens values that aren't valid counts (valid_count): a server
+    that reports something else (a string, a fraction, a bool, an absurd number) reports no count, and callers can
+    rely on the rest."""
+    return {k: v for k, v in usage.items() if k not in ("prompt_tokens", "completion_tokens") or valid_count(v)}
 
 
 def http_error_detail(e):
@@ -1178,10 +1259,15 @@ def parse_reply(label, resp, seconds):
         if not isinstance(usage, dict):
             raise TypeError(f"usage is {type(usage).__name__}")
         usage = valid_counts(usage)
+        finish = choice.get("finish_reason")
+        if finish is not None and not valid_label(finish, MAX_FINISH_REASON_CHARS):
+            raise TypeError(f"finish_reason isn't a printable string of at most {MAX_FINISH_REASON_CHARS} characters")
     except (KeyError, IndexError, TypeError, AttributeError) as e:
         log(f"{label}: bad response: {type(e).__name__}: {e}: {json.dumps(resp)[:300]}", err=True)
         return "", None, {}, "bad_response", seconds
-    return text, choice.get("finish_reason"), usage, None, seconds
+    # JSON can carry lone surrogates ("\ud800"), which can't be written to the transcript or the solution file.
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
+    return text, finish, usage, None, seconds
 
 
 def chat(label, base, payload, opts, stop):
@@ -1221,7 +1307,7 @@ def reasoning_tokens(usage):
     something other than a count)."""
     details = usage.get("completion_tokens_details")
     count = details.get("reasoning_tokens") if isinstance(details, dict) else None
-    return count if type(count) is int and count >= 0 else None
+    return count if valid_count(count) else None
 
 
 def is_model_error(finish):
@@ -1571,10 +1657,21 @@ def skipped_result(finish_reason, fail_stage):
     }
 
 
-INT_FIELDS = ("repeat", "passed", "passed_on", "attempts", "prompt_tokens", "completion_tokens")
+INT_FIELDS = ("repeat", "passed", "passed_on", "attempts")
+# Token count columns and their value when empty: a missing reasoning count is unknown (None), not zero.
+TOKEN_FIELDS = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": None}
 FLOAT_FIELDS = ("seconds", "load_seconds")
-# Trials with these finish reasons failed for reasons outside the model's reply; --resume runs them again.
+# Trials with these finish reasons failed for reasons outside the model's reply; --resume runs them again (apart from
+# trials skipped by --max-length-finishes, see is_finished).
 RETRY_FINISHES = ("bad_response", "disconnected", "skipped")
+
+
+def token_count(cell, empty):
+    """A token count cell of a results file as an int, or empty for an empty cell or a count above
+    MAX_ROW_TOKEN_COUNT: files written before server counts were capped can hold any number, which would overflow
+    the summary's float arithmetic."""
+    count = int(cell) if cell else None
+    return count if count is not None and count <= MAX_ROW_TOKEN_COUNT else empty
 
 
 def results_row(raw, path):
@@ -1593,8 +1690,8 @@ def results_row(raw, path):
     for k in FIELDS:
         if row.get(k) is None:
             row[k] = ""
-    # Empty when the server didn't report it, so a missing count isn't read as zero.
-    row["reasoning_tokens"] = int(row["reasoning_tokens"]) if row.get("reasoning_tokens") else None
+    for k, empty in TOKEN_FIELDS.items():
+        row[k] = token_count(row[k], empty)
     # Empty in rows from before the column existed; summarize falls back to an estimate for them.
     row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
     return row
@@ -1608,8 +1705,12 @@ def read_results(path):
 
 
 def is_finished(row):
-    """Whether a results row is final; --resume runs trials that failed for reasons outside the model again."""
+    """Whether a results row is final; --resume runs trials that failed for reasons outside the model again. A
+    trial skipped by --max-length-finishes is final: the model used up its budget, and another run would only
+    give it a new one."""
     finish = row.get("finish_reason") or ""
+    if finish == "skipped" and row.get("fail_stage") == "budget":
+        return True
     return not (finish in RETRY_FINISHES or finish.startswith("http_"))
 
 
@@ -1747,16 +1848,21 @@ def new_run_id(now=None):
     return f"{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}Z"
 
 
+def run_order(row):
+    """A row's run_id in a form that sorts by time ("" without one): older versions wrote whole seconds."""
+    run_id = row.get("run_id") or ""
+    if run_id.endswith("Z") and "." not in run_id:
+        run_id = run_id[:-1] + ".000Z"
+    return run_id
+
+
 def newest_configs(rows):
     """{(settings, task): config of the task's newest version}: the config of its rows from the latest run_id
     (row order breaks ties, e.g. for old files without run_id)."""
     newest = {}
     for i, r in enumerate(rows):
         key = (r.get("settings") or "", r["task"])
-        run_id = r.get("run_id") or ""
-        if run_id.endswith("Z") and "." not in run_id:  # older versions wrote whole seconds
-            run_id = run_id[:-1] + ".000Z"
-        rank = (run_id, i)
+        rank = (run_order(r), i)
         if key not in newest or rank > newest[key][0]:
             newest[key] = (rank, r.get("config"))
     return {key: config for key, (_, config) in newest.items()}
@@ -1836,8 +1942,32 @@ def add_task_scores(g, task, task_rows):
     lang[0] += p
     lang[1] += 1
     g["trials"].append(n)
-    if task_rows[-1].get("context"):
-        g["context"] = task_rows[-1]["context"]
+
+
+def scored_trials(task_rows):
+    """The trials a task is scored on. A row of a trial that failed for reasons outside the model's reply (a request
+    error, a skipped trial: the ones --resume runs again) is left out when a later run has a trial of the task to
+    take its place, as --resume's retry does; each later trial replaces one such row, the oldest first. Otherwise
+    it counts, as failed: within one run, or with nothing to replace it, it's a round the model didn't pass."""
+    by_run = defaultdict(list)
+    for r in task_rows:
+        by_run[run_order(r)].append(r)
+    unfinished, replaced = [], set()
+    for run in sorted(by_run):
+        run_rows = by_run[run]
+        replaced.update(id(r) for r, _ in zip(unfinished, run_rows, strict=False))
+        unfinished = unfinished[len(run_rows) :] + [r for r in run_rows if not is_finished(r)]
+    return [r for r in task_rows if id(r) not in replaced]
+
+
+def context_status(trials):
+    """A group's context check result: a failed check if any of its scored trials ran under one (the last such
+    result), otherwise "ok" if a check passed, otherwise "unchecked"."""
+    statuses = [r["context"] for r in trials if r.get("context")]
+    failed = [s for s in statuses if s not in ("ok", "unchecked")]
+    if failed:
+        return failed[-1]
+    return "ok" if "ok" in statuses else "unchecked"
 
 
 def summarize(rows):
@@ -1849,10 +1979,13 @@ def summarize(rows):
     (a reply has at least one token, so 0 means the server didn't say), with all their reply time.
     Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
     reported them (otherwise None: a partial count would be on another scale than completion tokens).
+    Rows of failed requests that a later run replaced are left out (scored_trials); "retried" counts them.
     Returns (groups, dropped row count)."""
     tasks_by_group, dropped = newest_rows(rows)
     groups = []
-    for (endpoint, model, settings), tasks in tasks_by_group.items():
+    for (endpoint, model, settings), all_tasks in tasks_by_group.items():
+        tasks = {task: scored_trials(task_rows) for task, task_rows in all_tasks.items()}
+        trials = [r for task_rows in tasks.values() for r in task_rows]
         g = {
             "endpoint": endpoint,
             "model": model,
@@ -1869,9 +2002,10 @@ def summarize(rows):
             "langs": defaultdict(lambda: [0.0, 0]),
             "trials": [],
             "tasks": set(tasks),
-            "context": "unchecked",
+            "context": context_status(trials),
+            "retried": sum(len(task_rows) for task_rows in all_tasks.values()) - len(trials),
             "per_task": {},
-            "tps": throughput([r for task_rows in tasks.values() for r in task_rows]),
+            "tps": throughput(trials),
             "rt": mean_reasoning_tokens(tasks),
         }
         for task, task_rows in tasks.items():
@@ -2030,6 +2164,12 @@ def summary_notes(groups, dropped, layout):
         notes.append(
             f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
             "are scored on each task's newest version"
+        )
+    retried = sum(g["retried"] for g in groups)
+    if retried:
+        notes.append(
+            f"{retried} row(s) of trials that ended in a request error or were skipped were left out: a later run "
+            "(e.g. --resume) ran those trials again"
         )
     missing = [f"{group_label(g, layout)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:

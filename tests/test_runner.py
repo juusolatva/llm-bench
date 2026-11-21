@@ -108,6 +108,45 @@ def test_chat_drops_invalid_token_counts(mock_server, usage, want):
     assert chat(s)[:4] == ("x", "stop", want, None)
 
 
+def test_chat_drops_absurd_token_counts(mock_server):
+    # Counts that can't be real would overflow float arithmetic in the summary and the context check.
+    usage = {"prompt_tokens": llm_bench.MAX_TOKEN_COUNT + 1, "completion_tokens": 10**400}
+    body = json.dumps({"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}], "usage": usage})
+    s = mock_server(replies=[Reply(body=body.encode())])
+    assert chat(s)[:4] == ("x", "stop", {}, None)
+
+
+@pytest.mark.parametrize("finish", [5, ["stop"], "x" * 101, "stop\nfake log line"])
+def test_chat_rejects_an_invalid_finish_reason(mock_server, finish):
+    body = json.dumps({"choices": [{"message": {"content": "x"}, "finish_reason": finish}]})
+    s = mock_server(replies=[Reply(body=body.encode())])
+    assert chat(s)[3] == "bad_response"
+
+
+def test_chat_replaces_lone_surrogates(mock_server):
+    # JSON allows "\ud800", which Python can't write as UTF-8 to the transcript or the solution file.
+    s = mock_server(replies=[Reply(body=b'{"choices": [{"message": {"content": "a\\ud800b"}}]}')])
+    text, finish, _, error, _ = chat(s)
+    assert (text, finish, error) == ("a?b", None, None)
+    text.encode()
+
+
+def test_chat_deeply_nested_reply_is_a_bad_response(mock_server, monkeypatch, capsys):
+    # Whether json.loads runs out of stack depends on the machine, so the parse failure is simulated.
+    real = llm_bench.json.loads
+    nested = b"[" * 100000
+
+    def loads(data, *args, **kwargs):
+        if data == nested:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(data, *args, **kwargs)
+
+    monkeypatch.setattr(llm_bench.json, "loads", loads)
+    s = mock_server(replies=[Reply(body=nested)])
+    assert chat(s)[3] == "bad_response"
+    assert "nested too deeply" in capsys.readouterr().err
+
+
 def test_chat_timeout(mock_server):
     s = mock_server(replies=[Reply(text="late", sleep=3)])
     assert chat(s, timeout=1)[3] == "timeout"
@@ -583,6 +622,8 @@ def test_length_budget_skips_rest_of_model(mock_server, tmp_path):
         ("b", "length", "no_code"),
         ("b", "skipped", "budget"),
     ]
+    # Trials skipped by the budget are final: --resume doesn't give the model a new budget for them.
+    assert run_endpoint(s, tmp_path, models=["a", "b"], tasks=TASKS[:3], max_length_finishes=2, resume=True) == []
 
 
 def row(task, passed_on, **extra):
@@ -610,6 +651,57 @@ def test_summarize_repeats():
     assert (g["n"], g["p1"], g["pass"], g["trials"]) == (2, 0.5, 1.0, [2, 2])  # py_a passed twice, once at attempt 1
     assert g["var1"] == pytest.approx(0.5)  # p=0.5 over 2 trials: 0.25 * 2/1
     assert (g["ct"], g["s"], g["load"]) == (10, 2.0, 2.0)  # means per round, summed over tasks
+
+
+RUN1, RUN2, RUN3 = "20261101T100000.000Z", "20261101T120000Z", "20261102T090000.000Z"  # RUN2: whole seconds
+
+
+def test_summarize_leaves_out_request_errors_that_were_run_again():
+    # A trial that hit http_500, then passed on --resume: one round, not a failed and a passed one.
+    rows = [
+        row("py_a", 0, run_id=RUN1, finish_reason="http_500", prompt_tokens=0, completion_tokens=0, seconds=0.0),
+        row("py_b", 1, run_id=RUN1),
+        row("py_c", 0, run_id=RUN1, finish_reason="skipped", fail_stage="request"),  # nothing replaced it
+        row("py_a", 1, run_id=RUN2),
+    ]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert (g["n"], g["pass"], g["trials"], g["retried"]) == (3, 2.0, [1, 1, 1], 1)
+    assert (g["var"], g["ct"], g["s"]) == (0.0, 15, 3.0)  # no spread, means not diluted by the error row
+    assert g["per_task"]["py_a"] == {"lang": "python", "trials": 1, "passed": 1, "passed_on_first": 1}
+
+
+def test_summarize_counts_request_errors_that_nothing_replaced():
+    # Within one run a request error is a failed round; a later run replaces only as many as it has trials,
+    # oldest first, and a retry that failed again can be replaced by a still later one.
+    rows = [row("py_a", 1, run_id=RUN1), row("py_a", 0, run_id=RUN1, finish_reason="http_500")]
+    (g,) = llm_bench.summarize(rows)[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (0.5, [2], 0)
+    errors = [row("py_a", 0, run_id=RUN1, finish_reason="disconnected", seconds=float(i)) for i in range(3)]
+    (g,) = llm_bench.summarize([*errors, row("py_a", 1, run_id=RUN2)])[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (pytest.approx(1 / 3), [3], 1)
+    assert g["s"] == pytest.approx((1 + 2 + 1) / 3)  # the oldest error (0 s) was replaced
+    retry_failed = [row("py_a", 0, run_id=r, finish_reason="http_500") for r in (RUN1, RUN2)]
+    (g,) = llm_bench.summarize(retry_failed)[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (0.0, [1], 1)  # one round that failed, not two
+    (g,) = llm_bench.summarize([*retry_failed, row("py_a", 1, run_id=RUN3)])[0]
+    assert (g["pass"], g["trials"], g["retried"]) == (1.0, [1], 2)
+
+
+def test_print_summary_notes_left_out_request_errors(capsys):
+    llm_bench.print_summary([row("py_a", 0, run_id=RUN1, finish_reason="disconnected"), row("py_a", 1, run_id=RUN2)])
+    out = capsys.readouterr().out
+    assert "1 row(s) of trials that ended in a request error or were skipped were left out" in out
+    assert "rounds" not in out
+
+
+def test_summarize_keeps_a_failed_context_check_from_any_task():
+    # Whichever task comes last, a trial run under a failed context check keeps the warning.
+    for order in (1, -1):
+        rows = [row("py_a", 1, context="short:4000"), row("py_b", 1, context="unchecked"), row("py_c", 1)]
+        (g,) = llm_bench.summarize(rows[::order])[0]
+        assert g["context"] == "short:4000"
+    assert llm_bench.summarize([row("py_a", 1, context="unchecked"), row("py_b", 1)])[0][0]["context"] == "ok"
+    assert llm_bench.summarize([row("py_a", 1, context="")])[0][0]["context"] == "unchecked"
 
 
 def test_summarize_keeps_newest_task_version_and_splits_settings():
@@ -798,6 +890,22 @@ def test_read_results_reasoning_tokens(tmp_path):
         "endpoint,model,task,lang,passed,passed_on,reasoning_tokens\ne,m,py_a,python,1,1,12\ne,m,py_b,python,1,1,\n"
     )
     assert [r["reasoning_tokens"] for r in llm_bench.read_results(path)] == [12, None]
+
+
+def test_read_results_treats_absurd_token_counts_as_unknown(tmp_path):
+    # Written before counts were capped: they would overflow the summary's float arithmetic.
+    path = tmp_path / "r.csv"
+    huge = "9" * 400
+    path.write_text(
+        "endpoint,model,task,lang,passed,passed_on,prompt_tokens,completion_tokens,reasoning_tokens\n"
+        f"e,m,py_a,python,1,1,{huge},{huge},{huge}\ne,m,py_b,python,1,1,10,5,2\n"
+    )
+    rows = llm_bench.read_results(path)
+    assert [(r["prompt_tokens"], r["completion_tokens"], r["reasoning_tokens"]) for r in rows] == [
+        (0, 0, None),
+        (10, 5, 2),
+    ]
+    llm_bench.summarize(rows)
 
 
 def test_check_results_file_upgrades_older_columns(tmp_path, capsys):

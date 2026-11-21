@@ -3,7 +3,10 @@ import json
 import os
 import re
 import shlex
+import socket
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 from collections import Counter
@@ -178,6 +181,9 @@ def test_extract_code_strips_think():
         ("```python\ngood\n```\nThe </think> tag is not used.", "good\n"),  # no reasoning at all
         ("plan ```python\nbad\n```\n</think>\nok:\n```python\ngood\n```", "good\n"),
         ("plan\n</think>\nx = 1\n", "\nx = 1\n"),  # no fence: after first
+        # A fence left open in the reasoning must not pair with the answer's closing fence.
+        ("draft:\n```python\nbad\n</think>\nFinal:\n```python\ngood\n```\n", "good\n"),
+        ("draft ```python\nbad\n</think>\n```python\nx\n```\nand\n```python\ngood\n```", "good\n"),
     ],
 )
 def test_extract_code_partial_think(text, want):
@@ -263,6 +269,12 @@ def test_extract_code_without_fence_returns_text():
 def test_extract_code_keeps_think_tags_inside_code():
     text = "<think>plan</think>\n```python\ndef render():\n    return '</think>' + '<think>x</think>'\n```"
     assert llm_bench.extract_code(text, "python") == "def render():\n    return '</think>' + '<think>x</think>'\n"
+    # Without the opening tag, and with another block after the one holding the tag: the tag is still code.
+    text = "```python\ns = '</think>'\nt = 1\n```\nUsage:\n```python\nprint(s)\n```"
+    assert llm_bench.strip_think(text) == text
+    # Nor does a shorter fence after the tag, inside a block with a longer fence, make it reasoning.
+    text = '````python\ndef render():\n    return """</think>\n```text\nhello\n"""\n````'
+    assert llm_bench.strip_think(text) == text
 
 
 def test_strip_think_is_linear(monkeypatch):
@@ -273,7 +285,7 @@ def test_strip_think_is_linear(monkeypatch):
     reply = "```python\n" + "s = '<think></think>'\n" * 20000 + "```\n"
     start = time.monotonic()
     assert llm_bench.strip_think(reply) == reply
-    assert len(scans) <= 2
+    assert len(scans) <= 3  # a fixed number of scans, whatever the number of tags
     assert time.monotonic() - start < 2
 
 
@@ -530,6 +542,75 @@ def test_list_models_reports_redirect(mock_server, capsys):
 def test_list_models_unreachable(capsys):
     assert llm_bench.list_models("dead", "http://127.0.0.1:9/v1", None) == []
     assert "dead: skipping" in capsys.readouterr().err
+
+
+def test_list_models_drops_duplicates_and_invalid_ids(mock_server, capsys):
+    ids = ["a", 7, "b", "a", None, "x" * (llm_bench.MAX_MODEL_ID_CHARS + 1), "bad\nname", "\ud800", "", "b", "c d"]
+    s = mock_server(models_reply=Reply(body=json.dumps({"data": [{"id": m} for m in ids]}).encode()))
+    assert llm_bench.list_models("m", s.url, None) == ["a", "b", "c d"]  # in order, each once
+    assert (
+        "m: ignoring 6 model ID(s) that aren't printable strings of at most 1000 characters" in capsys.readouterr().err
+    )
+
+
+def test_list_models_skips_a_deeply_nested_reply(mock_server, monkeypatch, capsys):
+    # json.loads raises RecursionError, which isn't a ValueError: it must not escape and end the whole run. Whether
+    # it runs out of stack depends on the machine, so the parse failure is simulated.
+    real = llm_bench.json.loads
+
+    def loads(data, *args, **kwargs):
+        if data[:3] == b"[[[":
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(data, *args, **kwargs)
+
+    monkeypatch.setattr(llm_bench.json, "loads", loads)
+    s = mock_server(models_reply=Reply(body=b"[" * 100000))
+    assert llm_bench.list_models("m", s.url, None) == []
+    assert "nested too deeply" in capsys.readouterr().err
+
+
+def test_read_capped_reads_in_pieces():
+    class Body:
+        def __init__(self, data):
+            self.data, self.reads = data, []
+
+        def read(self, n):
+            self.reads.append(n)
+            piece, self.data = self.data[:n], self.data[n:]
+            return piece
+
+    body = Body(b"x" * 200_000)
+    assert llm_bench.read_capped(body, 150_001) == b"x" * 150_001
+    piece = llm_bench.HTTP_READ_PIECE_BYTES
+    assert body.reads == [piece, piece, 150_001 - 2 * piece]  # never more than one piece per read
+    body = Body(b"short")
+    assert llm_bench.read_capped(body, 100) == b"short"
+    assert body.reads == [100, 95]  # stops at the end of the body
+
+
+def test_http_json_reads_a_chunked_reply(monkeypatch):
+    # One byte per chunk: read in pieces, so http.client never holds the whole capped body as separate chunks.
+    monkeypatch.setattr(llm_bench, "MAX_RESPONSE_BYTES", 1000)
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def serve(data):
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            conn.sendall(b"".join(b"1\r\n%c\r\n" % c for c in data) + b"0\r\n\r\n")
+
+    with srv:
+        url = f"http://127.0.0.1:{srv.getsockname()[1]}/v1/models"
+        for data, want in ((b'{"data": []}', {"data": []}), (b"[" + b"1," * 600 + b"1]", None)):
+            t = threading.Thread(target=serve, args=(data,))
+            t.start()
+            if want is None:
+                with pytest.raises(ValueError, match="exceeds 1000 bytes"):
+                    llm_bench.http_json(url, timeout=5)
+            else:
+                assert llm_bench.http_json(url, timeout=5) == want
+            t.join()
 
 
 def test_print_summary(capsys):
@@ -857,6 +938,80 @@ def test_run_cmd_reports_the_time_limit(fake_sandbox, tmp_path):
     rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=1)
     assert (rc, timed_out) == (1, True)
     assert llm_bench.TIME_LIMIT_MARKER.format(limit=1) in out
+
+
+def test_run_cmd_time_limit_excludes_the_unit_stop(monkeypatch, fake_sandbox, tmp_path):
+    # A test that fails just inside the limit isn't a time-limit kill because stopping the unit took a while.
+    monkeypatch.setattr(llm_bench, "stop_unit", lambda unit, systemctl="systemctl": time.sleep(0.8))
+    fake_sandbox("import time, sys; time.sleep(0.4); sys.exit(1)")
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=1)
+    assert (rc, timed_out) == (1, False)
+    assert "killed" not in out
+
+
+def test_run_cmd_survives_a_failed_unit_stop(monkeypatch, fake_sandbox, tmp_path, capsys):
+    # A stop that times out is logged; the command's own result stands.
+    def slow_stop(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", slow_stop)
+    fake_sandbox("print('fine')")
+    assert llm_bench.run_cmd(["x"], tmp_path) == (0, "fine\n", False)
+    assert "warning: could not stop sandbox unit llm-bench-" in capsys.readouterr().err
+    assert not llm_bench.ACTIVE_UNITS
+
+
+@pytest.mark.parametrize(("status", "warned"), [(0, False), (5, False), (1, True)])
+def test_stop_unit_reports_a_failed_stop(monkeypatch, capsys, status, warned):
+    # 5: the unit is already gone (normal: --collect removes it once its command exits).
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, status, b"", b"Failed to connect to bus")
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", run)
+    llm_bench.stop_unit("u.service")
+    err = capsys.readouterr().err
+    assert ("could not stop sandbox unit u.service: exit status 1: Failed to connect to bus" in err) == warned
+
+
+def test_run_cmd_keeps_the_timeout_when_the_killed_process_hangs(monkeypatch, tmp_path):
+    # A sandbox launcher that outlives its limit and then doesn't die after kill() is still reported as a timeout.
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.killed = False
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("systemd-run", timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    monkeypatch.setattr(llm_bench.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_bench, "sandbox_command", lambda *args: ["x"])
+    monkeypatch.setattr(llm_bench, "stop_unit", lambda unit, systemctl="systemctl": None)
+    monkeypatch.setattr(llm_bench.subprocess, "Popen", Process)
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=1)
+    assert (rc, timed_out) == (-1, True)
+    assert out == "sandbox failed: Command 'systemd-run' timed out after 11 seconds"
+    assert not llm_bench.ACTIVE_UNITS
+
+
+def test_stop_active_units_stops_every_unit_despite_failures(monkeypatch, capsys):
+    stopped = []
+
+    def run(cmd, **kwargs):
+        stopped.append(cmd[-1])
+        if len(stopped) == 1:
+            raise OSError("systemctl gone")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", run)
+    monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u1.service", "u2.service"})
+    llm_bench.stop_active_units()
+    assert sorted(stopped) == ["u1.service", "u2.service"]
+    assert "could not stop sandbox unit" in capsys.readouterr().err
 
 
 def test_run_cmd_reports_a_failed_start(monkeypatch, fake_sandbox, tmp_path):
