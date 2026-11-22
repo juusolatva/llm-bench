@@ -1161,6 +1161,17 @@ def test_print_summary_csv_keeps_formulas_as_text(capsys):
     assert sorted(models) == ["'=HYPERLINK(1)", "'@m"]
 
 
+def test_print_summary_csv_keeps_every_text_cell_and_header_as_text(capsys):
+    rows = [row("=1+1", 1, settings="=x", lang="=py")]  # all from a supplied results file
+    llm_bench.print_summary(rows, fmt="csv")
+    header, record = list(csv.reader(capsys.readouterr().out.splitlines()))
+    assert {"'=py", "'=py_tasks"} <= set(header)
+    assert dict(zip(header, record, strict=True))["settings"] == "'=x"
+    llm_bench.print_summary(rows, fmt="csv", per_task=True)
+    (record,) = csv.DictReader(capsys.readouterr().out.splitlines())
+    assert (record["settings"], record["task"]) == ("'=x", "'=1+1")
+
+
 def test_log_escapes_control_characters(capsys):
     llm_bench.log("server said: \x1b]0;title\x07 \u202eevil\nnext\tline", err=True)
     assert capsys.readouterr().err == "server said: \\x1b]0;title\\x07 \\u202eevil\nnext\tline\n"

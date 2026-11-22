@@ -577,6 +577,19 @@ def test_http_json_stops_a_trickling_reply_at_its_timeout(head):
         assert time.monotonic() - start < 3
 
 
+def test_connection_stops_a_trickling_proxy_reply_at_its_timeout():
+    # Opening an HTTPS tunnel through a proxy reads the proxy's CONNECT reply inside connect(): it's bounded too.
+    srv, _ = harness_drip_server(b"HTTP/1.1 200 Connection established\r\nX-Slow: ", 100, 0.1)
+    with srv:
+        conn = llm_bench.DeadlineHTTPConnection("127.0.0.1", srv.getsockname()[1], timeout=1)
+        conn.set_tunnel("api.example.invalid", 443)
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            conn.connect()
+        assert time.monotonic() - start < 3
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("host", "local"),
     [
@@ -819,6 +832,8 @@ def test_cli_accepts_a_matching_temperature_param(monkeypatch, temperature, para
         ["--temperature", "inf"],
         ["--param", "x=NaN"],
         ["--param", "x=[1, -Infinity]"],
+        ["--param", "temperature=1e400"],  # overflows to infinity
+        ["--param", 'x={"a": [-1e999]}'],
     ],
 )
 def test_cli_rejects_bad_params(monkeypatch, args):
@@ -1186,11 +1201,31 @@ def test_run_cmd_drains_output_beyond_the_cap(fake_sandbox, tmp_path, monkeypatc
     assert out == "z" * 100 + "\n[output limit exceeded]"
 
 
-def test_run_cmd_reports_an_output_read_failure(monkeypatch, fake_sandbox, tmp_path):
-    def failing_read(fd, n):
-        raise OSError(5, "Input/output error")
+def test_output_reader_reports_a_read_failure(tmp_path):
+    class Pipe:  # a directory: reading it fails with EISDIR, like a broken pipe read would fail
+        def __init__(self):
+            self.fd = os.open(tmp_path, os.O_RDONLY)
 
-    monkeypatch.setattr(llm_bench.os, "read", failing_read)
+        def fileno(self):
+            return self.fd
+
+        def close(self):
+            os.close(self.fd)
+
+    pipe = Pipe()
+    reader = llm_bench.OutputReader(pipe, 100)
+    with pytest.raises(OSError, match=r"reading the sandbox's output failed: \[Errno 21\]"):
+        reader.result(timeout=5)
+    pipe.close()
+
+
+def test_run_cmd_reports_an_output_read_failure(monkeypatch, fake_sandbox, tmp_path):
+    # Only the reader fails (patching os.read itself would also break subprocess's own use of it).
+    def failing_result(self, timeout):
+        self.thread.join(timeout)
+        raise OSError("reading the sandbox's output failed: [Errno 5] Input/output error")
+
+    monkeypatch.setattr(llm_bench.OutputReader, "result", failing_result)
     fake_sandbox("print('x')")
     rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
     assert (rc, timed_out) == (-1, False)

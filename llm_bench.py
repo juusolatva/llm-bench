@@ -532,14 +532,37 @@ class DeadlineSocket:
 
 class DeadlineConnection:
     """Mixin for http.client connections: the request's timeout is also one deadline from the start of the
-    connection to the end of the response (status line, headers and body, also of an HTTP error)."""
+    connection to the end of the response (status line, headers and body, also of an HTTP error). While connecting
+    (which can include a proxy's CONNECT reply and a TLS handshake, read in many small waits), a timer shuts the
+    socket down at the deadline; afterwards DeadlineSocket bounds every read."""
 
     def connect(self):
         timeout = self.timeout if isinstance(self.timeout, int | float) else None
-        deadline = time.monotonic() + timeout if timeout else None
-        super().connect()
-        if deadline is not None:
-            self.sock = DeadlineSocket(self.sock, deadline)
+        if not timeout:
+            super().connect()
+            return
+        deadline = time.monotonic() + timeout
+        expired = threading.Event()
+
+        def expire():
+            expired.set()
+            with contextlib.suppress(OSError, AttributeError):  # no socket yet (None), or already closed
+                self.sock.shutdown(socket.SHUT_RDWR)
+
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            super().connect()
+        except OSError:
+            if expired.is_set():
+                raise TimeoutError("timed out") from None
+            raise
+        finally:
+            timer.cancel()
+        if expired.is_set():  # it fired just as the connection was made: the socket is shut down
+            raise TimeoutError("timed out")
+        self.sock = DeadlineSocket(self.sock, deadline)
 
 
 class DeadlineHTTPConnection(DeadlineConnection, http.client.HTTPConnection):
@@ -993,13 +1016,13 @@ class OutputReader:
     blocks on a full pipe and the parent never holds more than `keep` bytes."""
 
     def __init__(self, pipe, keep):
-        self.pipe, self.keep, self.data, self.error = pipe, keep, bytearray(), None
+        self.pipe, self.fd, self.keep, self.data, self.error = pipe, pipe.fileno(), keep, bytearray(), None
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
 
     def _read(self):
         try:
-            while chunk := os.read(self.pipe.fileno(), 65536):
+            while chunk := os.read(self.fd, 65536):
                 if len(self.data) < self.keep:
                     self.data += chunk[: self.keep - len(self.data)]
         except OSError as e:
@@ -2278,15 +2301,15 @@ def markdown_escape(text):
 
 
 def spreadsheet_safe(text):
-    """A text cell for the summary CSV: a leading "'" when it starts with a character spreadsheets read as the start
-    of a formula (=, +, -, @, tab, carriage return), so they show it as text."""
+    """A text cell or header for the summary CSV: a leading "'" when it starts with a character spreadsheets read as
+    the start of a formula (=, +, -, @, tab, carriage return), so they show it as text."""
     return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 def group_label(g, layout):
     """A model in notes and column headers: endpoint/model, plus [settings] when the table has a settings column."""
     label = f"{display_label(g['endpoint'])}/{display_label(g['model'])}"
-    return label + (f" [{g['settings']}]" if layout["show_settings"] else "")
+    return label + (f" [{display_label(g['settings'])}]" if layout["show_settings"] else "")
 
 
 def score_cell(value, var, n, repeated):
@@ -2303,9 +2326,8 @@ def lang_cell(lang_counts, repeated):
 def summary_row(g, layout):
     """One model's row of the summary table as display strings."""
     repeated = layout["repeated"]
-    cells = [display_label(g["endpoint"]), display_label(g["model"])] + (
-        [g["settings"]] if layout["show_settings"] else []
-    )
+    cells = [display_label(g["endpoint"]), display_label(g["model"])]
+    cells += [display_label(g["settings"])] if layout["show_settings"] else []
     if repeated:
         lo, hi = min(g["trials"]), max(g["trials"])
         cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
@@ -2324,7 +2346,7 @@ def summary_cells(groups, layout):
     header = (
         text
         + (["rounds"] if layout["repeated"] else [])
-        + ["pass@1", "passed", *layout["langs"], "prompt_tok", "compl_tok"]
+        + ["pass@1", "passed", *map(display_label, layout["langs"]), "prompt_tok", "compl_tok"]
         + (["reason_tok"] if layout["reasoning"] else [])
         + ["sec", "tok/s", "load"]
     )
@@ -2345,7 +2367,7 @@ def summary_records(groups, layout):
         rec = {
             "endpoint": spreadsheet_safe(g["endpoint"]),
             "model": spreadsheet_safe(g["model"]),
-            "settings": g["settings"],
+            "settings": spreadsheet_safe(g["settings"]),
             "tasks": g["n"],
             "rounds_min": min(g["trials"]),
             "rounds_max": max(g["trials"]),
@@ -2356,7 +2378,7 @@ def summary_records(groups, layout):
         }
         for lang in layout["langs"]:
             passed, n = g["langs"].get(lang, (None, 0))  # .get: langs is a defaultdict
-            rec[lang], rec[f"{lang}_tasks"] = num(passed, 3), n
+            rec[spreadsheet_safe(lang)], rec[spreadsheet_safe(f"{lang}_tasks")] = num(passed, 3), n
         rec |= {
             "prompt_tokens": num(g["pt"], 1),
             "completion_tokens": num(g["ct"], 1),
@@ -2379,7 +2401,7 @@ def per_task_cells(groups, layout):
     """The task x model table as display strings: passes/trials per task and model, "-" without trials."""
     header = ["task"] + [group_label(g, layout) for g in groups]
     body = [
-        [task]
+        [display_label(task)]
         + [
             f"{g['per_task'][task]['passed']}/{g['per_task'][task]['trials']}" if task in g["per_task"] else "-"
             for g in groups
@@ -2395,8 +2417,8 @@ def per_task_records(groups):
         {
             "endpoint": spreadsheet_safe(g["endpoint"]),
             "model": spreadsheet_safe(g["model"]),
-            "settings": g["settings"],
-            "task": task,
+            "settings": spreadsheet_safe(g["settings"]),
+            "task": spreadsheet_safe(task),
             **g["per_task"][task],
         }
         for g in groups
@@ -2509,14 +2531,22 @@ def reject_constant(name):
     raise argparse.ArgumentTypeError(f"{name} isn't valid JSON (use a finite number or a string)")
 
 
+def finite_json_float(text):
+    """json.loads parse_float hook: a number too large for a float (1e400) would be sent as Infinity."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"{text} is too large (use a finite number or a string)")
+    return number
+
+
 def parse_param(spec):
     """KEY=VALUE -> (key, value); VALUE is parsed as JSON if possible (numbers, true/false, lists), else a string.
-    NaN and Infinity are refused: they would make the request invalid JSON."""
+    NaN, Infinity and numbers that overflow to it are refused: they would make the request invalid JSON."""
     key, sep, value = spec.partition("=")
     if not sep or not key:
         raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {spec!r}")
     try:
-        return key, json.loads(value, parse_constant=reject_constant)
+        return key, json.loads(value, parse_constant=reject_constant, parse_float=finite_json_float)
     except json.JSONDecodeError:
         return key, value
 
