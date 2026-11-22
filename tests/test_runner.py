@@ -355,6 +355,26 @@ def test_context_check_unchecked_without_full_size_count(mock_server, tmp_path, 
     assert "no token usage for the" in capsys.readouterr().err
 
 
+def test_context_check_ok_when_the_short_prompt_already_fills_the_need(mock_server, tmp_path):
+    # A server whose own prompt makes even the warm-up need more tokens than required: no filler prompt to build.
+    need = llm_bench.context_needed(opts())
+    s = mock_server(replies=[""], probe_reply=[probe_usage(need + 5)])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == "ok"
+    assert len(s.probes) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"), [(Reply(close=True), "disconnected"), (Reply(body=b"{"), "bad_response")]
+)
+def test_context_check_unchecked_when_the_full_size_prompt_fails(mock_server, tmp_path, capsys, failure, error):
+    # Only an HTTP error is the server rejecting the prompt; a dropped connection or a bad reply says nothing.
+    s = mock_server(replies=[""], probe_reply=[probe_usage(10), probe_usage(2010), failure])
+    (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1])
+    assert row["context"] == "unchecked"
+    assert f"failed: {error})" in capsys.readouterr().err
+
+
 def test_context_check_disabled(mock_server, tmp_path):
     s = mock_server(replies=[""], context=500)
     (row,) = run_endpoint(s, tmp_path, tasks=TASKS[:1], context_check=False)
@@ -517,6 +537,91 @@ def test_stop_active_hooks_kills_a_running_command():
     llm_bench.stop_active_hooks()
     t.join(10)
     assert errors == ["m/a: --before-model failed (killed by signal 9)"]
+    assert not llm_bench.ACTIVE_HOOKS
+
+
+def test_interrupted_attempt_is_not_recorded(mock_server, tmp_path, monkeypatch):
+    # Ctrl-C stops the sandbox mid-test: that failure says nothing about the solution, so the trial gets no row
+    # (--resume runs it later) instead of a failed one.
+    s, stop = mock_server(replies=["```python\nx = 1\n```"]), threading.Event()
+
+    def check_reply(task, text, adir):
+        stop.set()  # as if Ctrl-C arrived while the attempt was being built and tested
+        return False, "test", "python3 test_solution.py", "Terminated"
+
+    monkeypatch.setattr(llm_bench, "check_reply", check_reply)
+    rows = []
+    llm_bench.run_endpoint(
+        "m", s.url, ["test/model"], TASKS[:1], opts(), tmp_path / "results.csv", tmp_path / "runs", rows, stop
+    )
+    assert rows == []
+    assert llm_bench.read_results(tmp_path / "results.csv") == []
+
+
+@pytest.mark.parametrize(
+    ("resume", "rows", "want"),
+    [
+        (False, [("go_t", "stop")], True),  # without --resume every trial runs
+        (True, [], True),
+        (True, [("go_t", "stop")], False),  # finished
+        (True, [("go_t", "http_500")], True),  # run again
+        (True, [("py_t", "stop")], True),
+    ],
+)
+def test_go_trials_left(tmp_path, resume, rows, want):
+    csv_path = tmp_path / "results_e.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=llm_bench.FIELDS, restval="")
+        w.writeheader()
+        for task, finish in rows:
+            w.writerow(
+                {
+                    "endpoint": "e",
+                    "model": "m",
+                    "task": task,
+                    "lang": "go",
+                    "passed": 1,
+                    "passed_on": 1,
+                    "finish_reason": finish,
+                    "config": "cfg",
+                }
+            )
+    tasks = [{"name": "go_t", "lang": "go", "config": "cfg"}, {"name": "py_t", "lang": "python", "config": "cfg"}]
+    args = SimpleNamespace(resume=resume, repeat=1)
+    assert llm_bench.go_trials_left(args, {"e": ["m"]}, tasks, {"e": (csv_path, tmp_path / "runs")}) is want
+    assert llm_bench.go_trials_left(args, {"e": ["m"]}, tasks[1:], {"e": (csv_path, tmp_path / "runs")}) is False
+
+
+def test_output_paths_creates_private_directories(tmp_path):
+    # New output and transcript directories are the owner's alone; an existing directory keeps its mode.
+    args = SimpleNamespace(output_dir=tmp_path / "new" / "out", tag=None)
+    ((csv_path, runs_dir),) = llm_bench.output_paths(args, {"e": ["m"]}).values()
+    for d in (tmp_path / "new", tmp_path / "new" / "out", tmp_path / "new" / "out" / "runs"):
+        assert d.stat().st_mode & 0o077 == 0, d
+    assert (csv_path, runs_dir) == (args.output_dir / "results_e.csv", args.output_dir / "runs" / "e")
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    llm_bench.output_paths(SimpleNamespace(output_dir=shared, tag="t"), {"e": ["m"]})
+    assert shared.stat().st_mode & 0o777 == 0o755
+    assert (shared / "runs").stat().st_mode & 0o077 == 0
+
+
+def test_before_model_cleans_up_after_an_unexpected_error(monkeypatch):
+    # An error while waiting (e.g. from poll) must still kill the command's process group, reap it and close its output.
+    procs = []
+
+    def failing_read(fd, tail, timeout):
+        procs.extend(llm_bench.ACTIVE_HOOKS)
+        raise ValueError("boom")
+
+    monkeypatch.setattr(llm_bench, "read_some", failing_read)
+    cmd, stop = python_cmd("import time; time.sleep(30)"), threading.Event()
+    with pytest.raises(ValueError, match="boom"):
+        llm_bench.run_before_model("m/a", cmd, {}, stop)
+    (proc,) = procs
+    assert proc.returncode is not None  # killed and reaped, not left running
+    assert proc.stdout.closed
     assert not llm_bench.ACTIVE_HOOKS
 
 
@@ -1028,6 +1133,51 @@ def test_print_summary_markdown_escapes_pipes(capsys):
     assert "| org\\|model |" in capsys.readouterr().out
 
 
+def test_print_summary_markdown_renders_names_as_written(capsys):
+    # A model name from a results file can't add links, images or HTML to a summary pasted into a README.
+    name = "![x](https://e.invalid/p.png)<img src=x>[link](u)"
+    llm_bench.print_summary(
+        [row("py_a", 1, model=name, context="short:4000"), row("py_b", 1, model="other")], fmt="markdown"
+    )
+    out = capsys.readouterr().out
+    escaped = "\\!\\[x\\]\\(https://e.invalid/p.png\\)\\<img src=x\\>\\[link\\]\\(u\\)"
+    assert f"| e | {escaped} |" in out
+    assert f"e/{escaped} (missing py_b)" in out  # the notes too
+    assert "](" not in out.replace("\\](", "")
+
+
+def test_print_summary_table_escapes_and_caps_names(capsys):
+    # Terminal control sequences are shown, not run, and one huge name doesn't widen every row.
+    llm_bench.print_summary([row("py_a", 1, model="evil\x1b[2J" + "x" * 5000), row("py_a", 1, model="m2")])
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "evil\\x1b[2J" in out
+    assert max(len(line) for line in out.splitlines()) < 200
+    assert "…" in out
+
+
+def test_print_summary_csv_keeps_formulas_as_text(capsys):
+    llm_bench.print_summary([row("py_a", 1, model="=HYPERLINK(1)"), row("py_a", 1, model="@m")], fmt="csv")
+    models = [r["model"] for r in csv.DictReader(capsys.readouterr().out.splitlines())]
+    assert sorted(models) == ["'=HYPERLINK(1)", "'@m"]
+
+
+def test_print_summary_csv_keeps_every_text_cell_and_header_as_text(capsys):
+    rows = [row("=1+1", 1, settings="=x", lang="=py")]  # all from a supplied results file
+    llm_bench.print_summary(rows, fmt="csv")
+    header, record = list(csv.reader(capsys.readouterr().out.splitlines()))
+    assert {"'=py", "'=py_tasks"} <= set(header)
+    assert dict(zip(header, record, strict=True))["settings"] == "'=x"
+    llm_bench.print_summary(rows, fmt="csv", per_task=True)
+    (record,) = csv.DictReader(capsys.readouterr().out.splitlines())
+    assert (record["settings"], record["task"]) == ("'=x", "'=1+1")
+
+
+def test_log_escapes_control_characters(capsys):
+    llm_bench.log("server said: \x1b]0;title\x07 \u202eevil\nnext\tline", err=True)
+    assert capsys.readouterr().err == "server said: \\x1b]0;title\\x07 \\u202eevil\nnext\tline\n"
+
+
 def test_print_summary_csv(capsys):
     rows = [
         row("go_b", 0, lang="go", completion_tokens=900, seconds=2.0, config="old"),  # left out
@@ -1130,7 +1280,7 @@ def test_check_results_file_refuses_upgrade_of_rows_with_extra_cells(tmp_path):
     path = tmp_path / "results.csv"
     write_old_results(path, ["endpoint", "model", "task", "lang", "passed", "passed_on"], "e,m,py_a,python,1,1,extra")
     before = path.read_text()
-    with pytest.raises(SystemExit, match="cannot upgrade"):
+    with pytest.raises(SystemExit, match=r"cannot read .*results\.csv: line 2 has more cells than the header$"):
         llm_bench.check_results_file(path)
     assert path.read_text() == before
     assert list(tmp_path.iterdir()) == [path]  # temp file removed
@@ -1184,6 +1334,21 @@ def test_upgrade_keeps_file_permissions(tmp_path):
     llm_bench.check_results_file(path)
     assert path.read_text().splitlines()[0] == ",".join(llm_bench.FIELDS)
     assert path.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (",".join(llm_bench.FIELDS) + "\ne,m\n", "line 2 has fewer cells than the header"),  # current columns too
+        ("model\n", "not a results file"),  # no rows, but its columns are a subset of FIELDS: no upgrade
+    ],
+)
+def test_check_results_file_refuses_malformed_files(tmp_path, content, message):
+    path = tmp_path / "results.csv"
+    path.write_text(content)
+    with pytest.raises(SystemExit, match=message):
+        llm_bench.check_results_file(path)
+    assert path.read_text() == content
 
 
 def test_check_results_file_refuses_upgrade_of_short_rows(tmp_path):

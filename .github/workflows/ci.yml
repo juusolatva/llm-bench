@@ -64,7 +64,7 @@ jobs:
           echo /usr/lib/go/bin >> "$GITHUB_PATH"
       - run: go version && readlink -f "$(command -v go)"
       # Coverage for the quality gate, from the same tests as the test job.
-      - run: uv run --locked --no-build --group dev coverage run -m pytest -q
+      - run: uv run --locked --no-build --group dev coverage run -m pytest -q -rs
       - run: uv run --locked --no-build --group dev coverage xml
       - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9  # v8.3.0
         env:

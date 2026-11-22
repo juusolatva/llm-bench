@@ -19,6 +19,8 @@ import contextlib
 import csv
 import hashlib
 import http.client
+import io
+import ipaddress
 import json
 import math
 import os
@@ -28,6 +30,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -365,10 +368,10 @@ def _load_task(taskdir, lang, seen):
     if name in seen:
         raise ValueError(f"duplicate task {name}: {seen[name]} and {taskdir}")
     seen[name] = taskdir
-    prompt = prompt_file.read_text().strip()
+    prompt = prompt_file.read_text(encoding="utf-8").strip()
     if not prompt:
         raise ValueError(f"{prompt_file}: empty prompt")
-    return {"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text()}
+    return {"name": name, "lang": lang, "prompt": prompt, "test": test_file.read_text(encoding="utf-8")}
 
 
 def load_tasks(roots):
@@ -463,11 +466,21 @@ def model_dirs(models):
 PRINT_LOCK = threading.Lock()
 
 
+def printable(text, keep="\n\t"):
+    """text with each character that isn't printable (control characters such as terminal escape sequences,
+    invisible or direction-changing ones, lone surrogates) shown as a Python escape (\\x1b, \\u202e), apart from
+    those in keep. Server text (model IDs, error replies) goes through it before reaching the terminal."""
+    if "".join(c for c in text if c not in keep).isprintable():
+        return text
+    return "".join(c if c.isprintable() or c in keep else repr(c)[1:-1] for c in text)
+
+
 def log(msg, err=False):
-    """Thread-safe line output (one write per line, so lines from different endpoints never interleave)."""
+    """Thread-safe line output (one write per line, so lines from different endpoints never interleave). Characters
+    that aren't printable, apart from newlines and tabs, are escaped (printable)."""
     with PRINT_LOCK:
         f = sys.stderr if err else sys.stdout
-        f.write(msg + "\n")
+        f.write(printable(msg) + "\n")
         f.flush()
 
 
@@ -483,7 +496,114 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
-HTTP_OPENER = urllib.request.build_opener(NoRedirects)
+TIMED_OUT = "timed out"  # the message of the TimeoutError a socket raises for a wait that takes too long
+
+
+class DeadlineSocketIO(socket.SocketIO):
+    """A socket reader that stops at a deadline: each read waits at most until then (and at most the socket's own
+    timeout), so a server that keeps sending a little at a time can't stretch a request past its timeout, which
+    the socket timeout alone limits only per wait."""
+
+    def __init__(self, sock, deadline):
+        super().__init__(sock, "rb")
+        self._deadline, self._wait = deadline, sock.gettimeout()
+
+    def readinto(self, b):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(TIMED_OUT)
+        self._sock.settimeout(min(remaining, self._wait) if self._wait else remaining)
+        return super().readinto(b)
+
+
+class DeadlineSocket:
+    """A connected socket whose binary reader (what http.client reads the status line, headers and body from) is a
+    DeadlineSocketIO; everything else goes to the socket itself."""
+
+    def __init__(self, sock, deadline):
+        self._sock, self._deadline = sock, deadline
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+    def makefile(self, mode="r", buffering=None, **kwargs):
+        if mode != "rb":
+            return self._sock.makefile(mode, buffering, **kwargs)
+        self._sock._io_refs += 1  # as socket.makefile does; the reader's close() releases it
+        return io.BufferedReader(DeadlineSocketIO(self._sock, self._deadline), io.DEFAULT_BUFFER_SIZE)
+
+
+class DeadlineConnection:
+    """Mixin for http.client connections: the request's timeout is also one deadline from the start of the
+    connection to the end of the response (status line, headers and body, also of an HTTP error). While connecting
+    (which can include a proxy's CONNECT reply and a TLS handshake, read in many small waits), a timer shuts the
+    socket down at the deadline; afterwards DeadlineSocket bounds every read."""
+
+    def connect(self):
+        timeout = self.timeout if isinstance(self.timeout, int | float) else None
+        if not timeout:
+            super().connect()
+            return
+        deadline = time.monotonic() + timeout
+        expired = threading.Event()
+
+        def expire():
+            expired.set()
+            with contextlib.suppress(OSError, AttributeError):  # no socket yet (None), or already closed
+                self.sock.shutdown(socket.SHUT_RDWR)
+
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            super().connect()
+        except OSError:
+            if expired.is_set():
+                raise TimeoutError(TIMED_OUT) from None
+            raise
+        finally:
+            timer.cancel()
+        if expired.is_set():  # it fired just as the connection was made: the socket is shut down
+            raise TimeoutError(TIMED_OUT)
+        self.sock = DeadlineSocket(self.sock, deadline)
+
+
+class DeadlineHTTPConnection(DeadlineConnection, http.client.HTTPConnection):
+    pass
+
+
+class DeadlineHTTPSConnection(DeadlineConnection, http.client.HTTPSConnection):
+    pass
+
+
+class DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(DeadlineHTTPConnection, req)
+
+
+class DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(DeadlineHTTPSConnection, req, context=self._context)
+
+
+HTTP_HANDLERS = (NoRedirects, DeadlineHTTPHandler, DeadlineHTTPSHandler)
+HTTP_OPENER = urllib.request.build_opener(*HTTP_HANDLERS)  # uses proxies from the environment (HTTP_PROXY, ...)
+LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), *HTTP_HANDLERS)  # no proxy
+# Host name endings of the local network, whose servers a proxy usually can't reach.
+LOCAL_DOMAINS = (".localhost", ".local", ".lan", ".internal", ".home.arpa")
+
+
+def is_local_host(host):
+    """Whether host is this machine or on the local network: a loopback, private or link-local address, localhost,
+    a name without a dot (gpu-box) or one under LOCAL_DOMAINS. Requests to these skip proxies."""
+    host = (host or "").lower().rstrip(".")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "." not in host or host == "localhost" or host.endswith(LOCAL_DOMAINS)
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
 HTTP_READ_PIECE_BYTES = 64 * 1024
 
 
@@ -499,15 +619,18 @@ def read_capped(r, limit):
 
 def http_json(url, payload=None, timeout=60, api_key=None):
     """GET url (or POST payload as JSON) and return the decoded JSON reply. Raises ValueError if the reply
-    exceeds MAX_RESPONSE_BYTES or isn't JSON, and urllib/http.client errors on HTTP or connection failures
-    (urllib.error.HTTPError for a redirect, which is never followed)."""
+    exceeds MAX_RESPONSE_BYTES or isn't JSON, TimeoutError if the reply isn't complete within timeout seconds of
+    connecting (DeadlineConnection), and urllib/http.client errors on HTTP or connection failures
+    (urllib.error.HTTPError for a redirect, which is never followed). Requests to local hosts (is_local_host) skip
+    proxies set in the environment."""
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with HTTP_OPENER.open(req, timeout=timeout) as r:
+        opener = LOCAL_HTTP_OPENER if is_local_host(urllib.parse.urlsplit(url).hostname) else HTTP_OPENER
+        with opener.open(req, timeout=timeout) as r:
             # Read one byte past the cap so oversized bodies are caught regardless of Content-Length.
             body = read_capped(r, MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as e:
@@ -564,15 +687,21 @@ def default_model_filter(model_id):
 
 
 def parse_endpoint(spec):
-    """'[NAME=]URL' -> (name, base URL). A missing scheme becomes http://, a missing path /v1."""
+    """'[NAME=]URL' -> (name, base URL). A missing scheme becomes http://, a missing path /v1. The text before the
+    first "=" is a NAME only if it has no ":" or "?" (so an "=" in a URL's query doesn't make one)."""
     name, sep, url = spec.partition("=")
-    if not sep or "://" in name:
+    if not sep or re.search(r"[:?]", name):
         name, url = "", spec
     if "://" not in url:
         url = "http://" + url
     parts = urllib.parse.urlsplit(url)
+    error = f"invalid endpoint {spec!r}: expected [NAME=]http(s)://HOST[:PORT][/PATH]"
+    try:
+        parts.port  # noqa: B018 -- raises ValueError for a port that isn't a number from 0 to 65535
+    except ValueError:
+        raise ValueError(error) from None
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ValueError(f"invalid endpoint {spec!r}: expected [NAME=]http(s)://HOST[:PORT][/PATH]")
+        raise ValueError(error)
     path = parts.path.rstrip("/") or "/v1"
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     if not name:
@@ -715,6 +844,8 @@ class CmdResult(NamedTuple):
 TIME_LIMIT_MARKER = "[killed: exceeded the {limit} s time limit for building and testing]"
 ACTIVE_UNITS = set()  # systemd units of running sandboxes, stopped on interrupt
 ACTIVE_UNITS_LOCK = threading.Lock()
+SANDBOXES_STOPPED = threading.Event()  # set on Ctrl-C: run_cmd starts no new sandbox
+STOP_UNITS_TIMEOUT_S = 10  # how long stop_active_units keeps stopping units that are still starting
 
 
 SYSTEMCTL_NOT_LOADED = 5  # systemctl's exit status for a unit that is already gone (--collect removes it on exit)
@@ -741,11 +872,23 @@ def stop_unit(unit, systemctl="systemctl"):
 
 
 def stop_active_units():
-    """Stop the transient systemd units of sandboxes that are still running (on Ctrl-C)."""
+    """On Ctrl-C: let no new sandbox start, then stop the transient systemd units of the running ones until each
+    run_cmd has seen its unit end. A unit whose systemd-run was just starting may not exist yet when the first stop
+    reaches it ("not loaded"), so the stop repeats until the unit is gone or STOP_UNITS_TIMEOUT_S passes."""
     with ACTIVE_UNITS_LOCK:
-        units = list(ACTIVE_UNITS)
-    for unit in units:
-        stop_unit(unit)
+        SANDBOXES_STOPPED.set()
+    deadline = time.monotonic() + STOP_UNITS_TIMEOUT_S
+    while True:
+        with ACTIVE_UNITS_LOCK:
+            units = list(ACTIVE_UNITS)
+        if not units:
+            return
+        if time.monotonic() > deadline:
+            log(f"warning: {len(units)} sandbox unit(s) still running; their time limit will end them", err=True)
+            return
+        for unit in units:
+            stop_unit(unit)
+        time.sleep(0.2)
 
 
 # Host directories every sandbox sees read-only (sandbox_command), so the only places a system tool may live.
@@ -756,11 +899,16 @@ def sandbox_path_dirs():
     """The sandbox's PATH, apart from the Rust toolchain (/opt/rust/bin, mounted from RUST_SYSROOT) and Node with
     tsc (/opt/node/bin, from NODE_BIN and TS_PACKAGE): the host PATH entries under /usr, such as /usr/local/go/bin,
     then /usr/bin and /bin. Home, project and relative entries are left out because the sandbox doesn't expose
-    them."""
+    them, and so are entries that only reach /usr through a symlink (the sandbox would see the link's own path, which
+    it doesn't mount) and entries under /usr that resolve to a directory the sandbox doesn't mount. No duplicates."""
     system_path = [
-        path for path in os.get_exec_path() if Path(path).is_absolute() and Path(path).resolve().is_relative_to("/usr")
+        path
+        for path in os.get_exec_path()
+        if Path(path).is_absolute()
+        and Path(path).is_relative_to("/usr")
+        and any(Path(path).resolve().is_relative_to(d) for d in SANDBOX_SYSTEM_DIRS)
     ]
-    return [*system_path, "/usr/bin", "/bin"]
+    return list(dict.fromkeys([*system_path, "/usr/bin", "/bin"]))
 
 
 def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
@@ -866,16 +1014,48 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
     return command
 
 
-def run_unit(command, output, timeout, systemctl, unit):
-    """Start the sandbox command with its output going to the file output, wait for it and stop its unit.
-    Returns (exit status, seconds until it exited), the time taken before the unit is stopped, so a slow stop
-    can't turn a normal exit into a time-limit kill. Raises OSError if it can't start and
-    subprocess.TimeoutExpired if it doesn't exit within timeout + 10 s (systemd should end it at timeout)."""
+class OutputReader:
+    """Reads a pipe to its end in a thread, keeping its first `keep` bytes and dropping the rest, so the writer never
+    blocks on a full pipe and the parent never holds more than `keep` bytes."""
+
+    def __init__(self, pipe, keep):
+        self.pipe, self.fd, self.keep, self.data, self.error = pipe, pipe.fileno(), keep, bytearray(), None
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while chunk := os.read(self.fd, 65536):
+                if len(self.data) < self.keep:
+                    self.data += chunk[: self.keep - len(self.data)]
+        except OSError as e:
+            self.error = e
+
+    def result(self, timeout):
+        """The kept bytes once the pipe has ended (or after timeout s: what was read by then). Raises OSError if
+        reading failed."""
+        self.thread.join(timeout)
+        if self.error:
+            raise OSError(f"reading the sandbox's output failed: {self.error}")
+        if not self.thread.is_alive():
+            self.pipe.close()
+        return bytes(self.data)
+
+
+def run_unit(command, timeout, systemctl, unit):
+    """Start the sandbox command, wait for it, stop its unit and collect its output (stdout and stderr). Returns
+    (exit status, seconds until it exited, the first MAX_OUTPUT_BYTES + 1 bytes of output); the time is taken
+    before the unit is stopped, so a slow stop can't turn a normal exit into a time-limit kill. The output comes
+    through a pipe the parent alone reads: the sandbox holds only its write end, so nothing it does to its stdout
+    (file status flags such as O_DIRECT or O_NONBLOCK) affects the parent's reads. Raises OSError if it can't start
+    or its output can't be read, and subprocess.TimeoutExpired if it doesn't exit within timeout + 10 s (systemd
+    should end it at timeout)."""
     t0 = time.monotonic()
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    reader = OutputReader(process.stdout, MAX_OUTPUT_BYTES + 1)
     try:
         rc = process.wait(timeout=timeout + 10)
-        return rc, time.monotonic() - t0
+        elapsed = time.monotonic() - t0
     finally:
         stop_unit(unit, systemctl)  # also kills detached descendants after a normal exit or an interruption
         if process.poll() is None:
@@ -883,6 +1063,7 @@ def run_unit(command, output, timeout, systemctl, unit):
             # A process that doesn't die (uninterruptible sleep) must not replace the exception being raised.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=5)
+    return rc, elapsed, reader.result(timeout=5)  # stopping the unit ended every writer of the pipe
 
 
 def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
@@ -896,22 +1077,19 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
         return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
     unit = f"llm-bench-{uuid.uuid4().hex}.service"
     command = sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw)
-    # A regular file plus hard LimitFSIZE bounds output without an unbounded
-    # communicate() buffer. Read only a bounded prefix back into the parent.
-    with tempfile.TemporaryFile() as output:
-        with ACTIVE_UNITS_LOCK:
-            ACTIVE_UNITS.add(unit)
-        try:
-            rc, elapsed = run_unit(command, output, timeout, tools["systemctl"], unit)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
-        finally:
-            with ACTIVE_UNITS_LOCK:  # also when the unit never started (Popen failed)
-                ACTIVE_UNITS.discard(unit)
-        # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
-        timed_out = rc != 0 and elapsed >= timeout
-        output.seek(0)
-        data = output.read(MAX_OUTPUT_BYTES + 1)
+    with ACTIVE_UNITS_LOCK:  # the same lock as stop_active_units: no sandbox starts after it began
+        if SANDBOXES_STOPPED.is_set():
+            return CmdResult(-1, "interrupted: no new sandbox starts", False)
+        ACTIVE_UNITS.add(unit)
+    try:
+        rc, elapsed, data = run_unit(command, timeout, tools["systemctl"], unit)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CmdResult(-1, f"sandbox failed: {exc}", isinstance(exc, subprocess.TimeoutExpired))
+    finally:
+        with ACTIVE_UNITS_LOCK:  # also when the unit never started (Popen failed)
+            ACTIVE_UNITS.discard(unit)
+    # systemd kills the unit at RuntimeMaxSec; the exit status alone doesn't say so.
+    timed_out = rc != 0 and elapsed >= timeout
     text = data[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     if len(data) > MAX_OUTPUT_BYTES:
         return CmdResult(-1, text + "\n[output limit exceeded]", False)
@@ -963,8 +1141,8 @@ def prepare_go_cache(directory):
     work.mkdir()
     cache.mkdir()
     for name, content in LANGS["go"].get("extra", {}).items():
-        (work / name).write_text(content)
-    (work / "solution_test.go").write_text(GO_WARM_TEST)
+        (work / name).write_text(content, encoding="utf-8")
+    (work / "solution_test.go").write_text(GO_WARM_TEST, encoding="utf-8")
     log("go: warming the build cache (race-instrumented standard library), this takes a minute...", err=True)
     t0 = time.monotonic()
     warm = run_cmd(
@@ -1042,10 +1220,10 @@ def run_task(task, code, workdir):
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
-    (workdir / lang["sol"]).write_text(code)
-    (workdir / lang["test"]).write_text(task["test"])
+    (workdir / lang["sol"]).write_text(code, encoding="utf-8")
+    (workdir / lang["test"]).write_text(task["test"], encoding="utf-8")
     for name, content in lang.get("extra", {}).items():
-        (workdir / name).write_text(content)
+        (workdir / name).write_text(content, encoding="utf-8")
     rendered = [shlex.join(cmd) for cmd in lang["cmds"]]
     script = []
     for r in rendered:
@@ -1136,7 +1314,7 @@ def resolve_ts_package():
     tsc = Path(shutil.which("tsc")).resolve(strict=True)
     package = tsc.parent.parent
     try:
-        meta = json.loads((package / "package.json").read_text())
+        meta = json.loads((package / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = None
     if tsc.name != "tsc" or tsc.parent.name != "bin" or not isinstance(meta, dict) or meta.get("name") != "typescript":
@@ -1375,8 +1553,8 @@ def check_reply(task, text, adir):
     else:
         adir.mkdir(parents=True)
         passed, run_log, stage, fail_cmd, fail_out = False, "[no code in reply]", "no_code", None, None
-    (adir / "response.md").write_text(text)
-    (adir / "log.txt").write_text(run_log)
+    (adir / "response.md").write_text(text, encoding="utf-8")
+    (adir / "log.txt").write_text(run_log, encoding="utf-8")
     return passed, stage, fail_cmd, fail_out
 
 
@@ -1411,6 +1589,8 @@ def run_one_task(label, base, model, task, taskdir, opts, stop):
             result["finish_reason"], result["fail_stage"] = "oversized", "request"
             break
         passed, stage, fail_cmd, fail_out = check_reply(task, text, taskdir / f"attempt_{attempt}")
+        if stop.is_set():  # Ctrl-C may have stopped its sandbox: the result says nothing about the solution
+            raise Interrupted
         result["fail_stage"] = stage
         if passed:
             result["passed"], result["passed_on"] = 1, attempt
@@ -1458,6 +1638,8 @@ def check_context(label, base, model, opts, stop, base_tokens):
     measure tokens per filler word, then send a prompt of the needed size and compare the prompt tokens
     the server reports. Returns "ok", "short:<reported tokens>", "rejected:<error>" or "unchecked"."""
     need = context_needed(opts)
+    if base_tokens and base_tokens >= need:  # the short prompt alone already took that much context
+        return "ok"
     prefix = "Reply with OK. Ignore the following text.\n\n"
     _, _, usage, error, _ = probe(label, base, model, prefix + filler(CONTEXT_CALIBRATION_WORDS), opts, stop)
     sample_tokens = usage.get("prompt_tokens")
@@ -1493,6 +1675,9 @@ def check_context(label, base, model, opts, stop, base_tokens):
     expected = base_tokens + per_word * words
     log(f"{label}: checking that the context holds {need} tokens...", err=True)
     _, _, usage, error, _ = probe(label, base, model, prefix + filler(words), opts, stop)
+    if error and not error.startswith("http_"):  # no answer to judge (timeout, dropped connection, bad reply)
+        log(f"{label}: warning: can't check the context size (the {need}-token prompt failed: {error})", err=True)
+        return "unchecked"
     if error:
         log(
             f"{label}: warning: the server rejected a {need}-token prompt ({error}); the context is probably "
@@ -1587,7 +1772,9 @@ def hook_exited(proc):
 def read_some(fd, tail, timeout):
     """Wait up to timeout for output on fd and append it to the bytearray tail, keeping only its last
     BEFORE_MODEL_OUTPUT_BYTES. Returns False at EOF."""
-    if not select.select([fd], [], [], timeout)[0]:
+    poller = select.poll()  # not select.select, which fails for descriptors above 1023
+    poller.register(fd, select.POLLIN)
+    if not poller.poll(timeout * 1000):
         return True
     chunk = os.read(fd, 65536)
     tail += chunk
@@ -1602,22 +1789,26 @@ def wait_hook(proc):
     fd, tail, is_open = proc.stdout.fileno(), bytearray(), True
     deadline = time.monotonic() + BEFORE_MODEL_TIMEOUT_S
     timed_out = False
-    while not hook_exited(proc):
-        if time.monotonic() > deadline:
-            timed_out = True
-            break
-        if is_open:
-            is_open = read_some(fd, tail, 0.1)
-        else:
-            time.sleep(0.1)
-    kill_process_group(proc)
-    with ACTIVE_HOOKS_LOCK:
-        ACTIVE_HOOKS.discard(proc)
-    status = proc.wait()
-    grace = time.monotonic() + BEFORE_MODEL_OUTPUT_GRACE_S  # the rest of the output, unless a process that
-    while is_open and time.monotonic() < grace:  # left the group keeps it open
-        is_open = read_some(fd, tail, max(0.0, grace - time.monotonic()))
-    proc.stdout.close()
+    try:
+        while not hook_exited(proc):
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            if is_open:
+                is_open = read_some(fd, tail, 0.1)
+            else:
+                time.sleep(0.1)
+    finally:  # also after an unexpected error: nothing the command started may keep running
+        kill_process_group(proc)
+        with ACTIVE_HOOKS_LOCK:
+            ACTIVE_HOOKS.discard(proc)
+        status = proc.wait()
+        try:
+            grace = time.monotonic() + BEFORE_MODEL_OUTPUT_GRACE_S  # the rest of the output, unless a process
+            while is_open and time.monotonic() < grace:  # that left the group keeps it open
+                is_open = read_some(fd, tail, max(0.0, grace - time.monotonic()))
+        finally:
+            proc.stdout.close()
     if timed_out:
         return tail, f"timed out after {BEFORE_MODEL_TIMEOUT_S}s"
     if status < 0:
@@ -1709,15 +1900,31 @@ def token_count(cell, empty):
     return count if count is not None and count <= MAX_ROW_TOKEN_COUNT else empty
 
 
-def results_row(raw, path):
-    """One results CSV record as a row: numeric fields converted, defaults for columns of newer versions, and
-    an old "backend" column renamed to "endpoint". Raises ValueError if a required column is missing."""
-    row = {k: v for k, v in raw.items() if k is not None}
+# Columns every version of the results file has (an old "backend" column counts as "endpoint").
+RESULT_COLUMNS = {"endpoint", "model", "task", "lang", "passed", "passed_on"}
+
+
+def check_columns(fieldnames):
+    """Raise ValueError unless a results CSV header has RESULT_COLUMNS: also a file without rows must be one."""
+    columns = set(fieldnames or ())
+    if "backend" in columns:
+        columns.add("endpoint")
+    missing = RESULT_COLUMNS - columns
+    if missing:
+        raise ValueError(f"not a results file (missing columns: {', '.join(sorted(missing))})")
+
+
+def results_row(raw, where):
+    """One results CSV record (from csv.DictReader) as a row: numeric fields converted, defaults for columns of
+    newer versions, and an old "backend" column renamed to "endpoint". Raises ValueError for a record with more or
+    fewer cells than the header (where names it in the message)."""
+    if None in raw:  # DictReader's key for cells beyond the header
+        raise ValueError(f"{where} has more cells than the header")
+    if None in raw.values():  # DictReader's value for missing cells
+        raise ValueError(f"{where} has fewer cells than the header")
+    row = dict(raw)
     if "endpoint" not in row and "backend" in row:
         row["endpoint"] = row.pop("backend")
-    missing = {"endpoint", "model", "task", "lang", "passed", "passed_on"} - row.keys()
-    if missing:
-        raise ValueError(f"{path}: not a results file (missing columns: {', '.join(sorted(missing))})")
     for k in INT_FIELDS:
         row[k] = int(row.get(k) or (1 if k == "repeat" else 0))
     for k in FLOAT_FIELDS:
@@ -1734,9 +1941,12 @@ def results_row(raw, path):
 
 def read_results(path):
     """Rows of a results CSV, numeric fields converted. Files from older versions are accepted: missing
-    columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint"."""
-    with open(path, newline="") as f:
-        return [results_row(raw, path) for raw in csv.DictReader(f)]
+    columns get defaults (repeat 1, empty strings) and an old "backend" column is read as "endpoint". Raises
+    ValueError for a file without RESULT_COLUMNS or with a record whose cell count doesn't match the header."""
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        check_columns(reader.fieldnames)
+        return [results_row(raw, f"line {reader.line_num}") for raw in reader]
 
 
 def is_finished(row):
@@ -1855,7 +2065,7 @@ def run_endpoint(name, base, models, tasks, opts, out_path, runs_dir, rows, stop
         existing = [r for r in read_results(out_path) if r["endpoint"] == name]
     new_file = not existing and (not out_path.exists() or out_path.stat().st_size == 0)
     # Rows are written as they complete, so an aborted run keeps every finished trial.
-    with open(out_path, "a", newline="") as f:
+    with open(out_path, "a", newline="", encoding="utf-8") as f:
         run = EndpointRun(name, base, opts, f, out_path, runs_dir, existing, rows, stop)
         if new_file:
             run.w.writeheader()
@@ -2075,9 +2285,34 @@ def summary_layout(groups):
     }
 
 
+MAX_LABEL_CHARS = 60  # longest endpoint or model name shown in summary tables and notes; longer ones end in "…"
+# Characters Markdown would read as markup in a table cell: links, images, HTML, code, emphasis (an "_" only at a word
+# boundary, since GFM ignores it inside words), strikethrough, entities and the cell separator.
+MARKDOWN_SPECIAL_RE = re.compile(r"[\\`*\[\]<>()!|~&]|(?<![0-9A-Za-z])_|_(?![0-9A-Za-z])")
+
+
+def display_label(text):
+    """An endpoint or model name for the summary: characters that aren't printable escaped (printable) and cut to
+    MAX_LABEL_CHARS, so names from results files can't change the terminal or blow up every row's width."""
+    text = printable(text, keep="")
+    return text if len(text) <= MAX_LABEL_CHARS else text[: MAX_LABEL_CHARS - 1] + "…"
+
+
+def markdown_escape(text):
+    """text with each character Markdown would read as markup backslash-escaped, so it renders as written."""
+    return MARKDOWN_SPECIAL_RE.sub(lambda m: "\\" + m.group(), text)
+
+
+def spreadsheet_safe(text):
+    """A text cell or header for the summary CSV: a leading "'" when it starts with a character spreadsheets read as
+    the start of a formula (=, +, -, @, tab, carriage return), so they show it as text."""
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
 def group_label(g, layout):
     """A model in notes and column headers: endpoint/model, plus [settings] when the table has a settings column."""
-    return f"{g['endpoint']}/{g['model']}" + (f" [{g['settings']}]" if layout["show_settings"] else "")
+    label = f"{display_label(g['endpoint'])}/{display_label(g['model'])}"
+    return label + (f" [{display_label(g['settings'])}]" if layout["show_settings"] else "")
 
 
 def score_cell(value, var, n, repeated):
@@ -2094,7 +2329,8 @@ def lang_cell(lang_counts, repeated):
 def summary_row(g, layout):
     """One model's row of the summary table as display strings."""
     repeated = layout["repeated"]
-    cells = [g["endpoint"], g["model"]] + ([g["settings"]] if layout["show_settings"] else [])
+    cells = [display_label(g["endpoint"]), display_label(g["model"])]
+    cells += [display_label(g["settings"])] if layout["show_settings"] else []
     if repeated:
         lo, hi = min(g["trials"]), max(g["trials"])
         cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
@@ -2113,7 +2349,7 @@ def summary_cells(groups, layout):
     header = (
         text
         + (["rounds"] if layout["repeated"] else [])
-        + ["pass@1", "passed", *layout["langs"], "prompt_tok", "compl_tok"]
+        + ["pass@1", "passed", *map(display_label, layout["langs"]), "prompt_tok", "compl_tok"]
         + (["reason_tok"] if layout["reasoning"] else [])
         + ["sec", "tok/s", "load"]
     )
@@ -2132,9 +2368,9 @@ def summary_records(groups, layout):
     records = []
     for g in groups:
         rec = {
-            "endpoint": g["endpoint"],
-            "model": g["model"],
-            "settings": g["settings"],
+            "endpoint": spreadsheet_safe(g["endpoint"]),
+            "model": spreadsheet_safe(g["model"]),
+            "settings": spreadsheet_safe(g["settings"]),
             "tasks": g["n"],
             "rounds_min": min(g["trials"]),
             "rounds_max": max(g["trials"]),
@@ -2145,7 +2381,7 @@ def summary_records(groups, layout):
         }
         for lang in layout["langs"]:
             passed, n = g["langs"].get(lang, (None, 0))  # .get: langs is a defaultdict
-            rec[lang], rec[f"{lang}_tasks"] = num(passed, 3), n
+            rec[spreadsheet_safe(lang)], rec[spreadsheet_safe(f"{lang}_tasks")] = num(passed, 3), n
         rec |= {
             "prompt_tokens": num(g["pt"], 1),
             "completion_tokens": num(g["ct"], 1),
@@ -2168,7 +2404,7 @@ def per_task_cells(groups, layout):
     """The task x model table as display strings: passes/trials per task and model, "-" without trials."""
     header = ["task"] + [group_label(g, layout) for g in groups]
     body = [
-        [task]
+        [display_label(task)]
         + [
             f"{g['per_task'][task]['passed']}/{g['per_task'][task]['trials']}" if task in g["per_task"] else "-"
             for g in groups
@@ -2181,14 +2417,21 @@ def per_task_cells(groups, layout):
 def per_task_records(groups):
     """The task x model table as CSV records in long form: one per model and task."""
     return [
-        {"endpoint": g["endpoint"], "model": g["model"], "settings": g["settings"], "task": task, **g["per_task"][task]}
+        {
+            "endpoint": spreadsheet_safe(g["endpoint"]),
+            "model": spreadsheet_safe(g["model"]),
+            "settings": spreadsheet_safe(g["settings"]),
+            "task": spreadsheet_safe(task),
+            **g["per_task"][task],
+        }
         for g in groups
         for task in task_order([g])
     ]
 
 
-def summary_notes(groups, dropped, layout):
-    """Explanations and warnings to print under the summary."""
+def summary_notes(groups, dropped, layout, escape=str):
+    """Explanations and warnings to print under the summary; escape is applied to the model labels in them (for
+    Markdown)."""
     notes = []
     if layout["repeated"]:
         notes.append(
@@ -2206,13 +2449,15 @@ def summary_notes(groups, dropped, layout):
             f"{retried} row(s) of trials that ended in a request error or were skipped were left out: a later run "
             "(e.g. --resume) ran those trials again"
         )
-    missing = [f"{group_label(g, layout)} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
+    missing = [f"{escape(group_label(g, layout))} (missing {', '.join(tasks)})" for g, tasks in task_set_gaps(groups)]
     if missing:
         notes.append(
             "warning: models with the same settings were scored on different tasks, so their scores "
             f"aren't comparable: {', '.join(missing)}"
         )
-    failed = [f"{group_label(g, layout)} ({g['context']})" for g in groups if g["context"] not in ("ok", "unchecked")]
+    failed = [
+        f"{escape(group_label(g, layout))} ({g['context']})" for g in groups if g["context"] not in ("ok", "unchecked")
+    ]
     if failed:
         notes.append(f"warning: context check failed, results may be cut off: {', '.join(failed)}")
     return notes
@@ -2231,13 +2476,14 @@ def text_table(header, body, text_columns):
 
 
 def markdown_table(header, body, text_columns):
-    """A Markdown (GFM) pipe table: text columns left-aligned, the rest right-aligned."""
+    """A Markdown (GFM) pipe table: text columns left-aligned, the rest right-aligned. The header and the text
+    columns are escaped (markdown_escape), so names render as written; the numbers need no escaping."""
 
-    def line(cells):
-        return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+    def line(cells, text):
+        return "| " + " | ".join(markdown_escape(c) if i < text else c for i, c in enumerate(cells)) + " |"
 
     rule = ["---" if i < text_columns else "---:" for i in range(len(header))]
-    return "\n".join(line(cells) for cells in (header, rule, *body))
+    return "\n".join([line(header, len(header)), line(rule, 0), *(line(cells, text_columns) for cells in body)])
 
 
 def print_summary(rows, fmt="table", per_task=False):
@@ -2250,7 +2496,7 @@ def print_summary(rows, fmt="table", per_task=False):
     groups, dropped = summarize(rows)
     groups.sort(key=lambda g: (-g["pass"], -g["p1"], g["ct"]))
     layout = summary_layout(groups)
-    notes = summary_notes(groups, dropped, layout)
+    notes = summary_notes(groups, dropped, layout, markdown_escape if fmt == "markdown" else str)
     if fmt == "csv":
         records = per_task_records(groups) if per_task else summary_records(groups, layout)
         w = csv.DictWriter(sys.stdout, fieldnames=list(records[0]), lineterminator="\n")
@@ -2267,13 +2513,43 @@ def print_summary(rows, fmt="table", per_task=False):
         print("\n" + render(*per_task_cells(groups, layout)))
 
 
+def finite_float(value):
+    """argparse type: a finite float (JSON has no NaN or infinity)."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {value!r}")
+    return number
+
+
+def same_json_value(a, b):
+    """Whether two request parameter values are the same JSON value: False and 0 (or True and 1) aren't."""
+    numbers = (int, float)
+    if type(a) in numbers and type(b) in numbers:
+        return a == b
+    return type(a) is type(b) and a == b
+
+
+def reject_constant(name):
+    """json.loads parse_constant hook: NaN and Infinity aren't JSON, and a server can't parse them."""
+    raise argparse.ArgumentTypeError(f"{name} isn't valid JSON (use a finite number or a string)")
+
+
+def finite_json_float(text):
+    """json.loads parse_float hook: a number too large for a float (1e400) would be sent as Infinity."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"{text} is too large (use a finite number or a string)")
+    return number
+
+
 def parse_param(spec):
-    """KEY=VALUE -> (key, value); VALUE is parsed as JSON if possible (numbers, true/false, lists), else a string."""
+    """KEY=VALUE -> (key, value); VALUE is parsed as JSON if possible (numbers, true/false, lists), else a string.
+    NaN, Infinity and numbers that overflow to it are refused: they would make the request invalid JSON."""
     key, sep, value = spec.partition("=")
     if not sep or not key:
         raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {spec!r}")
     try:
-        return key, json.loads(value)
+        return key, json.loads(value, parse_constant=reject_constant, parse_float=finite_json_float)
     except json.JSONDecodeError:
         return key, value
 
@@ -2356,7 +2632,11 @@ def parse_args():
         help="load tasks from DIR (same layout as the built-in tasks/ directory) instead of the "
         "built-in tasks. Repeatable; also pass the built-in directory to combine them",
     )
-    ap.add_argument("--api-key", help="bearer token sent to every endpoint")
+    ap.add_argument(
+        "--api-key",
+        help="bearer token sent to every endpoint; other local users can see command-line arguments, so prefer "
+        "LLM_BENCH_API_KEY",
+    )
     ap.add_argument(
         "--timeout",
         type=positive_int,
@@ -2383,7 +2663,7 @@ def parse_args():
     )
     ap.add_argument(
         "--temperature",
-        type=float,
+        type=finite_float,
         metavar="T",
         help="sampling temperature (default: the server's/model's default); same as --param temperature=T",
     )
@@ -2473,7 +2753,9 @@ def parse_args():
     if args.tag:
         args.tag = safe_name(args.tag)
     args.params = dict(args.param)
-    if args.temperature is not None and args.params.get("temperature", args.temperature) != args.temperature:
+    if args.temperature is not None and not same_json_value(
+        args.params.get("temperature", args.temperature), args.temperature
+    ):
         ap.error("--temperature conflicts with --param temperature=...")
     if args.temperature is not None:
         args.params["temperature"] = args.temperature
@@ -2488,7 +2770,7 @@ def check_results_file(path):
     older version whose columns are all still in FIELDS is upgraded: rewritten with empty cells in the new ones."""
     if not path.exists() or path.stat().st_size == 0:
         return
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         header = next(csv.reader(f), [])
     if header != FIELDS and (len(set(header)) != len(header) or not set(header) <= set(FIELDS)):
         sys.exit(
@@ -2512,15 +2794,10 @@ def upgrade_results_file(path):
     error the old file is left as it was."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".upgrade")
     try:
-        with os.fdopen(fd, "w", newline="") as dst, open(path, newline="") as src:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as dst, open(path, newline="", encoding="utf-8") as src:
             w = csv.DictWriter(dst, fieldnames=FIELDS, restval="")
             w.writeheader()
-            for line, row in enumerate(csv.DictReader(src), start=2):
-                if None in row:  # DictReader's key for cells beyond the header
-                    raise ValueError(f"line {line} has more cells than the header")
-                if None in row.values():  # DictReader's value for missing cells
-                    raise ValueError(f"line {line} has fewer cells than the header")
-                w.writerow(row)
+            w.writerows(csv.DictReader(src))  # check_results_file read it first: every row fits the header
         shutil.copymode(path, tmp)  # mkstemp creates the file readable by its owner only
         os.replace(tmp, path)
     except BaseException:
@@ -2531,10 +2808,12 @@ def upgrade_results_file(path):
 
 def show_summary(paths, fmt, per_task):
     """--summary mode: print the summary of the given results files."""
-    try:
-        rows = [r for path in paths for r in read_results(path)]
-    except (OSError, ValueError, csv.Error) as e:  # UnicodeDecodeError is a ValueError
-        sys.exit(f"cannot read results: {e}")
+    rows = []
+    for path in paths:
+        try:
+            rows += read_results(path)
+        except (OSError, ValueError, csv.Error) as e:  # UnicodeDecodeError is a ValueError
+            sys.exit(f"cannot read {path}: {e}")
     print_summary(rows, fmt, per_task)
 
 
@@ -2550,6 +2829,21 @@ def select_tasks(args):
             if not any(fnmatchcase(t["name"], p) for t in all_tasks):
                 log(f"warning: task pattern {p!r} matched no task (see --list-tasks)", err=True)
     return tasks
+
+
+def warn_plaintext_api_key(endpoints, api_key):
+    """Warn about each endpoint the API key would reach over plain HTTP outside the local network (is_local_host),
+    where anyone on the network path can read it."""
+    if not api_key:
+        return
+    for name, base in endpoints.items():
+        parts = urllib.parse.urlsplit(base)
+        if parts.scheme == "http" and not is_local_host(parts.hostname):
+            log(
+                f"warning: {name}: the API key is sent to {parts.hostname} over plain HTTP, readable on the "
+                "network path; use https:// or a tunnel",
+                err=True,
+            )
 
 
 def parse_endpoints(specs):
@@ -2588,9 +2882,22 @@ def plan_models(args, endpoints):
     return plan
 
 
+def make_private_dirs(path):
+    """Create path and its missing parents readable only by their owner (mode 0o700). Directories that already exist
+    keep their permissions, which may share them on purpose."""
+    missing = []
+    while not path.exists():
+        missing.append(path)
+        path = path.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
 def output_paths(args, plan):
-    """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV."""
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    """Map endpoint name -> (results CSV, transcript directory), after checking each existing CSV. The output and
+    transcript directories are created private (make_private_dirs): transcripts hold the harnesses, which may come
+    from a private --tasks-dir, and the replies."""
+    make_private_dirs(args.output_dir / "runs")
     suffix = f"_{args.tag}" if args.tag else ""
     outputs = {
         name: (args.output_dir / f"results_{name}{suffix}.csv", args.output_dir / "runs" / f"{name}{suffix}")
@@ -2603,6 +2910,7 @@ def output_paths(args, plan):
 
 def main():
     """Command-line entry point: print a summary of results files, list tasks, or run the benchmark."""
+    global GO_CACHE
     args = parse_args()
     if args.summary:
         show_summary(args.summary, args.format, args.per_task)
@@ -2615,6 +2923,7 @@ def main():
     if not tasks:
         sys.exit("no tasks selected")
     endpoints = parse_endpoints(args.endpoints)
+    warn_plaintext_api_key(endpoints, args.api_key)
 
     check_toolchains(tasks)
     check_sandbox()
@@ -2636,14 +2945,36 @@ def main():
         )
     outputs = output_paths(args, plan)
     go_tmp = None
-    if any(t["lang"] == "go" for t in tasks):
-        go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
-        prepare_go_cache(go_tmp.name)
     try:
+        if go_trials_left(args, plan, tasks, outputs):
+            go_tmp = tempfile.TemporaryDirectory(prefix="llm-bench-go-")
+            prepare_go_cache(go_tmp.name)
         run_all(args, plan, endpoints, tasks, outputs)
     finally:
+        GO_CACHE = None  # it pointed into go_tmp
         if go_tmp is not None:
             go_tmp.cleanup()
+
+
+def finished_trials(csv_path, endpoint):
+    """Counter of the endpoint's finished trials in a results file per (model, task, config); empty without one."""
+    if not csv_path.exists() or not csv_path.stat().st_size:
+        return Counter()
+    rows = read_results(csv_path)
+    return Counter((r["model"], r["task"], r["config"]) for r in rows if r["endpoint"] == endpoint and is_finished(r))
+
+
+def go_trials_left(args, plan, tasks, outputs):
+    """Whether any Go trial will run: with --resume, one not yet finished in the results file (so a run with nothing
+    left doesn't spend a minute warming the Go build cache)."""
+    go_tasks = [t for t in tasks if t["lang"] == "go"]
+    if not go_tasks or not args.resume:
+        return bool(go_tasks)
+    for name, models in plan.items():
+        finished = finished_trials(outputs[name][0], name)
+        if any(finished[(m, t["name"], t["config"])] < args.repeat for m in models for t in go_tasks):
+            return True
+    return False
 
 
 def run_all(args, plan, endpoints, tasks, outputs):

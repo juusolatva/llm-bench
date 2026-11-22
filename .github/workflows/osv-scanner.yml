@@ -42,7 +42,7 @@ jobs:
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
       # Fork PRs get a read-only token, so only same-repository PRs upload SARIF.
-      upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      upload-sarif: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
       scan-args: |-
         --no-resolve
         -r

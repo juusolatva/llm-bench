@@ -10,6 +10,13 @@ import pytest
 
 import llm_bench
 
+
+@pytest.fixture(autouse=True)
+def fresh_sandbox_stop(monkeypatch):
+    """A test that interrupts a run (stop_active_units) mustn't keep later tests from starting sandboxes."""
+    monkeypatch.setattr(llm_bench, "SANDBOXES_STOPPED", threading.Event())
+
+
 # Transcript directory of MockServer's default model "test/model" ("/" isn't safe, so the name is hashed).
 MODEL_DIR = llm_bench.model_dirs(["test/model"])["test/model"]
 

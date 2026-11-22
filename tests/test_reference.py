@@ -26,8 +26,10 @@ def test_reference_exists(task):
     assert path.read_text().strip()
 
 
-def check_reference(task, tmp_path):
+def check_reference(task, tmp_path, monkeypatch):
     """Run the task's reference solution in the sandbox and expect it to pass (skip without its toolchain)."""
+    for name in ("RUST_SYSROOT", "NODE_BIN", "TS_PACKAGE"):  # check_toolchains sets them; restore them afterwards
+        monkeypatch.setattr(llm_bench, name, getattr(llm_bench, name))
     try:
         llm_bench.check_toolchains([task])
     except SystemExit as exc:
@@ -38,13 +40,13 @@ def check_reference(task, tmp_path):
 
 @pytest.mark.sandbox
 @pytest.mark.parametrize("task", OTHER_TASKS, ids=[t["name"] for t in OTHER_TASKS])
-def test_reference_passes(task, tmp_path):
+def test_reference_passes(task, tmp_path, monkeypatch):
     """The reference solution passes the task's harness in the sandbox."""
-    check_reference(task, tmp_path)
+    check_reference(task, tmp_path, monkeypatch)
 
 
 @pytest.mark.sandbox
 @pytest.mark.parametrize("task", GO_TASKS, ids=[t["name"] for t in GO_TASKS])
-def test_go_reference_passes(task, tmp_path, go_cache):
+def test_go_reference_passes(task, tmp_path, go_cache, monkeypatch):
     """Like test_reference_passes, for Go tasks, which need the warmed build cache."""
-    check_reference(task, tmp_path)
+    check_reference(task, tmp_path, monkeypatch)

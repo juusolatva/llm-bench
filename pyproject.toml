@@ -27,8 +27,8 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM"]
 ignore = ["E501"]
 
 [tool.coverage.run]
-# Coverage of the script for SonarQube Cloud (.github/workflows/sonarqube.yml); relative paths so the scanner
-# can map the report onto the checkout.
+# Coverage of the script for SonarQube Cloud (the sonarqube job in .github/workflows/ci.yml); relative paths so the
+# scanner can map the report onto the checkout.
 include = ["llm_bench.py"]
 relative_files = true
 branch = true

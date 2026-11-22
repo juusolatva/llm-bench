@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.request
 from collections import Counter
 from types import SimpleNamespace
 
@@ -28,13 +30,16 @@ import llm_bench
         ("my box=localhost:8080", ("my_box", "http://localhost:8080/v1")),
         ("http://[::1]:8080", ("__1_8080", "http://[::1]:8080/v1")),
         ("http://host:1/v1?a=b", ("host_1", "http://host:1/v1")),
+        ("localhost:8080/v1?a=b", ("localhost_8080", "http://localhost:8080/v1")),  # "=" in the query: no NAME
     ],
 )
 def test_parse_endpoint(spec, want):
     assert llm_bench.parse_endpoint(spec) == want
 
 
-@pytest.mark.parametrize("spec", ["ftp://host", "http://", "x=", "file:///etc"])
+@pytest.mark.parametrize(
+    "spec", ["ftp://host", "http://", "x=", "file:///etc", "box=http://localhost:abc/v1", "localhost:99999"]
+)
 def test_parse_endpoint_rejects(spec):
     with pytest.raises(ValueError):
         llm_bench.parse_endpoint(spec)
@@ -373,6 +378,13 @@ def test_sandbox_path_dirs_keeps_only_entries_under_usr(monkeypatch):
     assert llm_bench.sandbox_path_dirs() == ["/usr/llm-bench-test/bin", "/usr/bin", "/bin"]
 
 
+def test_sandbox_path_dirs_skips_links_into_usr_and_duplicates(monkeypatch, tmp_path):
+    # A home-directory link to /usr/bin would put a host path the sandbox doesn't mount on its PATH.
+    (tmp_path / "bin-link").symlink_to("/usr/bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(tmp_path / "bin-link"), "/usr/bin", "/usr/local/bin", "/usr/bin"]))
+    assert llm_bench.sandbox_path_dirs() == ["/usr/bin", "/usr/local/bin", "/bin"]
+
+
 BUILTIN_TASKS = llm_bench.load_tasks([llm_bench.DEFAULT_TASKS_DIR])
 
 
@@ -529,6 +541,100 @@ def test_http_json_refuses_redirects(mock_server, status, location, target):
     assert f"; {target.format(base=s.url.removesuffix('/v1'))} not followed (use the final URL" in e.value.reason
     assert e.value.read() == b""
     assert s.gets == ["/v1/models"]
+
+
+def harness_drip_server(head, body_bytes, delay):
+    """A one-request HTTP server that sends head at once, then body_bytes bytes of "x" one every delay seconds."""
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn, contextlib.suppress(OSError):
+            conn.recv(65536)
+            conn.sendall(head)
+            for _ in range(body_bytes):
+                time.sleep(delay)
+                conn.sendall(b"x")
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.getsockname()[1]}/v1/models"
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",  # the body trickles in
+        b"HTTP/1.1 200 OK\r\nX-Slow: ",  # a header trickles in
+    ],
+)
+def test_http_json_stops_a_trickling_reply_at_its_timeout(head):
+    # Each byte comes well within the socket timeout, so only the overall deadline ends the request.
+    srv, url = harness_drip_server(head, 100, 0.1)
+    with srv:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            llm_bench.http_json(url, timeout=1)
+        assert time.monotonic() - start < 3
+
+
+def test_connection_stops_a_trickling_proxy_reply_at_its_timeout():
+    # Opening an HTTPS tunnel through a proxy reads the proxy's CONNECT reply inside connect(): it's bounded too.
+    srv, _ = harness_drip_server(b"HTTP/1.1 200 Connection established\r\nX-Slow: ", 100, 0.1)
+    with srv:
+        conn = llm_bench.DeadlineHTTPConnection("127.0.0.1", srv.getsockname()[1], timeout=1)
+        conn.set_tunnel("api.example.invalid", 443)
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            conn.connect()
+        assert time.monotonic() - start < 3
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("host", "local"),
+    [
+        ("localhost", True),
+        ("127.0.0.1", True),
+        ("::1", True),
+        ("192.168.1.20", True),
+        ("10.0.0.5", True),
+        ("fe80::1", True),
+        ("gpu-box", True),
+        ("gpu-box.lan", True),
+        ("gpu-box.local.", True),
+        ("api.example.com", False),
+        ("8.8.8.8", False),
+        ("2001:4860::8888", False),
+    ],
+)
+def test_is_local_host(host, local):
+    assert llm_bench.is_local_host(host) is local
+
+
+def test_http_json_skips_proxies_only_for_local_hosts(mock_server, monkeypatch):
+    # A proxy from the environment (here a dead one) mustn't break requests to this machine or the LAN.
+    dead_proxy = urllib.request.ProxyHandler({"http": "http://127.0.0.1:9"})
+    monkeypatch.setattr(llm_bench, "HTTP_OPENER", urllib.request.build_opener(dead_proxy, *llm_bench.HTTP_HANDLERS))
+    s = mock_server()
+    assert llm_bench.list_models("m", s.url, None) == ["test/model"]
+    with pytest.raises(urllib.error.URLError, match="Connection refused"):  # went to the proxy, not to DNS
+        llm_bench.http_json("http://api.example.invalid/v1/models", timeout=5)
+
+
+def test_warn_plaintext_api_key(capsys):
+    endpoints = {
+        "lan": "http://192.168.1.20:1234/v1",
+        "remote": "http://api.example.com/v1",
+        "tls": "https://api.example.com/v1",
+    }
+    llm_bench.warn_plaintext_api_key(endpoints, None)
+    assert capsys.readouterr().err == ""
+    llm_bench.warn_plaintext_api_key(endpoints, "sekrit")
+    err = capsys.readouterr().err
+    assert err == (
+        "warning: remote: the API key is sent to api.example.com over plain HTTP, readable on the network path; "
+        "use https:// or a tunnel\n"
+    )
 
 
 def test_list_models_reports_redirect(mock_server, capsys):
@@ -705,6 +811,14 @@ def test_parse_param(spec, want):
     assert llm_bench.parse_param(spec) == want
 
 
+@pytest.mark.parametrize(("temperature", "param"), [("0.5", "0.5"), ("1", "1")])  # 1 and 1.0: the same number
+def test_cli_accepts_a_matching_temperature_param(monkeypatch, temperature, param):
+    monkeypatch.setattr(
+        sys, "argv", ["llm_bench.py", "localhost:1", "--temperature", temperature, "--param", f"temperature={param}"]
+    )
+    assert llm_bench.parse_args().params == {"temperature": float(temperature)}
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -712,6 +826,14 @@ def test_parse_param(spec, want):
         ["--param", "max_tokens=5"],
         ["--param", "model=x"],
         ["--temperature", "0.2", "--param", "temperature=0.5"],
+        ["--temperature", "0", "--param", "temperature=false"],  # False == 0 in Python, not in JSON
+        ["--temperature", "1", "--param", "temperature=true"],
+        ["--temperature", "nan"],  # not JSON: the request would be invalid
+        ["--temperature", "inf"],
+        ["--param", "x=NaN"],
+        ["--param", "x=[1, -Infinity]"],
+        ["--param", "temperature=1e400"],  # overflows to infinity
+        ["--param", 'x={"a": [-1e999]}'],
     ],
 )
 def test_cli_rejects_bad_params(monkeypatch, args):
@@ -752,8 +874,12 @@ def test_cli_summary_mode(monkeypatch, capsys, tmp_path):
 
 
 def test_cli_summary_bad_file(monkeypatch, tmp_path):
-    with pytest.raises(SystemExit, match="cannot read results"):
+    with pytest.raises(SystemExit, match=r"cannot read .*missing\.csv"):
         run_main(monkeypatch, "--summary", str(tmp_path / "missing.csv"))
+    other = tmp_path / "other.csv"
+    other.write_text("foo,bar\n")  # header only: still not a results file
+    with pytest.raises(SystemExit, match=r"cannot read .*other\.csv: not a results file"):
+        run_main(monkeypatch, "--summary", str(other))
 
 
 def test_cli_summary_formats(monkeypatch, capsys, tmp_path):
@@ -978,6 +1104,7 @@ def test_run_cmd_keeps_the_timeout_when_the_killed_process_hangs(monkeypatch, tm
     class Process:
         def __init__(self, *args, **kwargs):
             self.killed = False
+            self.stdout = open(os.devnull, "rb")  # noqa: SIM115 -- run_unit's reader closes it
 
         def wait(self, timeout=None):
             raise subprocess.TimeoutExpired("systemd-run", timeout)
@@ -1001,17 +1128,108 @@ def test_run_cmd_keeps_the_timeout_when_the_killed_process_hangs(monkeypatch, tm
 def test_stop_active_units_stops_every_unit_despite_failures(monkeypatch, capsys):
     stopped = []
 
-    def run(cmd, **kwargs):
+    def run(cmd, **kwargs):  # a stopped unit ends, and its run_cmd removes it from ACTIVE_UNITS
         stopped.append(cmd[-1])
         if len(stopped) == 1:
             raise OSError("systemctl gone")
+        llm_bench.ACTIVE_UNITS.discard(cmd[-1])
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
     monkeypatch.setattr(llm_bench.subprocess, "run", run)
     monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u1.service", "u2.service"})
     llm_bench.stop_active_units()
-    assert sorted(stopped) == ["u1.service", "u2.service"]
+    assert sorted(stopped[:2]) == ["u1.service", "u2.service"]  # the failed one is stopped again in the next round
+    assert not llm_bench.ACTIVE_UNITS
     assert "could not stop sandbox unit" in capsys.readouterr().err
+
+
+def test_stop_active_units_repeats_for_a_unit_that_is_still_starting(monkeypatch):
+    # The first stop reaches a unit before systemd-run created it ("not loaded"); a later one stops it.
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd[-1])
+        if len(calls) >= 3:
+            llm_bench.ACTIVE_UNITS.discard(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0 if len(calls) >= 3 else 5, b"", b"")
+
+    monkeypatch.setattr(llm_bench.subprocess, "run", run)
+    monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u.service"})
+    llm_bench.stop_active_units()
+    assert calls == ["u.service"] * 3
+    assert llm_bench.SANDBOXES_STOPPED.is_set()
+
+
+def test_stop_active_units_gives_up_after_its_timeout(monkeypatch, capsys):
+    monkeypatch.setattr(llm_bench.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 5))
+    monkeypatch.setattr(llm_bench, "ACTIVE_UNITS", {"u.service"})
+    monkeypatch.setattr(llm_bench, "STOP_UNITS_TIMEOUT_S", 0.3)
+    llm_bench.stop_active_units()
+    assert "1 sandbox unit(s) still running; their time limit will end them" in capsys.readouterr().err
+
+
+def test_run_cmd_starts_no_sandbox_after_an_interrupt(monkeypatch, fake_sandbox, tmp_path):
+    llm_bench.SANDBOXES_STOPPED.set()
+    monkeypatch.setattr(llm_bench.subprocess, "Popen", lambda *a, **k: pytest.fail("must not start a sandbox"))
+    assert llm_bench.run_cmd(["x"], tmp_path) == (-1, "interrupted: no new sandbox starts", False)
+    assert not llm_bench.ACTIVE_UNITS
+
+
+def test_run_cmd_output_is_unaffected_by_the_sandbox_changing_its_stdout_flags(fake_sandbox, tmp_path):
+    # The sandbox shares only the pipe's write end: O_NONBLOCK or O_DIRECT on it don't reach the parent's reads.
+    fake_sandbox(
+        "import fcntl, os, sys\n"
+        "flags = fcntl.fcntl(1, fcntl.F_GETFL)\n"
+        "fcntl.fcntl(1, fcntl.F_SETFL, flags | os.O_DIRECT)\n"
+        "os.write(1, b'x' * 3000)\n"
+        "fcntl.fcntl(1, fcntl.F_SETFL, flags | os.O_NONBLOCK)\n"
+        "os.write(1, b'y' * 3000)\n"
+    )
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (0, False)
+    assert out == "x" * 3000 + "y" * 3000
+
+
+def test_run_cmd_drains_output_beyond_the_cap(fake_sandbox, tmp_path, monkeypatch):
+    # Far more output than a pipe holds: it's read and dropped, so the command finishes instead of blocking.
+    monkeypatch.setattr(llm_bench, "MAX_OUTPUT_BYTES", 100)
+    fake_sandbox("import sys; sys.stdout.write('z' * 5_000_000)")
+    start = time.monotonic()
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=20)
+    assert time.monotonic() - start < 10
+    assert (rc, timed_out) == (-1, False)
+    assert out == "z" * 100 + "\n[output limit exceeded]"
+
+
+def test_output_reader_reports_a_read_failure(tmp_path):
+    class Pipe:  # a directory: reading it fails with EISDIR, like a broken pipe read would fail
+        def __init__(self):
+            self.fd = os.open(tmp_path, os.O_RDONLY)
+
+        def fileno(self):
+            return self.fd
+
+        def close(self):
+            os.close(self.fd)
+
+    pipe = Pipe()
+    reader = llm_bench.OutputReader(pipe, 100)
+    with pytest.raises(OSError, match=r"reading the sandbox's output failed: \[Errno 21\]"):
+        reader.result(timeout=5)
+    pipe.close()
+
+
+def test_run_cmd_reports_an_output_read_failure(monkeypatch, fake_sandbox, tmp_path):
+    # Only the reader fails (patching os.read itself would also break subprocess's own use of it).
+    def failing_result(self, timeout):
+        self.thread.join(timeout)
+        raise OSError("reading the sandbox's output failed: [Errno 5] Input/output error")
+
+    monkeypatch.setattr(llm_bench.OutputReader, "result", failing_result)
+    fake_sandbox("print('x')")
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path)
+    assert (rc, timed_out) == (-1, False)
+    assert out == "sandbox failed: reading the sandbox's output failed: [Errno 5] Input/output error"
 
 
 def test_run_cmd_reports_a_failed_start(monkeypatch, fake_sandbox, tmp_path):
