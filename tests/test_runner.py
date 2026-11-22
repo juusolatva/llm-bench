@@ -616,8 +616,9 @@ def test_before_model_cleans_up_after_an_unexpected_error(monkeypatch):
         raise ValueError("boom")
 
     monkeypatch.setattr(llm_bench, "read_some", failing_read)
+    cmd, stop = python_cmd("import time; time.sleep(30)"), threading.Event()
     with pytest.raises(ValueError, match="boom"):
-        llm_bench.run_before_model("m/a", python_cmd("import time; time.sleep(30)"), {}, threading.Event())
+        llm_bench.run_before_model("m/a", cmd, {}, stop)
     (proc,) = procs
     assert proc.returncode is not None  # killed and reaped, not left running
     assert proc.stdout.closed

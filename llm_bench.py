@@ -496,6 +496,9 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
+TIMED_OUT = "timed out"  # the message of the TimeoutError a socket raises for a wait that takes too long
+
+
 class DeadlineSocketIO(socket.SocketIO):
     """A socket reader that stops at a deadline: each read waits at most until then (and at most the socket's own
     timeout), so a server that keeps sending a little at a time can't stretch a request past its timeout, which
@@ -508,7 +511,7 @@ class DeadlineSocketIO(socket.SocketIO):
     def readinto(self, b):
         remaining = self._deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("timed out")  # what the socket raises for one wait that takes too long
+            raise TimeoutError(TIMED_OUT)
         self._sock.settimeout(min(remaining, self._wait) if self._wait else remaining)
         return super().readinto(b)
 
@@ -556,12 +559,12 @@ class DeadlineConnection:
             super().connect()
         except OSError:
             if expired.is_set():
-                raise TimeoutError("timed out") from None
+                raise TimeoutError(TIMED_OUT) from None
             raise
         finally:
             timer.cancel()
         if expired.is_set():  # it fired just as the connection was made: the socket is shut down
-            raise TimeoutError("timed out")
+            raise TimeoutError(TIMED_OUT)
         self.sock = DeadlineSocket(self.sock, deadline)
 
 
