@@ -2225,6 +2225,8 @@ def summarize(rows):
     Reasoning tokens ("rt") are a mean per round like completion tokens, but only when every trial that got a reply
     reported them (otherwise None: a partial count would be on another scale than completion tokens).
     Rows of failed requests that a later run replaced are left out (scored_trials); "retried" counts them.
+    Seconds per pass ("spp") is reply time divided by passes, both per round, so the time of failed trials counts
+    and passing more tasks lowers it; None without passes.
     Returns (groups, dropped row count)."""
     tasks_by_group, dropped = newest_rows(rows)
     groups = []
@@ -2255,6 +2257,7 @@ def summarize(rows):
         }
         for task, task_rows in tasks.items():
             add_task_scores(g, task, task_rows)
+        g["spp"] = g["s"] / g["pass"] if g["pass"] else None
         groups.append(g)
     return groups, dropped
 
@@ -2339,7 +2342,8 @@ def summary_row(g, layout):
     cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
     if layout["reasoning"]:
         cells.append("-" if g["rt"] is None else f"{g['rt']:.0f}")
-    cells += [f"{g['s']:.1f}", "-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
+    cells += [f"{g['s']:.1f}", "-" if g["spp"] is None else f"{g['spp']:.1f}"]
+    cells += ["-" if g["tps"] is None else f"{g['tps']:.1f}", f"{g['load']:.1f}"]
     return cells
 
 
@@ -2351,7 +2355,7 @@ def summary_cells(groups, layout):
         + (["rounds"] if layout["repeated"] else [])
         + ["pass@1", "passed", *map(display_label, layout["langs"]), "prompt_tok", "compl_tok"]
         + (["reason_tok"] if layout["reasoning"] else [])
-        + ["sec", "tok/s", "load"]
+        + ["sec", "s/pass", "tok/s", "load"]
     )
     return header, [summary_row(g, layout) for g in groups], len(text)
 
@@ -2387,6 +2391,7 @@ def summary_records(groups, layout):
             "completion_tokens": num(g["ct"], 1),
             "reasoning_tokens": num(g["rt"], 1),
             "seconds": num(g["s"], 2),
+            "seconds_per_pass": num(g["spp"], 2),
             "tok_per_s": num(g["tps"], 1),
             "load_seconds": num(g["load"], 2),
         }
