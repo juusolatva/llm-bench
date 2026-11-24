@@ -1093,6 +1093,19 @@ def test_summarize_throughput_skips_replies_without_token_usage():
     assert {g["model"]: g["tps"] for g in groups} == {"m": pytest.approx(10.0), "n": None}
 
 
+def test_summarize_seconds_per_pass_counts_failed_trials():
+    # Reply time per round over passes per round: the failed trial's time counts, and passing more lowers it.
+    rows = [row("py_a", 1, seconds=10.0), row("py_a", 0, seconds=30.0), row("py_b", 1, seconds=20.0)]
+    groups = llm_bench.summarize(rows + [row("py_a", 0, model="n")])[0]
+    assert {g["model"]: g["spp"] for g in groups} == {"m": pytest.approx(40.0 / 1.5), "n": None}
+
+
+def test_print_summary_table_shows_no_seconds_per_pass_without_passes(capsys):
+    llm_bench.print_summary([row("py_a", 0, completion_tokens=100, seconds=4.0)])
+    head, line = capsys.readouterr().out.strip().splitlines()[:2]
+    assert line.split()[head.split().index("s/pass")] == "-"
+
+
 def test_summarize_per_task_counts():
     rows = [row("py_a", 1), row("py_a", 2), row("py_a", 0), row("go_b", 0, lang="go")]
     (g,) = llm_bench.summarize(rows)[0]
@@ -1107,7 +1120,7 @@ def test_print_summary_table_shows_throughput(capsys):
     head, line = capsys.readouterr().out.strip().splitlines()[:2]
     assert "tok/s" in head.split()
     assert "reason_tok" not in head  # no row reports reasoning tokens
-    assert line.split()[-2:] == ["25.0", "2.0"]  # tok/s, load
+    assert line.split()[-4:] == ["4.0", "4.0", "25.0", "2.0"]  # sec, s/pass, tok/s, load
 
 
 def test_print_summary_table_shows_reasoning_tokens_when_reported(capsys):
@@ -1207,6 +1220,7 @@ def test_print_summary_csv(capsys):
         "completion_tokens": "200.0",
         "reasoning_tokens": "26.0",
         "seconds": "6.0",
+        "seconds_per_pass": "4.0",
         "tok_per_s": "30.0",
         "load_seconds": "2.0",
     }
@@ -1217,6 +1231,7 @@ def test_print_summary_csv_single_round_has_no_spread(capsys):
     llm_bench.print_summary([row("py_a", 0, completion_tokens=0, finish_reason="timeout")], fmt="csv")
     (rec,) = csv.DictReader(capsys.readouterr().out.splitlines())
     assert (rec["pass1_sd"], rec["passed_sd"], rec["reasoning_tokens"], rec["tok_per_s"]) == ("", "", "", "")
+    assert rec["seconds_per_pass"] == ""  # no passes
 
 
 PER_TASK_ROWS = [
