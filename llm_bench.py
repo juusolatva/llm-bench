@@ -2705,11 +2705,18 @@ def finite_float(value):
 
 
 def same_json_value(a, b):
-    """Whether two request parameter values are the same JSON value: False and 0 (or True and 1) aren't."""
+    """Whether two request parameter values are the same JSON value: False and 0 (or True and 1) aren't, also
+    inside lists and objects, where Python's == would treat them as equal."""
     numbers = (int, float)
     if type(a) in numbers and type(b) in numbers:
         return a == b
-    return type(a) is type(b) and a == b
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, list):
+        return len(a) == len(b) and all(map(same_json_value, a, b))
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(same_json_value(a[key], b[key]) for key in a)
+    return a == b
 
 
 def reject_constant(name):

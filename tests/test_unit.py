@@ -964,6 +964,27 @@ def test_parse_param(spec, want):
     assert llm_bench.parse_param(spec) == want
 
 
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        (1, 1.0, True),
+        (0, False, False),
+        (1, True, False),
+        ("a", "a", True),
+        ([1, [2.0, {"k": 0}]], [1.0, [2, {"k": 0.0}]], True),
+        ([0], [False], False),
+        ([1, [True]], [1, [1]], False),
+        ({"a": 1}, {"a": True}, False),
+        ({"a": {"b": [0]}}, {"a": {"b": [False]}}, False),
+        ([1], [1, 2], False),
+        ({"a": 1}, {"b": 1}, False),
+        ([1], {"0": 1}, False),
+    ],
+)
+def test_same_json_value(a, b, same):
+    assert llm_bench.same_json_value(a, b) is same
+
+
 @pytest.mark.parametrize(("temperature", "param"), [("0.5", "0.5"), ("1", "1")])  # 1 and 1.0: the same number
 def test_cli_accepts_a_matching_temperature_param(monkeypatch, temperature, param):
     monkeypatch.setattr(
@@ -989,6 +1010,7 @@ def test_cli_accepts_a_matching_temperature_param(monkeypatch, temperature, para
         ["--param", 'x={"a": [-1e999]}'],
         ["--param", "seed=1", "--param", "seed=2"],
         ["--param", "x=0", "--param", "x=false"],
+        ["--param", "x=[0]", "--param", "x=[false]"],
     ],
 )
 def test_cli_rejects_bad_params(monkeypatch, args):
