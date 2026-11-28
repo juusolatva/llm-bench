@@ -987,6 +987,8 @@ def test_cli_accepts_a_matching_temperature_param(monkeypatch, temperature, para
         ["--param", "x=[1, -Infinity]"],
         ["--param", "temperature=1e400"],  # overflows to infinity
         ["--param", 'x={"a": [-1e999]}'],
+        ["--param", "seed=1", "--param", "seed=2"],
+        ["--param", "x=0", "--param", "x=false"],
     ],
 )
 def test_cli_rejects_bad_params(monkeypatch, args):
@@ -1050,6 +1052,26 @@ def test_cli_summary_options_need_summary(monkeypatch, capsys, args):
         run_main(monkeypatch, "http://localhost:1/v1", *args)
     assert exc.value.code == 2
     assert "only with --summary" in capsys.readouterr().err
+
+
+def test_cli_summary_takes_no_endpoints(monkeypatch, capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        run_main(monkeypatch, "http://localhost:1/v1", "--summary", str(tmp_path / "r.csv"))
+    assert exc.value.code == 2
+    assert "--summary takes no endpoints: http://localhost:1/v1" in capsys.readouterr().err
+
+
+def test_cli_summary_ignores_endpoints_from_the_environment(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "r.csv"
+    path.write_text("endpoint,model,task,lang,passed,passed_on\ne,m,py_a,python,1,1\n")
+    monkeypatch.setenv("LLM_BENCH_ENDPOINTS", "http://localhost:1/v1")
+    run_main(monkeypatch, "--summary", str(path))
+    assert "1/1" in capsys.readouterr().out
+
+
+def test_cli_accepts_a_repeated_identical_param(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["llm_bench.py", "localhost:1", "--param", "seed=1", "--param", "seed=1"])
+    assert llm_bench.parse_args().params == {"seed": 1}
 
 
 def test_cli_rejects_unknown_format(monkeypatch, tmp_path):
