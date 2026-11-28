@@ -40,6 +40,15 @@ sort out > got
 printf '%s\n' 'd/db 1.bak' 'd/db 2.bak' 'd/db 3.bak' 'd/db 4.bak' > want
 cmp -s got want || { diff want got >&2; fail "bash solution.sh d 0 with $files: wrong deleted paths printed, sorted here (diff above: < want, > got)"; }
 
+# DIR with a space and a leading "./", printed exactly as given.
+rm -rf 'my dir'; mkdir 'my dir'
+touch -d '2024-01-01' 'my dir/new.bak'
+touch -d '2023-01-01' 'my dir/old.bak'
+bash "$SOL" './my dir' 1 > out 2> err < /dev/null || fail "bash solution.sh './my dir' 1 with DIR 'my dir' containing 'new.bak' (modified 2024-01-01) and 'old.bak' (2023-01-01): exit status $?, want 0 (stderr: $(cat err))"
+printf '%s\n' './my dir/old.bak' > want
+cmp -s out want || { diff want out >&2; fail "bash solution.sh './my dir' 1 with DIR 'my dir' containing 'new.bak' (modified 2024-01-01) and 'old.bak' (2023-01-01): wrong output, want the deleted path as DIR/NAME with DIR exactly as given (diff above: < want, > got)"; }
+[ -e 'my dir/new.bak' ] && [ ! -e 'my dir/old.bak' ] || fail "bash solution.sh './my dir' 1: want 'my dir/old.bak' deleted and 'my dir/new.bak' kept"
+
 setup
 bash "$SOL" d 10 > out 2> err < /dev/null || fail "bash solution.sh d 10 with $files: exit status $?, want 0 (stderr: $(cat err))"
 listing > got
@@ -51,13 +60,14 @@ cmp -s got want || { diff want got >&2; fail "bash solution.sh d 10 with $files:
 setup
 # usage_error ARG...: the solution must reject these arguments with exit status 1 and a message on stderr.
 usage_error() {
-    local shown rc
-    shown=$(printf "'%s' " "$@")
+    local shown='with no arguments ' rc
+    [ "$#" -eq 0 ] || shown=$(printf "'%s' " "$@")
     bash "$SOL" "$@" > out 2> err < /dev/null
     rc=$?
     [ "$rc" -eq 1 ] || fail "bash solution.sh ${shown}(wrong usage; d is a directory, d/notes.txt a file, nodir does not exist): exit status $rc, want 1"
     [ -s err ] || fail "bash solution.sh ${shown}(wrong usage): no error message on stderr"
 }
+usage_error
 usage_error d
 usage_error d 1 x
 usage_error d -1
@@ -69,5 +79,5 @@ usage_error d/notes.txt 1
 listing > got
 setup
 listing > want
-cmp -s got want || { diff want got >&2; fail "wrong usage (arguments d; d 1 x; d -1; d abc; d 1x; d ''; nodir 1; d/notes.txt 1) deleted files in d (diff above: < want, > got)"; }
+cmp -s got want || { diff want got >&2; fail "wrong usage (no arguments; d; d 1 x; d -1; d abc; d 1x; d ''; nodir 1; d/notes.txt 1) deleted files in d (diff above: < want, > got)"; }
 echo 'harness: all checks passed'

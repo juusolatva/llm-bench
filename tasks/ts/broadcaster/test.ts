@@ -324,6 +324,21 @@ function harness_timeout(): void {
   r.expectSize(1);
 }
 
+/** Skipped pings and broadcasts don't change when a blocked client became blocked. */
+function harness_skippedKeepsBlockedSince(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  r.accept(c1, false);
+  r.add(c1, "S", 0);
+  r.ping(500);
+  r.broadcast("U1", 600);
+  r.broadcast("U2", 700);
+  r.tick(999);
+  r.expectDestroyed(c1, 0);
+  r.tick(1000);
+  r.expectDestroyed(c1, 1);
+}
+
 function harness_reblocked(): void {
   const r = new harness_Run();
   const c1 = new harness_Client("c1");
@@ -445,6 +460,7 @@ const harness_scenarios: (() => void)[] = [
   harness_drainedTwice,
   harness_timeout,
   harness_reblocked,
+  harness_skippedKeepsBlockedSince,
   harness_drainedOverCap,
   harness_remove,
   harness_readd,

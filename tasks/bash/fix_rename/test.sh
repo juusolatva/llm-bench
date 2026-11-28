@@ -20,4 +20,15 @@ bash "$SOL" empty txt log > out 2> err < /dev/null
 rc=$?
 [ "$rc" -eq 0 ] || fail "$case2: exit status $rc, want 0 (stderr: $(cat err))"
 [ ! -s err ] || fail "$case2: stderr not empty: $(cat err)"
+
+mkdir 'no match'
+touch 'no match/a.md' 'no match/b.TXT' 'no match/c.txt.bak'
+case3="bash solution.sh 'no match' txt log, with files 'a.md' 'b.TXT' 'c.txt.bak' in 'no match' (none ends in .txt)"
+bash "$SOL" 'no match' txt log > out 2> err < /dev/null
+rc=$?
+[ "$rc" -eq 0 ] || fail "$case3: exit status $rc, want 0 (stderr: $(cat err))"
+[ ! -s err ] || fail "$case3: stderr not empty: $(cat err)"
+(cd 'no match' && find . -type f | sort) > got
+printf '%s\n' './a.md' './b.TXT' './c.txt.bak' > want
+cmp -s got want || { diff want got >&2; fail "$case3: files in 'no match' changed (diff above: < want, > got)"; }
 echo 'harness: all checks passed'

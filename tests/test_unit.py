@@ -15,7 +15,7 @@ from collections import Counter
 from types import SimpleNamespace
 
 import pytest
-from conftest import Reply
+from conftest import Reply, free_port
 
 import llm_bench
 
@@ -43,6 +43,15 @@ def test_parse_endpoint(spec, want):
 def test_parse_endpoint_rejects(spec):
     with pytest.raises(ValueError):
         llm_bench.parse_endpoint(spec)
+
+
+@pytest.mark.parametrize("spec", ["http://alice@gpu-box:8080/v1", "box=https://alice@gpu-box", "alice:@gpu-box"])
+def test_parse_endpoint_rejects_credentials(spec):
+    # Any user info counts, with or without a password; the message names the host but not the user info.
+    with pytest.raises(ValueError, match="credentials in the URL") as e:
+        llm_bench.parse_endpoint(spec)
+    assert "alice" not in str(e.value)
+    assert "gpu-box" in str(e.value)
 
 
 def test_parse_endpoint_name_is_path_safe():
@@ -245,6 +254,36 @@ def test_extract_code_fence_pairing(text, want):
     assert llm_bench.extract_code(text) == want
 
 
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        # A code line ending in backticks doesn't close the block when a fence on its own line follows.
+        ("```python\nfence = 'x' # ends like ```\ny = 2\n```", "fence = 'x' # ends like ```\ny = 2\n"),
+        ("```bash\ncat <<'EOF'\nrun ```\nEOF\n```\nDone.", "cat <<'EOF'\nrun ```\nEOF\n"),
+        # It still closes the block when the next fence opens another block, or when no fence follows.
+        ("```python\nx = 1```\nTest:\n```python\nassert x\n```", "assert x\n"),
+        ("```python\nx = 1```\nThat's all.", "x = 1"),
+        # A longer opening fence needs an own-line close at least as long.
+        ("````python\na ````\nb\n````", "a ````\nb\n"),
+    ],
+)
+def test_extract_code_glued_closing_fence(text, want):
+    assert llm_bench.extract_code(text, "python") == want
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("[THINK]plan\n```python\nbad\n```\n[/THINK]\n```python\ngood\n```", "good\n"),
+        ("draft\n```python\nbad\n```\n[/THINK]\n```python\ngood\n```", "good\n"),  # opening tag dropped
+        ("[THINK]never finished\n```python\nbad\n```", ""),
+        ('```python\nTAGS = ("[THINK]", "[/THINK]")\n```', 'TAGS = ("[THINK]", "[/THINK]")\n'),  # code stays
+    ],
+)
+def test_extract_code_bracket_think_tags(text, want):
+    assert llm_bench.extract_code(text, "python") == want
+
+
 def test_extract_code_crlf_reply():
     text = "<think>\r\nplan\r\n</think>\r\nHere: ```bash\r\necho hi\r\n```\r\nDone.\r\n"
     assert llm_bench.extract_code(text, "bash") == "echo hi\n"
@@ -304,6 +343,9 @@ def test_strip_think_is_linear(monkeypatch):
         "```py\na\n" * 50000,
         "Here: ```python\nx ```\n" * 50000,
         "````py\nx````\n" * 30000 + "```\n" * 30000,
+        "```py\nx```\n" * 30000 + "y\n" * 30000 + "```\n",  # glued fences, one own-line fence at the end
+        "````py\n" + "x```\n" * 50000 + "````\n",
+        "[THINK]" * 50000 + "```py\nx\n```",
     ],
 )
 def test_extract_code_degenerate_replies_are_fast(reply):
@@ -356,6 +398,11 @@ def test_check_toolchains_checks_the_tools_of_selected_languages(monkeypatch):
     with pytest.raises(SystemExit, match=r"missing toolchains on PATH: gawk\n"):
         llm_bench.check_toolchains([{"lang": "term"}, {"lang": "bash"}])
     llm_bench.check_toolchains([{"lang": "bash"}, {"lang": "python"}])  # gawk and go aren't needed
+    monkeypatch.setattr(
+        llm_bench.shutil, "which", lambda name, path=None: None if name == "cmp" else f"/usr/bin/{name}"
+    )
+    with pytest.raises(SystemExit, match=r"missing toolchains on PATH: cmp\n"):  # the Bash harnesses use it
+        llm_bench.check_toolchains([{"lang": "bash"}])
 
 
 def test_check_toolchains_ignores_tools_outside_the_sandbox_path(monkeypatch, tmp_path):
@@ -421,6 +468,11 @@ def test_builtin_harnesses_print_the_final_line(task):
         assert test.count(done) == 1
     if task["lang"] == "go":
         assert "func TestMain(m *testing.M)" in test
+        # Package-scope names share the solution's package: harness or Test (go test needs it) prefixes only.
+        # Methods are scoped to their (prefixed) types; grouped declarations would need a closer look.
+        names = re.findall(r"^(?:func|type|var|const) (\w+)", test, re.MULTILINE)
+        assert not [n for n in names if not n.startswith(("harness", "Test"))], names
+        assert not re.search(r"^(?:var|const|type) \(", test, re.MULTILINE)
     if task["lang"] == "ts":
         # Named imports from the compiled solution module only, so a missing export is a compile error naming it.
         assert re.search(r'^import \{[^}]+\} from "\./solution\.js";$', test, re.MULTILINE)
@@ -593,6 +645,99 @@ def test_connection_stops_a_trickling_proxy_reply_at_its_timeout():
         conn.close()
 
 
+def test_deadline_socket_stops_sending_at_the_deadline():
+    # Like an SSL socket, whose sendall loops over send() with a fresh timeout for each piece: a server that takes a
+    # little at a time, each well within the socket timeout, is stopped only by the deadline.
+    class Sock:
+        timeout = 5
+
+        def gettimeout(self):
+            return self.timeout
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def send(self, data):
+            time.sleep(0.05)
+            return 100
+
+    sock = Sock()
+    data = b"x" * 1_000_000
+    start = time.monotonic()
+    deadline_sock = llm_bench.DeadlineSocket(sock, start + 0.5)
+    with pytest.raises(TimeoutError):
+        deadline_sock.sendall(data)
+    assert time.monotonic() - start < 1
+    assert sock.timeout == 5  # restored for the reads that follow
+
+
+def test_deadline_socket_send_of_nothing_fails_at_once():
+    class Sock:
+        def gettimeout(self):
+            return 5
+
+        def settimeout(self, timeout):
+            pass
+
+        def send(self, data):
+            return 0
+
+    start = time.monotonic()
+    deadline_sock = llm_bench.DeadlineSocket(Sock(), start + 5)
+    with pytest.raises(OSError, match="connection closed while sending the request"):
+        deadline_sock.sendall(b"x")
+    assert time.monotonic() - start < 1
+
+
+def test_command_output_finds_a_marker_with_crlf():
+    assert llm_bench.command_output("$ a\r\nwarn\r\n$ b\r\nFAIL\r\n", "b") == "$ b\r\nFAIL\r\n"
+    assert llm_bench.command_output("no markers\n", "b") == "no markers\n"
+
+
+def test_deadline_create_connection_gives_all_addresses_one_deadline(monkeypatch):
+    # Two addresses that never answer: together they take the deadline, not the timeout each.
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("192.0.2.1", 80))] * 2
+    monkeypatch.setattr(llm_bench.socket, "getaddrinfo", lambda *args: addresses)
+    attempts = []
+
+    class Socket:
+        def __init__(self, *args):
+            self.timeout = None
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, address):
+            attempts.append(self.timeout)
+            time.sleep(self.timeout)
+            raise TimeoutError("timed out")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(llm_bench.socket, "socket", Socket)
+    start = time.monotonic()
+    deadline = start + 0.5
+    with pytest.raises(TimeoutError):
+        llm_bench.deadline_create_connection(("gpu-box", 80), deadline, 10)
+    assert time.monotonic() - start < 1
+    assert attempts[0] == pytest.approx(0.5, abs=0.05)
+    assert len(attempts) <= 2
+
+
+def test_deadline_create_connection_tries_the_next_address(monkeypatch):
+    srv = socket.create_server(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    addresses = [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", free_port())),  # refused
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port)),
+    ]
+    monkeypatch.setattr(llm_bench.socket, "getaddrinfo", lambda *args: addresses)
+    with srv, llm_bench.deadline_create_connection(("gpu-box", port), time.monotonic() + 5, 2) as sock:
+        assert sock.getpeername()[1] == port
+        assert sock.gettimeout() == 2
+
+
 @pytest.mark.parametrize(
     ("host", "local"),
     [
@@ -621,7 +766,7 @@ def test_is_local_host(host, local):
 
 def test_http_json_skips_proxies_only_for_local_hosts(mock_server, monkeypatch):
     # A proxy from the environment (here a dead one) mustn't break requests to this machine or the LAN.
-    dead_proxy = urllib.request.ProxyHandler({"http": "http://127.0.0.1:9"})
+    dead_proxy = urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{free_port()}"})  # nothing listens there
     monkeypatch.setattr(llm_bench, "HTTP_OPENER", urllib.request.build_opener(dead_proxy, *llm_bench.HTTP_HANDLERS))
     s = mock_server()
     assert llm_bench.list_models("m", s.url, None) == ["test/model"]
@@ -984,6 +1129,48 @@ def test_sandbox_command_limits_the_unit(monkeypatch, tmp_path):
     ]
 
 
+GUARD_GROUP = "/sys/fs/cgroup/user.slice/u.service"
+GUARD_LIMITS = {"memory.max": "1000\n", "pids.max": "10\n", "memory.swap.max": "0\n", "cpu.max": "200000 100000\n"}
+
+
+def run_cgroup_guard(monkeypatch, limits):
+    """Run CGROUP_GUARD in-process against fake cgroup files (memory limit 1000, 10 tasks); returns the program it
+    would exec, or raises its SystemExit."""
+    files = {"/proc/self/cgroup": "0::/user.slice/u.service\n"} | {f"{GUARD_GROUP}/{k}": v for k, v in limits.items()}
+
+    def read_text(path, *args, **kwargs):
+        if str(path) not in files:
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return files[str(path)]
+
+    execs = []
+    monkeypatch.setattr(llm_bench.Path, "read_text", read_text)
+    monkeypatch.setattr(os, "execv", lambda path, argv: execs.append(argv))
+    monkeypatch.setattr(sys, "argv", ["-c", "1000", "10", "/usr/bin/bwrap", "--x"])
+    exec(llm_bench.CGROUP_GUARD, {})  # the benchmark's own launcher code, not model output
+    return execs
+
+
+def test_cgroup_guard_execs_the_sandbox_when_the_limits_hold(monkeypatch):
+    assert run_cgroup_guard(monkeypatch, GUARD_LIMITS) == [["/usr/bin/bwrap", "--x"]]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"memory.max": "max\n"}, "sandbox cgroup limits are not enforced: memory.max is max"),
+        ({"memory.max": "2000\n", "pids.max": "max\n"}, "not enforced: memory.max is 2000, pids.max is max"),
+        ({"memory.swap.max": "max\n"}, "not enforced: memory.swap.max is max"),
+        ({"cpu.max": "max 100000\n"}, "not enforced: cpu.max is max 100000"),
+        ({"memory.swap.max": None}, r"can't read /sys/fs/cgroup/user\.slice/u\.service/memory\.swap\.max \(No such"),
+    ],
+)
+def test_cgroup_guard_names_what_is_wrong(monkeypatch, change, message):
+    limits = {k: v for k, v in (GUARD_LIMITS | change).items() if v is not None}
+    with pytest.raises(SystemExit, match=message):
+        run_cgroup_guard(monkeypatch, limits)
+
+
 def test_sandbox_command_go_cache(monkeypatch, tmp_path):
     mount = llm_bench.GO_CACHE_MOUNT
     monkeypatch.setattr(llm_bench, "GO_CACHE", tmp_path / "cache")
@@ -1209,6 +1396,30 @@ def test_run_cmd_drains_output_beyond_the_cap(fake_sandbox, tmp_path, monkeypatc
     assert out == "z" * 100 + "\n[output limit exceeded]"
 
 
+def test_run_cmd_stops_the_sandbox_at_the_output_limit(fake_sandbox, tmp_path, monkeypatch):
+    # A loop that prints fails as soon as its output passes the limit, instead of running until the time limit.
+    monkeypatch.setattr(llm_bench, "MAX_OUTPUT_BYTES", 100)
+    fake_sandbox("import sys, time\nwhile True:\n    sys.stdout.write('z' * 1000)\n    sys.stdout.flush()\n")
+    start = time.monotonic()
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=20)
+    assert time.monotonic() - start < 10
+    assert (rc, timed_out) == (-1, False)
+    assert out == "z" * 100 + "\n[output limit exceeded]"
+    stops = (tmp_path / "systemctl").read_text().splitlines()
+    assert len(stops) == 2  # at the limit, and again once it has ended
+    assert stops[0] == stops[1]
+
+
+def test_run_cmd_reports_the_time_limit_with_the_output_limit(fake_sandbox, tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_bench, "MAX_OUTPUT_BYTES", 10)
+    monkeypatch.setattr(llm_bench, "stop_unit", lambda unit, systemctl="systemctl": None)
+    monkeypatch.setattr(llm_bench.subprocess.Popen, "kill", lambda self: None)  # as if the stop came too late
+    fake_sandbox("import sys, time; print('x' * 100, flush=True); time.sleep(1.2); sys.exit(1)")
+    rc, out, timed_out = llm_bench.run_cmd(["x"], tmp_path, timeout=1)
+    assert (rc, timed_out) == (-1, True)
+    assert out == "x" * 10 + "\n[output limit exceeded]\n" + llm_bench.TIME_LIMIT_MARKER.format(limit=1)
+
+
 def test_output_reader_reports_a_read_failure(tmp_path):
     class Pipe:  # a directory: reading it fails with EISDIR, like a broken pipe read would fail
         def __init__(self):
@@ -1263,24 +1474,29 @@ def test_check_sandbox_exits_when_the_sandbox_fails(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("output", "rc", "timed_out", "stage", "index"),
+    ("output", "rc", "timed_out", "stage", "index", "fed_back"),
     [
-        ("", 1, False, "build", 0),  # no marker printed yet: the first command is blamed
-        ("$ 0\nerror\n", 1, False, "build", 0),
-        ("$ 0\n$ 1\nFAIL\n", 1, False, "test", 1),
-        ("$ 0\n$ 1\n", -9, True, "time_limit", 1),
+        ("", 1, False, "build", 0, ""),  # no marker printed yet: the first command is blamed
+        ("$ 0\nerror\n", 1, False, "build", 0, "$ 0\nerror\n"),
+        # The feedback starts at the failing command: the build's warnings aren't part of it.
+        ("$ 0\nwarning: unused\n$ 1\nFAIL\n", 1, False, "test", 1, "$ 1\nFAIL\n"),
+        ("$ 0\n$ 1\n", -9, True, "time_limit", 1, "$ 1\n"),
     ],
 )
-def test_run_task_failure_stage(monkeypatch, tmp_path, output, rc, timed_out, stage, index):
+def test_run_task_failure_stage(monkeypatch, tmp_path, output, rc, timed_out, stage, index, fed_back):
     spec = llm_bench.LANGS["c"]
     rendered = [llm_bench.shlex.join(c) for c in spec["cmds"]]
     assert len(rendered) == 2
-    out = output.replace("$ 0", f"$ {rendered[0]}").replace("$ 1", f"$ {rendered[1]}")
+
+    def expand(text):
+        return text.replace("$ 0", f"$ {rendered[0]}").replace("$ 1", f"$ {rendered[1]}")
+
+    out = expand(output)
     monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(rc, out, timed_out))
     (tmp_path / "w").mkdir()
     (tmp_path / "w" / "stale").write_text("from an earlier attempt")
     ok, log, got_stage, cmd, fail_out = llm_bench.run_task({"lang": "c", "test": "harness"}, "code", tmp_path / "w")
-    assert (ok, got_stage, cmd, fail_out) == (False, stage, rendered[index], out)
+    assert (ok, got_stage, cmd, fail_out) == (False, stage, rendered[index], expand(fed_back))
     assert log == f"{out}\n[exit {rc}]"
     assert not (tmp_path / "w" / "stale").exists()  # the work directory starts empty
 
@@ -1321,7 +1537,10 @@ def test_run_task_keeps_ansi_for_other_languages(monkeypatch, tmp_path):
     rendered = [llm_bench.shlex.join(c) for c in llm_bench.LANGS["c"]["cmds"]]
     out = f"$ {rendered[0]}\n$ {rendered[1]}\n\x1b[1mFAIL\x1b[0m\n"
     monkeypatch.setattr(llm_bench, "run_cmd", lambda cmd, cwd: llm_bench.CmdResult(1, out, False))
-    assert llm_bench.run_task({"lang": "c", "test": "h"}, "code", tmp_path / "w")[4] == out
+    assert (
+        llm_bench.run_task({"lang": "c", "test": "h"}, "code", tmp_path / "w")[4]
+        == f"$ {rendered[1]}\n\x1b[1mFAIL\x1b[0m\n"
+    )
 
 
 def test_extract_code_prefers_the_ts_block():

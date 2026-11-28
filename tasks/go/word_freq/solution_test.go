@@ -47,6 +47,14 @@ func TestEmptyAndUnicode(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("WordFreq(reader returning %q one byte per Read): got %v, %v; want %v, nil", in, got, err, want)
 	}
+	// A reader that returns its last data together with io.EOF, as the io.Reader contract allows.
+	in = "last words"
+	want = map[string]int{"last": 1, "words": 1}
+	got, err = WordFreq(iotest.DataErrReader(strings.NewReader(in)))
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("WordFreq(reader returning %q with io.EOF in the same Read call as the last bytes): got %v, %v; want %v, nil",
+			in, got, err, want)
+	}
 }
 
 func TestLongLine(t *testing.T) {

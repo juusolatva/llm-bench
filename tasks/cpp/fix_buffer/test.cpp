@@ -86,6 +86,10 @@ int main() {
         Buffer f(3);
         f = m;
         HARNESS_CHECK(f.size() == 0, "Buffer f(3); f = m (m was moved from): f.size() = %zu, want 0", f.size());
+        Buffer z(0);                                   // and of a Buffer of size 0
+        Buffer z2 = z;
+        z2 = z;
+        HARNESS_CHECK(z2.size() == 0, "Buffer z(0); Buffer z2 = z; z2 = z: z2.size() = %zu, want 0", z2.size());
         m = n;
         HARNESS_CHECK(harness_holds(m, "wxyz") && m.data() != n.data(),
                       "m = n (m was moved from, n has \"wxyz\"): m has %s; want \"wxyz\" in its own memory",

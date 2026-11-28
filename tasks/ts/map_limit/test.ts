@@ -104,7 +104,7 @@ class harness_Scenario<T, R> {
     await harness_flush();
   }
 
-  async reject(index: number, error: Error): Promise<void> {
+  async reject(index: number, error: unknown): Promise<void> {
     this.rec.calls[index].reject(error);
     this.steps.push(`call ${index} rejected with ${harness_describe(error)}`);
     await harness_flush();
@@ -174,6 +174,32 @@ async function harness_rejection(): Promise<void> {
   s.expectStarted([0, 1]);
 }
 
+/** A second call rejecting after the first one changes nothing: the promise keeps the first error. */
+async function harness_secondRejection(): Promise<void> {
+  const s = new harness_Scenario<number, number>("mapLimit([1,2,3,4], 2, fn)", [1, 2, 3, 4], 2);
+  const first = new Error("first");
+  await s.reject(0, first);
+  await s.reject(1, new Error("second"));
+  if (s.outcome.state !== "rejected" || s.outcome.error !== first) {
+    throw new Error(`${s.where()}, the promise is ${s.show()}, expected rejected with the Error of call 0`);
+  }
+  s.expectStarted([0, 1]);
+}
+
+/** A call may reject with any value, also a falsy one: it still stops further calls. */
+async function harness_falsyRejection(): Promise<void> {
+  const s = new harness_Scenario<number, number>("mapLimit([1,2,3,4], 2, fn)", [1, 2, 3, 4], 2);
+  await s.reject(0, 0);
+  if (s.outcome.state !== "rejected" || s.outcome.error !== 0) {
+    throw new Error(`${s.where()}, the promise is ${s.show()}, expected rejected with 0 at once`);
+  }
+  await s.resolve(1, 20);
+  s.expectStarted([0, 1]);
+  if (s.outcome.state !== "rejected" || s.outcome.error !== 0) {
+    throw new Error(`${s.where()}, the promise is ${s.show()}, expected rejected with 0`);
+  }
+}
+
 async function harness_empty(): Promise<void> {
   const s = new harness_Scenario<number, number>("mapLimit([], 3, fn)", [], 3);
   await harness_flush();
@@ -197,6 +223,8 @@ const harness_scenarios: (() => Promise<void>)[] = [
   harness_limitAboveLength,
   harness_sequential,
   harness_rejection,
+  harness_secondRejection,
+  harness_falsyRejection,
   harness_empty,
   ...[0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY].map((limit) => () => harness_badLimit([1, 2], limit)),
   () => harness_badLimit([], 0),
