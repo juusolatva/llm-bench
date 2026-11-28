@@ -77,4 +77,21 @@ printf '%s\n' 'only in a: -flag.txt' 'differ: .env' 'only in b: .hidden/cfg' 'di
     "only in b: it's new.txt" 'only in a: old dir/sub/y.txt' 'only in a: old dir/x.txt' 'only in a: only a.txt' \
     'only in a: src/lib.c' 'only in b: src/lib.h' 'differ: src/util.c' > "$T/want"
 cmp -s "$T/want" "$T/out" || { diff "$T/want" "$T/out" >&2; fail "$case1 -- wrong output (diff above: < want, > got)"; }
+
+# Trees without differences: no output, and still exit status 0.
+W="$T/work2"
+mkdir "$W" && cd "$W" || exit 1
+put 'a/same file.txt' 'same\n'
+put 'b/same file.txt' 'same\n'
+touch -d '2024-01-01' 'b/same file.txt'
+put a/.hidden/cfg 'k=v\n'
+put b/.hidden/cfg 'k=v\n'
+mkdir 'b/empty dir'
+case2="bash solution.sh in a directory with these entries (PATH: CONTENTS; b/same file.txt has an older modification time than a/same file.txt):$(describe)
+"
+bash "$SOL" > "$T/out" 2> "$T/err" < /dev/null
+rc=$?
+ran_interpreter "$case2"
+[ "$rc" -eq 0 ] || fail "$case2 -- exit status $rc, want 0 (stderr: $(head -c 2000 "$T/err"))"
+[ ! -s "$T/out" ] || fail "$case2 -- printed $(printf '%q' "$(head -c 2000 "$T/out")"), want no output (no differences)"
 echo 'harness: all checks passed'

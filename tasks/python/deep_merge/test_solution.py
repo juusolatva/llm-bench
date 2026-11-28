@@ -7,6 +7,7 @@ def harness_check(a, b, want):
     got = deep_merge(a, b)
     assert got == want, f"deep_merge({a0!r}, {b0!r}): got {got!r}, want {want!r}"
     assert a == a0 and b == b0, f"deep_merge({a0!r}, {b0!r}) modified its inputs: a is now {a!r}, b is now {b!r}; want both unchanged"
+    assert got is not a and got is not b, f"deep_merge({a0!r}, {b0!r}) returned {'a' if got is a else 'b'} itself; want a new dict"
     return got
 
 
@@ -47,7 +48,10 @@ for which in ("a", "b"):
     assert nested == {"l": [[1], {"d": 1}]}, (
         f"r = deep_merge({shown}); r['l'][0].append(2); r['l'][1]['d'] = 9 changed {which} to {nested!r}; "
         f"want {which} unchanged ({{'l': [[1], {{'d': 1}}]}}): the result must not share dicts or lists with a or b, including ones nested in lists")
-harness_check({"k": 1}, {"k": {"z": 1}}, {"k": {"z": 1}})
+r = harness_check({"k": 1}, b := {"k": {"z": 1}}, {"k": {"z": 1}})
+r["k"]["z"] = 2
+assert b == {"k": {"z": 1}}, (f"r = deep_merge({{'k': 1}}, {{'k': {{'z': 1}}}}); r['k']['z'] = 2 changed b to {b!r}; want b "
+                              f"unchanged ({{'k': {{'z': 1}}}}): the result must not share dicts or lists with a or b")
 harness_check({"k": {"z": 1}}, {"k": None}, {"k": None})
 harness_check({"k": {"z": 1}}, {"k": [1]}, {"k": [1]})
 harness_check({}, {}, {})

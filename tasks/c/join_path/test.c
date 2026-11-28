@@ -25,6 +25,7 @@ int main(void) {
     harness_t("usr/", "bin", "usr/bin");
     harness_t("usr///", "bin", "usr/bin");
     harness_t("/", "etc", "/etc");
+    harness_t("///", "etc", "/etc");
     harness_t("a", "/etc", "/etc");
     harness_t("", "x", "x");
     harness_t("x", "", "x");

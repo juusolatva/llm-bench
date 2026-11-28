@@ -41,34 +41,49 @@ mod harness_tests {
         }
     }
 
+    /// Runs topo_order(n, edges) in a thread and waits at most 5 s for it, so a slow solution fails with a message
+    /// that names the bound instead of running into the sandbox's time limit. what describes the edges.
+    fn harness_timed(n: usize, edges: Vec<(usize, usize)>, what: &str) -> Vec<usize> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(topo_order(n, &edges));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(order)) => order,
+            Ok(Err(e)) => panic!("topo_order({}, {}) = Err({:?}), want Ok (the graph is acyclic)", n, what, e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "too slow: topo_order({}, {}) didn't return within 5 s; it must run in O((n + m) log n)", n, what),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("topo_order({}, {}) panicked", n, what),
+        }
+    }
+
     #[test] fn large() {
-        let start = std::time::Instant::now();
-        let n = 200_000;
+        let n = 1_000_000;
         // A reverse chain (i before i - 1) with extra edges: the order is n-1, ..., 0.
         let mut edges: Vec<(usize, usize)> = (1..n).map(|i| (i, i - 1)).collect();
         edges.extend((2..n).step_by(3).map(|i| (i, i - 2)));
-        let got = topo_order(n, &edges).expect("large acyclic graph must succeed");
+        let what = "edges (i, i-1) for 1 <= i < n and (i, i-2) for i = 2, 5, 8, ...";
+        let got = harness_timed(n, edges, what);
         let want: Vec<usize> = (0..n).rev().collect();
-        assert!(got == want, "topo_order(200000, edges (i, i-1) for 1 <= i < n and (i, i-2) for i = 2, 5, 8, ...): {}",
-                harness_mismatch(&got, &want));
+        assert!(got == want, "topo_order({}, {}): {}", n, what, harness_mismatch(&got, &want));
 
         // Independent pairs: (2k+1) before (2k). The smallest available node always goes first.
         let edges: Vec<(usize, usize)> = (0..n / 2).map(|k| (2 * k + 1, 2 * k)).collect();
-        let got = topo_order(n, &edges).expect("large acyclic graph must succeed");
+        let what = "edges (2k+1, 2k) for 0 <= k < n/2";
+        let got = harness_timed(n, edges, what);
         let mut want = vec![1, 0];
         for k in 1..n / 2 {
             want.push(2 * k + 1);
             want.push(2 * k);
         }
-        assert!(got == want, "topo_order(200000, edges (2k+1, 2k) for 0 <= k < 100000): {}", harness_mismatch(&got, &want));
+        assert!(got == want, "topo_order({}, {}): {}", n, what, harness_mismatch(&got, &want));
 
         // Even nodes 2k before the top quarter's nodes n-1-k: while most nodes are ready, each node taken unlocks one
         // that is larger than all of them.
         let edges: Vec<(usize, usize)> = (0..n / 4).map(|k| (2 * k, n - 1 - k)).collect();
-        let got = topo_order(n, &edges).expect("large acyclic graph must succeed");
+        let what = "edges (2k, n-1-k) for 0 <= k < n/4";
+        let got = harness_timed(n, edges, what);
         let want: Vec<usize> = (0..n).collect();
-        assert!(got == want, "topo_order(200000, edges (2k, 199999-k) for 0 <= k < 50000): {}", harness_mismatch(&got, &want));
-        let secs = start.elapsed().as_secs_f64();
-        assert!(secs < 5.0, "too slow: three graphs with 200000 nodes took {:.1} s", secs);
+        assert!(got == want, "topo_order({}, {}): {}", n, what, harness_mismatch(&got, &want));
     }
 }

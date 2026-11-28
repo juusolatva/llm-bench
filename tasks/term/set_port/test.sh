@@ -68,6 +68,7 @@ rc=$?
 ran_interpreter "$case1"
 [ "$rc" -eq 0 ] || fail "$case1 -- exit status $rc, want 0 (stderr: $(head -c 2000 "$T/err"))"
 [ ! -s "$T/out" ] || fail "$case1 -- printed $(printf '%q' "$(head -c 2000 "$T/out")"), want no output"
+[ ! -s "$T/err" ] || fail "$case1 -- printed $(printf '%q' "$(head -c 2000 "$T/err")") on stderr, want no output"
 cd "$T" || exit 1
 diff -r want work >&2 || fail "$case1 -- wrong files afterwards (diff above: < want, > got; 'Only in' lines name files that should or shouldn't exist)"
 echo 'harness: all checks passed'

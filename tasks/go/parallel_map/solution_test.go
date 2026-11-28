@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,12 +48,26 @@ func TestOrderAndConcurrency(t *testing.T) {
 		for i := range inputs {
 			inputs[i] = i
 		}
+		// The first `workers` inputs wait (up to 2 s in all) until `workers` calls are running, so the peak doesn't
+		// depend on how the calls happen to overlap.
+		gate, gateOnce := make(chan struct{}), sync.Once{}
+		gateCtx, gateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		got, err := ParallelMap(context.Background(), inputs, workers, func(ctx context.Context, x int) (int, error) {
 			h.enter()
 			defer h.leave()
-			time.Sleep(time.Duration(5+x%3) * time.Millisecond)
+			if h.active.Load() >= int64(workers) {
+				gateOnce.Do(func() { close(gate) })
+			}
+			if x < workers {
+				select {
+				case <-gate:
+				case <-gateCtx.Done():
+				}
+			}
+			time.Sleep(time.Duration(1+x%3) * time.Millisecond)
 			return x * x, nil
 		})
+		gateCancel()
 		if err != nil {
 			t.Fatalf("workers=%d: unexpected error %v", workers, err)
 		}
@@ -150,6 +165,28 @@ func TestErrorCancelsAndStops(t *testing.T) {
 	}
 	if s > 11 && canceled.Load() == 0 {
 		t.Fatalf("%s: no running call saw its context canceled", cs)
+	}
+}
+
+func TestFirstErrorInTime(t *testing.T) {
+	// The first error returned is the one from input 3; input 0 fails later (once canceled), with a lower index.
+	const cs = "ParallelMap([0 1 2 3], workers 4) with f failing at once on input 3 and on input 0 only once its context is canceled"
+	first, late := errors.New("first"), errors.New("late")
+	got, err := ParallelMap(context.Background(), []int{0, 1, 2, 3}, 4, func(ctx context.Context, x int) (int, error) {
+		switch x {
+		case 3:
+			return 0, first
+		case 0:
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+			return 0, late
+		}
+		return x, nil
+	})
+	if !errors.Is(err, first) || got != nil {
+		t.Fatalf("%s: got %v, %v; want nil and the error returned first in time (first), not the one of the lowest input", cs, got, err)
 	}
 }
 
