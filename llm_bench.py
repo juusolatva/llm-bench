@@ -49,7 +49,7 @@ from typing import NamedTuple
 # --- CONFIGURATION ---
 # Part of every row's config hash: bump it whenever a change can change results (prompting, feedback,
 # code extraction, build/test handling), so rows from different versions are never mixed.
-BENCH_VERSION = "0.6.0"
+BENCH_VERSION = "0.7.0"
 # Defaults for the command-line options (see --help).
 DEFAULT_TIMEOUT_S = 1800  # per request: ~max tokens / slowest model's tok/s (at long context) + load time
 DEFAULT_MAX_TOKENS = 16384  # worst-case prompt (~9k tokens) + max tokens must fit in the context window
@@ -239,6 +239,8 @@ LANGS = {
                 "--crate-name",
                 "solution",
                 "-O",
+                "-C",
+                "overflow-checks=on",
                 "-o",
                 "libsolution.rlib",
                 "lib.rs",
@@ -249,6 +251,8 @@ LANGS = {
                 "2021",
                 "--test",
                 "-O",
+                "-C",
+                "overflow-checks=on",
                 "--extern",
                 "solution=libsolution.rlib",
                 "-o",
@@ -316,6 +320,7 @@ LANGS = {
         "tags": ("bash", "sh", "shell"),
         "cmds": [["bash", SH_HARNESS]],
         "final_line": HARNESS_FINAL_LINE,
+        "tools": ("awk", "grep", "find", "diff", "cmp"),  # used by the harnesses and reference solutions
     },
     # Terminal tasks: commands with everyday tools (grep, sed, awk, find, sort, ...) run in a prepared directory.
     "term": {
@@ -418,6 +423,10 @@ FIELDS = [
 RESERVED_PARAMS = {"model", "messages", "max_tokens", "stream", "n"}
 THINK_CLOSE = "</think>"
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# Other reasoning tags some chat templates put into the content ([THINK]...[/THINK]), read as <think> tags. Each has
+# the length of the tag it stands for, so replacing them keeps every position in the reply.
+OTHER_THINK_TAGS = {"[THINK]": "<think>", "[/THINK]": "</think>"}
+OTHER_THINK_RE = re.compile("|".join(re.escape(tag) for tag in OTHER_THINK_TAGS))
 # Fenced code blocks are found by a left-to-right scan (_code_blocks), so a fence is never used twice. An
 # opening fence is a run of 3+ backticks either at the start of a line with an optional info string (it
 # starts with the language tag: "python", "python:solution.py", "c++ title=x") or mid-line directly followed
@@ -497,6 +506,7 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
 
 
 TIMED_OUT = "timed out"  # the message of the TimeoutError a socket raises for a wait that takes too long
+HTTP_SEND_PIECE_BYTES = 64 * 1024  # DeadlineSocket.sendall checks the deadline before each piece
 
 
 class DeadlineSocketIO(socket.SocketIO):
@@ -518,13 +528,28 @@ class DeadlineSocketIO(socket.SocketIO):
 
 class DeadlineSocket:
     """A connected socket whose binary reader (what http.client reads the status line, headers and body from) is a
-    DeadlineSocketIO; everything else goes to the socket itself."""
+    DeadlineSocketIO and whose sendall (the request) also stops at the deadline; everything else goes to the socket
+    itself."""
 
     def __init__(self, sock, deadline):
         self._sock, self._deadline = sock, deadline
 
     def __getattr__(self, name):
         return getattr(self._sock, name)
+
+    def sendall(self, data):
+        """Send data in pieces, each wait bounded by the socket timeout and the deadline, so a server that accepts the
+        request a little at a time can't stretch it past the deadline."""
+        view, wait = memoryview(data).cast("B"), self._sock.gettimeout()
+        try:
+            while view:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(TIMED_OUT)
+                self._sock.settimeout(min(remaining, wait) if wait else remaining)
+                view = view[self._sock.send(view[:HTTP_SEND_PIECE_BYTES]) :]
+        finally:
+            self._sock.settimeout(wait)
 
     def makefile(self, mode="r", buffering=None, **kwargs):
         if mode != "rb":
@@ -533,11 +558,37 @@ class DeadlineSocket:
         return io.BufferedReader(DeadlineSocketIO(self._sock, self._deadline), io.DEFAULT_BUFFER_SIZE)
 
 
+def deadline_create_connection(address, deadline, timeout, source_address=None):
+    """socket.create_connection, but trying the host's addresses only until the deadline: create_connection gives each
+    address the whole timeout, so a name with several unreachable addresses could take a multiple of it. The
+    connected socket gets the per-wait timeout."""
+    host, port = address
+    error = None
+    for family, kind, proto, _, sockaddr in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(TIMED_OUT)
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(min(remaining, timeout))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+        except OSError as e:
+            sock.close()
+            error = e
+            continue
+        sock.settimeout(timeout)
+        return sock
+    raise error or OSError(f"no addresses found for {host}")
+
+
 class DeadlineConnection:
     """Mixin for http.client connections: the request's timeout is also one deadline from the start of the
-    connection to the end of the response (status line, headers and body, also of an HTTP error). While connecting
-    (which can include a proxy's CONNECT reply and a TLS handshake, read in many small waits), a timer shuts the
-    socket down at the deadline; afterwards DeadlineSocket bounds every read."""
+    connection to the end of the response (status line, headers and body, also of an HTTP error). Connecting tries
+    the host's addresses only until the deadline (deadline_create_connection); while a proxy's CONNECT reply and a
+    TLS handshake are read (in many small waits), a timer shuts the socket down at the deadline; afterwards
+    DeadlineSocket bounds sending the request and every read."""
 
     def connect(self):
         timeout = self.timeout if isinstance(self.timeout, int | float) else None
@@ -545,6 +596,9 @@ class DeadlineConnection:
             super().connect()
             return
         deadline = time.monotonic() + timeout
+        self._create_connection = lambda address, timeout, source: deadline_create_connection(
+            address, deadline, timeout, source
+        )
         expired = threading.Event()
 
         def expire():
@@ -710,6 +764,11 @@ def parse_endpoint(spec):
         raise ValueError(error) from None
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError(error)
+    if parts.username is not None or parts.password is not None:  # the message leaves them out too
+        raise ValueError(
+            f"invalid endpoint for {parts.hostname}: credentials in the URL (USER:PASSWORD@) would appear in the log "
+            "and the output files; give an API key with LLM_BENCH_API_KEY or --api-key instead"
+        )
     path = parts.path.rstrip("/") or "/v1"
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     if not name:
@@ -720,9 +779,15 @@ def parse_endpoint(spec):
 def _code_blocks(text):
     """Fenced blocks as (start, end, tag, code), in reply order. A block ends at the first closing fence after
     it: a run of at least as many backticks as its opening fence followed only by whitespace up to the end of
-    the line, either on its own line or glued to the end of the code. Scanning stops at an unclosed block.
-    The closing fences are found in one pass, so this stays linear in the reply length."""
-    closes = [(m.start(), m.end(), len(m.group(1))) for m in FENCE_CLOSE_RE.finditer(text)]
+    the line, either on its own line or glued to the end of the code. A glued fence ends the block only if no
+    closing fence on its own line comes before the next opening fence (as in CommonMark, where only a fence on
+    its own line closes a block): otherwise it's a code line that ends in backticks. Scanning stops at an
+    unclosed block. The closing fences are found in one pass and each is looked at a bounded number of times,
+    so this stays linear in the reply length."""
+    closes = []  # (start, end, length, on its own line)
+    for m in FENCE_CLOSE_RE.finditer(text):
+        own = not text[text.rfind("\n", 0, m.start()) + 1 : m.start()].strip()
+        closes.append((m.start(), m.end(), len(m.group(1)), own))
     starts = [c[0] for c in closes]
     longest_after = [0] * (len(closes) + 1)  # longest closing fence at or after each index
     for i in range(len(closes) - 1, -1, -1):
@@ -735,13 +800,29 @@ def _code_blocks(text):
             break
         while closes[i][2] < len(fence):  # shorter fences inside the block are code
             i += 1
-        code_end, end, _ = closes[i]
+        if not closes[i][3]:
+            i = _own_line_close(text, closes, i, len(fence))
+        code_end, end, _, _ = closes[i]
         line_start = text.rfind("\n", 0, code_end) + 1
         if line_start >= opening.end() and not text[line_start:code_end].strip():
             code_end = line_start  # a fence on its own (possibly indented) line: the code ends before it
         blocks.append((opening.start(), end, tag, text[opening.end() : code_end]))
         pos = end
     return blocks
+
+
+def _own_line_close(text, closes, i, fence):
+    """For a block whose first closing fence closes[i] is glued to a code line: the index of the first closing fence
+    on its own line, at least fence backticks long, that comes before the next opening fence (counting a bare fence
+    line, which could open or close, as a close), or i if there is none."""
+    after = FENCE_OPEN_RE.search(text, closes[i][1])
+    limit = after.end() if after else len(text) + 1
+    for j in range(i + 1, len(closes)):
+        if closes[j][0] >= limit:
+            break
+        if closes[j][3] and closes[j][2] >= fence:
+            return j
+    return i
 
 
 def _outside_code(blocks, positions):
@@ -771,6 +852,18 @@ def _closes_open_fence(text, blocks, pos):
     )
 
 
+def _as_think_tags(text):
+    """text with the OTHER_THINK_TAGS outside fenced code replaced by the <think> tags they stand for."""
+    others = [m.start() for m in OTHER_THINK_RE.finditer(text)]
+    if not others:
+        return text
+    chars = list(text)
+    for pos in _outside_code(_code_blocks(text), others):
+        tag = OTHER_THINK_RE.match(text, pos).group()
+        chars[pos : pos + len(tag)] = OTHER_THINK_TAGS[tag]
+    return "".join(chars)
+
+
 def strip_think(text):
     """Remove reasoning and return the rest of the reply:
     - <think>...</think> blocks;
@@ -780,8 +873,9 @@ def strip_think(text):
       reasoning left a fence open that would otherwise pair with the answer's closing fence (_closes_open_fence);
     - a reply that starts with a <think> that never closes (reasoning cut off by max_tokens) becomes "".
     Tags inside fenced code blocks are part of the code, and an unpaired <think> later in the reply is text.
+    [THINK] and [/THINK] outside code count as <think> and </think> (OTHER_THINK_TAGS).
     CRLF line endings become LF first (the fence patterns and the build tools, bash especially, expect LF)."""
-    text = text.replace("\r\n", "\n")
+    text = _as_think_tags(text.replace("\r\n", "\n"))
     # Search only up to the last </think>: an unclosed <think> after it would make each match attempt scan
     # to the end of the reply (quadratic in replies full of <think>).
     last_close = text.rfind(THINK_CLOSE)
@@ -828,17 +922,29 @@ def extract_code(text, lang=None):
 CGROUP_GUARD = """
 import os, sys
 from pathlib import Path
-relative = next(s.split("::", 1)[1] for s in
-                Path("/proc/self/cgroup").read_text().splitlines() if s.startswith("0::"))
-group = Path("/sys/fs/cgroup") / relative.lstrip("/")
-memory = (group / "memory.max").read_text().strip()
-tasks = (group / "pids.max").read_text().strip()
-swap = (group / "memory.swap.max").read_text().strip()
-quota, period = (group / "cpu.max").read_text().split()
-if (memory == "max" or not 0 < int(memory) <= int(sys.argv[1])
-        or tasks == "max" or not 0 < int(tasks) <= int(sys.argv[2])
-        or swap != "0" or quota == "max" or int(quota) > 2 * int(period)):
-    raise SystemExit("sandbox cgroup limits are not enforced")
+cgroup = [s.split("::", 1)[1] for s in Path("/proc/self/cgroup").read_text().splitlines() if s.startswith("0::")]
+if not cgroup:
+    raise SystemExit("sandbox cgroup limits can't be checked: no cgroup v2 entry in /proc/self/cgroup")
+group = Path("/sys/fs/cgroup") / cgroup[0].lstrip("/")
+def limit(name):
+    try:
+        return (group / name).read_text().split()
+    except OSError as e:
+        raise SystemExit(f"sandbox cgroup limits can't be checked: can't read {group / name} ({e.strerror}); is the "
+                         f"{name.split('.')[0]} controller (and, for memory.swap.max, swap accounting) available to "
+                         "systemd user services?") from None
+memory, tasks, swap, cpu = limit("memory.max")[0], limit("pids.max")[0], limit("memory.swap.max")[0], limit("cpu.max")
+problems = []
+if memory == "max" or not 0 < int(memory) <= int(sys.argv[1]):
+    problems.append(f"memory.max is {memory}")
+if tasks == "max" or not 0 < int(tasks) <= int(sys.argv[2]):
+    problems.append(f"pids.max is {tasks}")
+if swap != "0":
+    problems.append(f"memory.swap.max is {swap}")
+if cpu[0] == "max" or int(cpu[0]) > 2 * int(cpu[1]):
+    problems.append(f"cpu.max is {' '.join(cpu)}")
+if problems:
+    raise SystemExit("sandbox cgroup limits are not enforced: " + ", ".join(problems))
 os.execv(sys.argv[3], sys.argv[3:])
 """
 
@@ -1024,10 +1130,12 @@ def sandbox_command(tools, unit, cmd, cwd, timeout, go_cache_rw):
 
 class OutputReader:
     """Reads a pipe to its end in a thread, keeping its first `keep` bytes and dropping the rest, so the writer never
-    blocks on a full pipe and the parent never holds more than `keep` bytes."""
+    blocks on a full pipe and the parent never holds more than `keep` bytes. on_full, if given, is called once (in
+    the reading thread) when the kept bytes reach `keep`."""
 
-    def __init__(self, pipe, keep):
+    def __init__(self, pipe, keep, on_full=None):
         self.pipe, self.fd, self.keep, self.data, self.error = pipe, pipe.fileno(), keep, bytearray(), None
+        self.on_full = on_full
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
 
@@ -1036,6 +1144,8 @@ class OutputReader:
             while chunk := os.read(self.fd, 65536):
                 if len(self.data) < self.keep:
                     self.data += chunk[: self.keep - len(self.data)]
+                    if len(self.data) == self.keep and self.on_full:
+                        self.on_full()
         except OSError as e:
             self.error = e
 
@@ -1057,10 +1167,17 @@ def run_unit(command, timeout, systemctl, unit):
     through a pipe the parent alone reads: the sandbox holds only its write end, so nothing it does to its stdout
     (file status flags such as O_DIRECT or O_NONBLOCK) affects the parent's reads. Raises OSError if it can't start
     or its output can't be read, and subprocess.TimeoutExpired if it doesn't exit within timeout + 10 s (systemd
-    should end it at timeout)."""
+    should end it at timeout). Output beyond MAX_OUTPUT_BYTES stops the unit at once: the command has failed, and
+    a loop that prints would otherwise run until the time limit."""
     t0 = time.monotonic()
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    reader = OutputReader(process.stdout, MAX_OUTPUT_BYTES + 1)
+
+    def output_limit_reached():
+        stop_unit(unit, systemctl)
+        with contextlib.suppress(OSError):
+            process.kill()
+
+    reader = OutputReader(process.stdout, MAX_OUTPUT_BYTES + 1, output_limit_reached)
     try:
         rc = process.wait(timeout=timeout + 10)
         elapsed = time.monotonic() - t0
@@ -1100,7 +1217,8 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     timed_out = rc != 0 and elapsed >= timeout
     text = data[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     if len(data) > MAX_OUTPUT_BYTES:
-        return CmdResult(-1, text + "\n[output limit exceeded]", False)
+        text += "\n[output limit exceeded]"
+        rc = -1
     if timed_out:
         text += "\n" + TIME_LIMIT_MARKER.format(limit=timeout)
     return CmdResult(rc, text, timed_out)
@@ -1245,7 +1363,7 @@ def run_task(task, code, workdir):
         if finished(out, rendered[-1], lang["final_line"]):
             return True, f"{out}\n[exit {rc}]", None, None, None
         out += "\n" + EARLY_EXIT_NOTE.format(final_line=lang["final_line"])
-        return False, f"{out}\n[exit {rc}]", "test", rendered[-1], out
+        return False, f"{out}\n[exit {rc}]", "test", rendered[-1], command_output(out, rendered[-1])
     run_log = f"{out}\n[exit {rc}]"
     # The failing command is the last one whose "$ cmd" marker appears in the output.
     markers = {f"$ {r}": i for i, r in enumerate(rendered)}
@@ -1256,7 +1374,15 @@ def run_task(task, code, workdir):
         stage = "test"
     else:
         stage = "build"
-    return False, run_log, stage, rendered[index], out
+    return False, run_log, stage, rendered[index], command_output(out, rendered[index])
+
+
+def command_output(out, command):
+    """The part of out from the last "$ command" marker on: the feedback shows the failing command's output, not
+    the warnings of the build steps before it, which would take up the head that clip() keeps."""
+    lines = out.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.rstrip("\n") == f"$ {command}"]
+    return "".join(lines[starts[-1] :]) if starts else out
 
 
 def clip(text, limit=FEEDBACK_CHARS):
@@ -1513,7 +1639,8 @@ def send_chat(label, base, payload, opts, stop):
         try:
             resp = http_json(f"{base}/chat/completions", payload, timeout=opts.timeout, api_key=opts.api_key)
         except urllib.error.HTTPError as e:  # the server answered: model failed to load, crashed, prompt too long
-            log(f"{label}: HTTP {e.code}: {http_error_detail(e) or e.reason}", err=True)
+            with e:  # closes the connection whatever happens to the exception
+                log(f"{label}: HTTP {e.code}: {http_error_detail(e) or e.reason}", err=True)
             return "", None, {}, f"http_{e.code}", time.monotonic() - t0
         except TimeoutError:  # raised directly only while waiting for the reply: the model was too slow
             log(f"{label}: no reply within {opts.timeout}s", err=True)
@@ -1954,7 +2081,23 @@ def results_row(raw, where):
         row[k] = token_count(row[k], empty)
     # Empty in rows from before the column existed; summarize falls back to an estimate for them.
     row["usage_seconds"] = float(row["usage_seconds"]) if row.get("usage_seconds") else None
+    check_row_values(row, where)
     return row
+
+
+def check_row_values(row, where):
+    """Raise ValueError (naming where) for numbers no run writes, which would break the summary's arithmetic later:
+    passed other than 0 or 1, a negative count, or seconds that are negative, infinite or NaN."""
+    if row["passed"] not in (0, 1):
+        raise ValueError(f"{where}: passed is {row['passed']}, not 0 or 1")
+    for k in ("passed_on", "attempts"):
+        if row[k] < 0:
+            raise ValueError(f"{where}: {k} is negative")
+    if row["repeat"] < 1:
+        raise ValueError(f"{where}: repeat is {row['repeat']}, not a round number from 1")
+    for k in (*FLOAT_FIELDS, "usage_seconds"):
+        if row[k] is not None and not (math.isfinite(row[k]) and row[k] >= 0):
+            raise ValueError(f"{where}: {k} is {row[k]}, not a number of seconds")
 
 
 def read_results(path):

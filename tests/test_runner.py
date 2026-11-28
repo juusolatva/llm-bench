@@ -4,14 +4,13 @@ import csv
 import json
 import re
 import shlex
-import socket
 import sys
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
-from conftest import MODEL_DIR, Reply
+from conftest import MODEL_DIR, Reply, free_port
 from conftest import MockServer as llm_bench_mock_server
 
 import llm_bench
@@ -157,12 +156,6 @@ def test_chat_success(mock_server):
     text, finish, usage, error, seconds = chat(s)
     assert (text, finish, usage, error) == ("hello", "stop", {"prompt_tokens": 10, "completion_tokens": 5}, None)
     assert 0 < seconds < 5  # duration of the request
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def test_chat_server_down_retries_then_gives_up(monkeypatch, capsys):
@@ -953,6 +946,28 @@ def test_read_results_rejects_other_csv(tmp_path):
     path = tmp_path / "x.csv"
     path.write_text("a,b\n1,2\n")
     with pytest.raises(ValueError, match="not a results file"):
+        llm_bench.read_results(path)
+
+
+@pytest.mark.parametrize(
+    ("cells", "message"),
+    [
+        ("2,1,1,1.0,", "line 2: passed is 2, not 0 or 1"),
+        ("1,-1,1,1.0,", "line 2: passed_on is negative"),
+        ("1,1,0,1.0,", "line 2: repeat is 0"),
+        ("1,1,1,nan,", "line 2: seconds is nan"),
+        ("1,1,1,inf,", "line 2: seconds is inf"),
+        ("1,1,1,-1,", "line 2: seconds is -1.0"),
+        ("1,1,1,1.0,-inf", "line 2: usage_seconds is -inf"),
+    ],
+)
+def test_read_results_rejects_impossible_numbers(tmp_path, cells, message):
+    # Values no run writes, which would otherwise crash the summary (math.sqrt of a negative variance) or skew it.
+    path = tmp_path / "r.csv"
+    path.write_text(
+        f"endpoint,model,task,lang,passed,passed_on,repeat,seconds,usage_seconds\ne,m,py_a,python,{cells}\n"
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
         llm_bench.read_results(path)
 
 

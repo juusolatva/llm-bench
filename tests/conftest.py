@@ -1,4 +1,5 @@
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -19,6 +20,13 @@ def fresh_sandbox_stop(monkeypatch):
 
 # Transcript directory of MockServer's default model "test/model" ("/" isn't safe, so the name is hashed).
 MODEL_DIR = llm_bench.model_dirs(["test/model"])["test/model"]
+
+
+def free_port():
+    """A local TCP port that nothing listens on (closed again right away)."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 @dataclass
