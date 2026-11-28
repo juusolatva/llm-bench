@@ -2944,21 +2944,26 @@ def parse_args():
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if args.tag:
         args.tag = safe_name(args.tag)
-    args.params = {}
-    for key, value in args.param:
-        if key in args.params and not same_json_value(args.params[key], value):
+    args.params = request_params(ap, args.param, args.temperature)
+    return args
+
+
+def request_params(ap, param, temperature):
+    """The extra request parameters from --param (KEY, VALUE) pairs and --temperature; conflicting values or
+    parameters the benchmark sets itself end the program with a usage error."""
+    params = {}
+    for key, value in param:
+        if key in params and not same_json_value(params[key], value):
             ap.error(f"--param {key}=... is given twice with different values")
-        args.params[key] = value
-    if args.temperature is not None and not same_json_value(
-        args.params.get("temperature", args.temperature), args.temperature
-    ):
-        ap.error("--temperature conflicts with --param temperature=...")
-    if args.temperature is not None:
-        args.params["temperature"] = args.temperature
-    reserved = sorted(RESERVED_PARAMS & args.params.keys())
+        params[key] = value
+    if temperature is not None:
+        if not same_json_value(params.get("temperature", temperature), temperature):
+            ap.error("--temperature conflicts with --param temperature=...")
+        params["temperature"] = temperature
+    reserved = sorted(RESERVED_PARAMS & params.keys())
     if reserved:
         ap.error(f"--param can't set {', '.join(reserved)}")
-    return args
+    return params
 
 
 def check_results_file(path):
