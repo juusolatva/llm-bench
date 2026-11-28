@@ -599,6 +599,11 @@ def test_connection_stops_a_trickling_proxy_reply_at_its_timeout():
         ("192.168.1.20", True),
         ("10.0.0.5", True),
         ("fe80::1", True),
+        ("100.64.0.1", True),  # shared address space: carrier-grade NAT, mesh VPNs
+        ("100.127.255.254", True),
+        ("::ffff:100.100.1.2", True),
+        ("100.128.0.1", False),
+        ("100.63.255.255", False),
         ("gpu-box", True),
         ("gpu-box.lan", True),
         ("gpu-box.local.", True),

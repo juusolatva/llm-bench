@@ -540,6 +540,32 @@ def test_stop_active_hooks_kills_a_running_command():
     assert not llm_bench.ACTIVE_HOOKS
 
 
+@pytest.mark.parametrize(
+    "server_options",
+    [
+        {"replies": [Reply(status=500, body=b"{}")]},  # the task's request fails
+        {"replies": ["```python\nx = 1\n```"], "probe_reply": Reply(status=500, body=b"{}")},  # loading fails
+    ],
+)
+def test_request_failing_after_interrupt_is_not_recorded(mock_server, tmp_path, monkeypatch, server_options):
+    # Ctrl-C may also stop a server started from the same terminal, so the request in flight fails: that error says
+    # nothing about the model, so neither a failed trial nor a "load" row for every remaining trial is written.
+    s, stop = mock_server(**server_options), threading.Event()
+    real_http_json = llm_bench.http_json
+
+    def http_json(*args, **kwargs):
+        stop.set()  # as if Ctrl-C arrived while waiting for the reply
+        return real_http_json(*args, **kwargs)
+
+    monkeypatch.setattr(llm_bench, "http_json", http_json)
+    rows = []
+    llm_bench.run_endpoint(
+        "m", s.url, ["test/model"], TASKS[:3], opts(), tmp_path / "results.csv", tmp_path / "runs", rows, stop
+    )
+    assert rows == []
+    assert llm_bench.read_results(tmp_path / "results.csv") == []
+
+
 def test_interrupted_attempt_is_not_recorded(mock_server, tmp_path, monkeypatch):
     # Ctrl-C stops the sandbox mid-test: that failure says nothing about the solution, so the trial gets no row
     # (--resume runs it later) instead of a failed one.
@@ -1209,9 +1235,9 @@ def test_print_summary_csv(capsys):
         "rounds_min": "1",
         "rounds_max": "2",
         "pass1": "1.5",
-        "pass1_sd": "0.707",
+        "pass1_sd": "",  # go_b has one trial: the spread is unknown
         "passed": "1.5",
-        "passed_sd": "0.707",
+        "passed_sd": "",
         "python": "0.5",
         "python_tasks": "1",
         "go": "1.0",
@@ -1232,6 +1258,24 @@ def test_print_summary_csv_single_round_has_no_spread(capsys):
     (rec,) = csv.DictReader(capsys.readouterr().out.splitlines())
     assert (rec["pass1_sd"], rec["passed_sd"], rec["reasoning_tokens"], rec["tok_per_s"]) == ("", "", "", "")
     assert rec["seconds_per_pass"] == ""  # no passes
+
+
+def test_print_summary_no_spread_where_a_task_has_one_trial(capsys):
+    rows = [row("py_a", 1, model="multi"), row("py_a", 0, model="multi"), row("py_b", 1, model="multi")]
+    rows += [row("py_a", 1, model="multi"), row("py_b", 0, model="multi")]  # 3 + 2 trials: spread known
+    rows += [row("py_a", 1, model="one"), row("py_b", 0, model="one")]  # one round alongside the repeated model
+    rows += [row("py_a", 1, model="mixed"), row("py_a", 1, model="mixed"), row("py_b", 1, model="mixed")]
+    llm_bench.print_summary(rows)
+    out = capsys.readouterr().out
+    lines = {line.split()[1]: line.split() for line in out.splitlines() if line.startswith("e ")}
+    assert lines["multi"][2:5] == ["2-3", "1.2±0.9/2", "1.2±0.9/2"]
+    assert lines["one"][2:5] == ["1", "1.0/2", "1.0/2"]  # no ±0.0: one trial says nothing about the spread
+    assert lines["mixed"][2:5] == ["1-2", "2.0/2", "2.0/2"]  # py_b's single trial would count as zero variance
+    assert "no ± for e/mixed, e/one: some tasks have only one trial" in out  # in summary order
+    llm_bench.print_summary(rows, fmt="csv")
+    recs = {r["model"]: r for r in csv.DictReader(capsys.readouterr().out.splitlines())}
+    assert (recs["multi"]["pass1_sd"], recs["multi"]["passed_sd"]) == ("0.913", "0.913")  # sqrt(1/3 + 1/2)
+    assert [(r["pass1_sd"], r["passed_sd"]) for m, r in recs.items() if m != "multi"] == [("", ""), ("", "")]
 
 
 PER_TASK_ROWS = [

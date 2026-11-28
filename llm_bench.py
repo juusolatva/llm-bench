@@ -593,15 +593,23 @@ LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
 LOCAL_DOMAINS = (".localhost", ".local", ".lan", ".internal", ".home.arpa")
 
 
+# RFC 6598 shared address space: carrier-grade NAT, and the addresses of mesh VPNs (Tailscale, Headscale, NetBird),
+# whose peers a proxy can't reach either. ipaddress counts it as neither private nor global.
+SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
 def is_local_host(host):
-    """Whether host is this machine or on the local network: a loopback, private or link-local address, localhost,
-    a name without a dot (gpu-box) or one under LOCAL_DOMAINS. Requests to these skip proxies."""
+    """Whether host is this machine or on the local network: a loopback, private, link-local or shared
+    (SHARED_ADDRESS_SPACE) address, localhost, a name without a dot (gpu-box) or one under LOCAL_DOMAINS.
+    Requests to these skip proxies."""
     host = (host or "").lower().rstrip(".")
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return "." not in host or host == "localhost" or host.endswith(LOCAL_DOMAINS)
-    return ip.is_loopback or ip.is_private or ip.is_link_local
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_private or ip.is_link_local or ip in SHARED_ADDRESS_SPACE
 
 
 HTTP_READ_PIECE_BYTES = 64 * 1024
@@ -1489,7 +1497,17 @@ def chat(label, base, payload, opts, stop):
     error is None for a usable reply; otherwise it is the row's finish_reason for a failure that is the
     model's (or its loader's) problem rather than the server's: "timeout", "http_<code>", "bad_response"
     or "disconnected". If the server itself is unreachable, wait and retry the same request; raise
-    ServerDown when it stays down, Interrupted if the run is interrupted while waiting."""
+    ServerDown when it stays down, Interrupted if the run is interrupted while waiting or during the request:
+    Ctrl-C may also have stopped a server started from the same terminal, so an error then says nothing about
+    the model, and a row written after Ctrl-C could land after the summary."""
+    result = send_chat(label, base, payload, opts, stop)
+    if stop.is_set():
+        raise Interrupted
+    return result
+
+
+def send_chat(label, base, payload, opts, stop):
+    """chat() without the final check for Ctrl-C."""
     for delay in (*SERVER_RETRY_DELAYS_S, None):
         t0 = time.monotonic()
         try:
@@ -2318,9 +2336,17 @@ def group_label(g, layout):
     return label + (f" [{display_label(g['settings'])}]" if layout["show_settings"] else "")
 
 
-def score_cell(value, var, n, repeated):
-    """A pass count: mean±sd/n with several rounds, otherwise count/n."""
-    return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if repeated else f"{round(value)}/{n}"
+def has_spread(g):
+    """Whether the group's spread can be estimated: every task needs at least two trials (one trial of a task says
+    nothing about its variance, so counting it as zero would make the spread look smaller than it is)."""
+    return min(g["trials"]) > 1
+
+
+def score_cell(value, var, n, repeated, spread):
+    """A pass count: mean±sd/n with several rounds (mean/n when the spread can't be estimated), otherwise count/n."""
+    if not repeated:
+        return f"{round(value)}/{n}"
+    return f"{value:.1f}±{math.sqrt(var):.1f}/{n}" if spread else f"{value:.1f}/{n}"
 
 
 def lang_cell(lang_counts, repeated):
@@ -2337,7 +2363,9 @@ def summary_row(g, layout):
     if repeated:
         lo, hi = min(g["trials"]), max(g["trials"])
         cells.append(str(lo) if lo == hi else f"{lo}-{hi}")
-    cells += [score_cell(g["p1"], g["var1"], g["n"], repeated), score_cell(g["pass"], g["var"], g["n"], repeated)]
+    spread = has_spread(g)
+    cells += [score_cell(g["p1"], g["var1"], g["n"], repeated, spread)]
+    cells += [score_cell(g["pass"], g["var"], g["n"], repeated, spread)]
     cells += [lang_cell(g["langs"][lang], repeated) if lang in g["langs"] else "-" for lang in layout["langs"]]
     cells += [f"{g['pt']:.0f}", f"{g['ct']:.0f}"]
     if layout["reasoning"]:
@@ -2361,16 +2389,15 @@ def summary_cells(groups, layout):
 
 
 def summary_records(groups, layout):
-    """The summary as CSV records: plain numbers, empty where a value is unknown (or, with one round, the spread)."""
+    """The summary as CSV records: plain numbers, empty where a value is unknown (the spread, too, unless every
+    task has several trials)."""
 
     def num(value, digits):
         return "" if value is None else round(value, digits)
 
-    def spread(var):
-        return round(math.sqrt(var), 3) if layout["repeated"] else ""
-
     records = []
     for g in groups:
+        spread = has_spread(g)
         rec = {
             "endpoint": spreadsheet_safe(g["endpoint"]),
             "model": spreadsheet_safe(g["model"]),
@@ -2379,9 +2406,9 @@ def summary_records(groups, layout):
             "rounds_min": min(g["trials"]),
             "rounds_max": max(g["trials"]),
             "pass1": num(g["p1"], 3),
-            "pass1_sd": spread(g["var1"]),
+            "pass1_sd": round(math.sqrt(g["var1"]), 3) if spread else "",
             "passed": num(g["pass"], 3),
-            "passed_sd": spread(g["var"]),
+            "passed_sd": round(math.sqrt(g["var"]), 3) if spread else "",
         }
         for lang in layout["langs"]:
             passed, n = g["langs"].get(lang, (None, 0))  # .get: langs is a defaultdict
@@ -2443,6 +2470,9 @@ def summary_notes(groups, dropped, layout, escape=str):
             "with several rounds: mean passes per round ± the standard deviation of one round's score; "
             "tokens and seconds are means per round"
         )
+    unspread = [escape(group_label(g, layout)) for g in groups if not has_spread(g)]
+    if layout["repeated"] and unspread:
+        notes.append(f"no ± for {', '.join(unspread)}: some tasks have only one trial, so the spread is unknown")
     if dropped:
         notes.append(
             f"{dropped} row(s) from older versions of a task were left out: models with the same settings "
