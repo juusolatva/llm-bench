@@ -34,19 +34,21 @@ static void harness_on_death(void) {
     fprintf(stderr, ", key, %zu, val, %zu), where key has %zu bytes and val has %zu bytes\n", harness_ks, harness_vs,
             harness_ks, harness_vs);
 }
+/* Whether the n bytes at p contain a NUL (no access when n is 0, where p may be NULL). */
+static int harness_has_nul(const char *p, size_t n) { return n > 0 && memchr(p, '\0', n) != NULL; }
 static void harness_t(const char *line, size_t ks, size_t vs, int want, const char *wk, const char *wv) {
     harness_line = line, harness_ks = ks, harness_vs = vs;
     size_t n = strlen(line) + 1;
     char *l = harness_alloc(n); memcpy(l, line, n);
     char *k = harness_alloc(ks), *v = harness_alloc(vs);   /* exact sizes: ASan catches overflows */
-    memset(k, 'X', ks);
-    memset(v, 'X', vs);
+    if (ks) memset(k, 'X', ks);                             /* malloc(0) may return NULL */
+    if (vs) memset(v, 'X', vs);
     int r = parse_kv(l, k, ks, v, vs);
-    if (r == 1 && (!memchr(k, '\0', ks) || !memchr(v, '\0', vs))) {
+    if (r == 1 && (!harness_has_nul(k, ks) || !harness_has_nul(v, vs))) {
         fputs("parse_kv(", stderr);
         harness_put_escaped(line);
         fprintf(stderr, ", key, %zu, val, %zu): got 1 with %s not NUL-terminated within its %zu bytes, want %d", ks, vs,
-                memchr(k, '\0', ks) ? "val" : "key", memchr(k, '\0', ks) ? vs : ks, want);
+                harness_has_nul(k, ks) ? "val" : "key", harness_has_nul(k, ks) ? vs : ks, want);
         if (want == 1) {
             fputs(" key=", stderr); harness_put_escaped(wk);
             fputs(" val=", stderr); harness_put_escaped(wv);
