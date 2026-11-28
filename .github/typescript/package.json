@@ -1,0 +1,8 @@
+{
+  "name": "llm-bench-ci-typescript",
+  "private": true,
+  "description": "The TypeScript compiler that CI installs (npm ci) for the TypeScript tests.",
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

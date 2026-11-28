@@ -36,8 +36,15 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends golang-go
           echo /usr/lib/go/bin >> "$GITHUB_PATH"
       - run: go version && readlink -f "$(command -v go)"
+      # tsc for the TypeScript tests, from .github/typescript's lockfile, on the runner's Node: the sandbox mounts
+      # the resolved node binary and the typescript package themselves, wherever they are.
+      - name: Install tsc
+        run: |
+          npm ci --prefix .github/typescript --ignore-scripts --no-fund --no-audit
+          echo "$PWD/.github/typescript/node_modules/.bin" >> "$GITHUB_PATH"
+      - run: node --version && tsc --version
       # Sandbox (end-to-end) tests skip themselves when bwrap + a systemd user session are unavailable, and a task's
-      # tests skip when its toolchain isn't there for the sandbox (TypeScript here: no tsc).
+      # tests skip when its toolchain isn't there for the sandbox.
       - run: uv run --locked --no-build --group dev pytest -rs
 
   sonarqube:
@@ -63,6 +70,10 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends golang-go
           echo /usr/lib/go/bin >> "$GITHUB_PATH"
       - run: go version && readlink -f "$(command -v go)"
+      - name: Install tsc
+        run: |
+          npm ci --prefix .github/typescript --ignore-scripts --no-fund --no-audit
+          echo "$PWD/.github/typescript/node_modules/.bin" >> "$GITHUB_PATH"
       # Coverage for the quality gate, from the same tests as the test job.
       - run: uv run --locked --no-build --group dev coverage run -m pytest -q -rs
       - run: uv run --locked --no-build --group dev coverage xml
