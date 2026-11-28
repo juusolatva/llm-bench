@@ -668,6 +668,28 @@ def test_deadline_socket_stops_sending_at_the_deadline():
     assert sock.timeout == 5  # restored for the reads that follow
 
 
+def test_deadline_socket_send_of_nothing_fails_at_once():
+    class Sock:
+        def gettimeout(self):
+            return 5
+
+        def settimeout(self, timeout):
+            pass
+
+        def send(self, data):
+            return 0
+
+    start = time.monotonic()
+    with pytest.raises(OSError, match="connection closed while sending the request"):
+        llm_bench.DeadlineSocket(Sock(), time.monotonic() + 5).sendall(b"x")
+    assert time.monotonic() - start < 1
+
+
+def test_command_output_finds_a_marker_with_crlf():
+    assert llm_bench.command_output("$ a\r\nwarn\r\n$ b\r\nFAIL\r\n", "b") == "$ b\r\nFAIL\r\n"
+    assert llm_bench.command_output("no markers\n", "b") == "no markers\n"
+
+
 def test_deadline_create_connection_gives_all_addresses_one_deadline(monkeypatch):
     # Two addresses that never answer: together they take the deadline, not the timeout each.
     addresses = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("192.0.2.1", 80))] * 2

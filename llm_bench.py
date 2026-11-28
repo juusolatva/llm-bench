@@ -547,7 +547,10 @@ class DeadlineSocket:
                 if remaining <= 0:
                     raise TimeoutError(TIMED_OUT)
                 self._sock.settimeout(min(remaining, wait) if wait else remaining)
-                view = view[self._sock.send(view[:HTTP_SEND_PIECE_BYTES]) :]
+                sent = self._sock.send(view[:HTTP_SEND_PIECE_BYTES])
+                if not sent:  # would otherwise spin until the deadline
+                    raise OSError("connection closed while sending the request")
+                view = view[sent:]
         finally:
             self._sock.settimeout(wait)
 
@@ -1381,7 +1384,7 @@ def command_output(out, command):
     """The part of out from the last "$ command" marker on: the feedback shows the failing command's output, not
     the warnings of the build steps before it, which would take up the head that clip() keeps."""
     lines = out.splitlines(keepends=True)
-    starts = [i for i, line in enumerate(lines) if line.rstrip("\n") == f"$ {command}"]
+    starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == f"$ {command}"]  # as splitlines() does
     return "".join(lines[starts[-1] :]) if starts else out
 
 
