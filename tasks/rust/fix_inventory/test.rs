@@ -10,7 +10,7 @@ mod harness_tests {
             self.log.push(format!("add({:?}, {})", name, qty));
         }
         fn remove(&mut self, name: &str, qty: u32, want_ok: bool) {
-            let got = self.inv.remove(name, qty);
+            let got: Result<(), String> = self.inv.remove(name, qty);
             assert!(got.is_ok() == want_ok, "after {}: remove({:?}, {}) returned {:?}, want {}",
                     self.log.join(", "), name, qty, got, if want_ok { "Ok(())" } else { "an Err" });
             self.log.push(format!("remove({:?}, {})", name, qty));

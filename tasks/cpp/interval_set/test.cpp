@@ -1,11 +1,12 @@
+#include "solution.hpp"
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
-#include "solution.hpp"
 
 using harness_vec = std::vector<std::pair<long, long>>;
 static int harness_fails;
@@ -34,11 +35,11 @@ struct harness_set {
         log += ", s.remove(" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
     }
     void expect(const harness_vec& want) {
-        auto got = s.intervals();
+        auto got = std::as_const(s).intervals();
         if (got != want) fail("s.intervals() = " + harness_str(got) + ", want " + harness_str(want));
     }
     void contains(long x, bool want) {
-        if (s.contains(x) != want)
+        if (std::as_const(s).contains(x) != want)
             fail("s.contains(" + std::to_string(x) + ") = " + (want ? "false" : "true") + ", want " +
                  (want ? "true" : "false") + " (s.intervals() = " + harness_str(s.intervals()) + ")");
     }
@@ -52,7 +53,7 @@ static void harness_check_time(const char* call, long i) {
     if (secs < 20) return;
     char where[64] = "";
     if (i >= 0) std::snprintf(where, sizeof where, " with i = %ld", i);
-    std::fprintf(stderr, "too slow: the large-set test (add(3i, 3i+1) for i = 0..199999; then contains(3i) and "
+    std::fprintf(stderr, "too slow: the large-set test (add(3i, 3i+1) for i = 399999 down to 0; then contains(3i) and "
                  "contains(3i+1) for each i; then remove(3i, 3i+1) for even i; then add(3i, 3i+7) for i = 1, 5, 9, ...; "
                  "then intervals()) has taken %.1f s (limit 20 s) and the last call to return was %s%s; contains must "
                  "run in O(log n), and add and remove in O(log n) plus O(1) per stored interval they merge or delete\n",
@@ -100,13 +101,23 @@ int main() {
     h.remove(3, 4);
     h.add(3, 4);
     h.expect({{0, 10}});
+    h.add(LONG_MIN, -(1L << 40));                      // endpoints beyond 32 bits, up to the limits of long
+    h.add(1L << 40, LONG_MAX);
+    h.expect({{LONG_MIN, -(1L << 40)}, {0, 10}, {1L << 40, LONG_MAX}});
+    h.contains(LONG_MIN, true);
+    h.contains(-(1L << 40), false);
+    h.contains(LONG_MAX - 1, true);
+    h.contains(LONG_MAX, false);
+    h.remove(LONG_MIN, LONG_MAX);
+    h.expect({});
 
-    // Large set: add [3i, 3i+1) for i < 200000, remove the even i, then add [3i, 3i+7) for i = 1, 5, 9, ...
-    // which merges each with the interval starting at 3(i+2). Expected: n/4 intervals [3i, 3i+7).
+    // Large set: add [3i, 3i+1) for i < 400000 in descending order (each one in front of all the others), remove
+    // the even i, then add [3i, 3i+7) for i = 1, 5, 9, ... which merges each with the interval starting at 3(i+2).
+    // Expected: n/4 intervals [3i, 3i+7).
     harness_t0 = std::chrono::steady_clock::now();
     IntervalSet big;
-    const long n = 200000;
-    for (long i = 0; i < n; i++) {
+    const long n = 400000;
+    for (long i = n - 1; i >= 0; i--) {
         big.add(3 * i, 3 * i + 1);
         harness_check_time("add(3i, 3i+1)", i);
     }
@@ -129,13 +140,23 @@ int main() {
         big.add(3 * i, 3 * i + 7);
         harness_check_time("add(3i, 3i+7)", i);
     }
-    auto iv = big.intervals();
+    auto iv = std::as_const(big).intervals();
     harness_check_time("intervals()", -1);
     harness_vec head(iv.begin(), iv.begin() + std::min<std::size_t>(iv.size(), 3));
     if (iv.size() != static_cast<std::size_t>(n / 4) || head != harness_vec{{3, 10}, {15, 22}, {27, 34}}) {
         std::fprintf(stderr, "large set: intervals() has %zu intervals starting %s, want %ld starting { [3,10) [15,22) [27,34) }\n",
                      iv.size(), harness_str(head).c_str(), n / 4);
         harness_fails++;
+    } else {
+        for (std::size_t k = 0; k < iv.size(); k++) {
+            long i = 4 * static_cast<long>(k) + 1;
+            if (iv[k] != std::pair<long, long>{3 * i, 3 * i + 7}) {
+                std::fprintf(stderr, "large set: intervals()[%zu] = [%ld,%ld), want [%ld,%ld) (the intervals are [3i, 3i+7) "
+                             "for i = 1, 5, 9, ...)\n", k, iv[k].first, iv[k].second, 3 * i, 3 * i + 7);
+                harness_fails++;
+                break;
+            }
+        }
     }
     if (harness_fails) return 1;
     std::puts("harness: all checks passed");

@@ -104,6 +104,23 @@ func TestConcurrent(t *testing.T) {
 					t.Errorf("concurrent GET %s right after PUT %q: got %d %q, want 200 %q", key, val, c, b, val)
 					return
 				}
+				if c, _ := harnessDo(h, "DELETE", key, ""); c != 204 {
+					t.Errorf("concurrent DELETE %s right after PUT %q: got %d, want 204", key, val, c)
+					return
+				}
+				if c, b := harnessDo(h, "GET", key, ""); c != 404 {
+					t.Errorf("concurrent GET %s right after DELETE: got %d %q, want 404", key, c, b)
+					return
+				}
+				// A key that every goroutine writes and deletes: DELETE finds it or not, depending on the others.
+				if c, _ := harnessDo(h, "PUT", "/kv/shared", val); c != 204 {
+					t.Errorf("concurrent PUT /kv/shared with body %q: got %d, want 204", val, c)
+					return
+				}
+				if c, _ := harnessDo(h, "DELETE", "/kv/shared", ""); c != 204 && c != 404 {
+					t.Errorf("concurrent DELETE /kv/shared (other goroutines PUT and DELETE it too): got %d, want 204 or 404", c)
+					return
+				}
 			}
 		}(i)
 	}

@@ -1,8 +1,8 @@
+#include "solution.hpp"
 #include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
-#include "solution.hpp"
 
 using harness_vec = std::vector<std::pair<std::string, int>>;
 static int harness_fails;

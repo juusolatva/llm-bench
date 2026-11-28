@@ -1,13 +1,15 @@
+#include <sanitizer/common_interface_defs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 int parse_kv(const char *line, char *key, size_t keysz, char *val, size_t valsz);
 
 static int harness_fails;
-/* malloc that exits instead of returning NULL, so a failed allocation isn't blamed on the solution. */
+/* malloc that exits instead of returning NULL, so a failed allocation isn't blamed on the solution (malloc(0) may
+   return NULL; any access through it is an error anyway). */
 static void *harness_alloc(size_t n) {
     void *p = malloc(n);
-    if (!p) { fputs("harness: allocation failed\n", stderr); exit(2); }
+    if (!p && n) { fputs("harness: allocation failed\n", stderr); exit(2); }
     return p;
 }
 /* Print s in double quotes with control characters escaped (\n, \r, \t, \xNN), so whitespace in inputs is visible. */
@@ -23,10 +25,22 @@ static void harness_put_escaped(const char *s) {
     }
     fputc('"', stderr);
 }
+/* The call in progress, named when a sanitizer stops the program (its report names only lines of the harness). */
+static const char *harness_line;
+static size_t harness_ks, harness_vs;
+static void harness_on_death(void) {
+    fputs("the sanitizer stopped the program during parse_kv(", stderr);
+    harness_put_escaped(harness_line);
+    fprintf(stderr, ", key, %zu, val, %zu), where key has %zu bytes and val has %zu bytes\n", harness_ks, harness_vs,
+            harness_ks, harness_vs);
+}
 static void harness_t(const char *line, size_t ks, size_t vs, int want, const char *wk, const char *wv) {
+    harness_line = line, harness_ks = ks, harness_vs = vs;
     size_t n = strlen(line) + 1;
     char *l = harness_alloc(n); memcpy(l, line, n);
     char *k = harness_alloc(ks), *v = harness_alloc(vs);   /* exact sizes: ASan catches overflows */
+    memset(k, 'X', ks);
+    memset(v, 'X', vs);
     int r = parse_kv(l, k, ks, v, vs);
     if (r == 1 && (!memchr(k, '\0', ks) || !memchr(v, '\0', vs))) {
         fputs("parse_kv(", stderr);
@@ -58,6 +72,7 @@ static void harness_t(const char *line, size_t ks, size_t vs, int want, const ch
     free(l); free(k); free(v);
 }
 int main(void) {
+    __sanitizer_set_death_callback(harness_on_death);
     harness_t("name = Bob\n", 32, 32, 1, "name", "Bob");
     harness_t("  path=/usr/local/bin  ", 32, 32, 1, "path", "/usr/local/bin");
     harness_t("greeting = hello world \r\n", 32, 32, 1, "greeting", "hello world");
@@ -81,6 +96,12 @@ int main(void) {
     harness_t("abcd=1", 4, 32, -1, 0, 0);
     harness_t("k=abc", 4, 4, 1, "k", "abc");
     harness_t("k=abcd", 4, 4, -1, 0, 0);
+    harness_t("k=", 32, 1, 1, "k", "");
+    harness_t("k=v", 32, 1, -1, 0, 0);
+    harness_t("k=", 1, 1, -1, 0, 0);
+    harness_t("k=v", 0, 32, -1, 0, 0);
+    harness_t("k=v", 32, 0, -1, 0, 0);
+    harness_t("# comment", 0, 0, 0, 0, 0);
     if (harness_fails) return 1;
     puts("harness: all checks passed");
     return 0;

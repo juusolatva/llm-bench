@@ -86,6 +86,33 @@ else:
 assert len(d) == 3, f"{case}: f was called {len(d)} times, want 3"
 assert close(sleeps, [1.0, 2.0]), f"{case}: time.sleep calls {sleeps}, want [1.0, 2.0]"
 
+sleeps.clear(); z = []
+@retry(times=3, exceptions=(ValueError,), delay=1)
+def returns_none():
+    z.append(1)
+    if len(z) == 1:
+        raise ValueError("x")
+case = "retry(times=3, exceptions=(ValueError,), delay=1) on f() that raises ValueError once, then returns None"
+try:
+    got = returns_none()
+except Exception as e:
+    raise AssertionError(f"{case}: raised {e!r} after {len(z)} calls, want None after 2 calls") from None
+assert got is None and len(z) == 2 and close(sleeps, [1]), \
+    f"{case}: returned {got!r} after {len(z)} calls with time.sleep calls {sleeps}, want None after 2 calls and [1]"
+
+sleeps.clear(); z = []
+@retry(times=3, delay=1)
+def returns_zero():
+    z.append(1)
+    return 0
+case = "retry(times=3, delay=1) on f() that returns 0"
+try:
+    got = returns_zero()
+except Exception as e:
+    raise AssertionError(f"{case}: raised {e!r} after {len(z)} calls, want 0 after 1 call") from None
+assert got == 0 and len(z) == 1 and sleeps == [], \
+    f"{case}: returned {got!r} after {len(z)} calls with time.sleep calls {sleeps}, want 0 after 1 call and no sleep"
+
 for bad in (0, -1):
     try:
         retry(times=bad)

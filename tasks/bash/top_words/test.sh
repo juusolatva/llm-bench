@@ -35,6 +35,16 @@ check "$T/ties" "ties"
 printf '%s\n' '10 alpha' '9 gamma' '2 beta' > "$T/want"
 check "$T/counts" "counts"
 
+# Lines that start with spaces, punctuation and digits, also at the start of the file: no empty word may be
+# counted (with a count of 1 it would sort before "dog").
+printf '  "The" cat\n42 the\n... the, cat?\n-- dog\n' > "$T/leading"
+printf '%s\n' '3 the' '2 cat' '1 dog' > "$T/want"
+check "$T/leading" "leading"
+
+printf ' 123 !?\n\n4.5\n' > "$T/no letters"
+: > "$T/want"
+check "$T/no letters" "no letters" any-exit
+
 printf 'b a b\n' > "$T/two"
 printf '%s\n' '2 b' '1 a' > "$T/want"
 check "$T/two" "two" any-exit

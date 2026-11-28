@@ -3,7 +3,7 @@ mod harness_tests {
     use solution::topo_order;
 
     fn harness_check(n: usize, edges: &[(usize, usize)], want: &[usize]) {
-        let got = topo_order(n, edges);
+        let got: Result<Vec<usize>, String> = topo_order(n, edges);
         assert!(got.as_deref() == Ok(want), "topo_order({}, {:?}) = {:?}, want Ok({:?})", n, edges, got, want);
     }
 
@@ -22,6 +22,7 @@ mod harness_tests {
         harness_check(3, &[(2, 0)], &[1, 2, 0]);
         harness_check(4, &[(3, 1), (2, 1), (3, 0)], &[2, 3, 0, 1]);
         harness_check(5, &[(4, 0), (4, 0), (1, 0), (3, 2)], &[1, 3, 2, 4, 0]);
+        harness_check(5, &[(4, 0), (1, 0), (1, 0), (3, 2)], &[1, 3, 2, 4, 0]);
         harness_check(6, &[(5, 2), (5, 0), (4, 0), (4, 1), (2, 3), (3, 1)], &[4, 5, 0, 2, 3, 1]);
     }
 
@@ -35,7 +36,7 @@ mod harness_tests {
             (0, vec![(0, 0)]),
             (5, vec![(0, 1), (2, 3), (3, 4), (4, 2)]),
         ] {
-            let got = topo_order(n, &edges);
+            let got: Result<Vec<usize>, String> = topo_order(n, &edges);
             assert!(got.is_err(), "topo_order({}, {:?}) = {:?}, want an Err", n, edges, got);
         }
     }
@@ -60,7 +61,14 @@ mod harness_tests {
             want.push(2 * k);
         }
         assert!(got == want, "topo_order(200000, edges (2k+1, 2k) for 0 <= k < 100000): {}", harness_mismatch(&got, &want));
+
+        // Even nodes 2k before the top quarter's nodes n-1-k: while most nodes are ready, each node taken unlocks one
+        // that is larger than all of them.
+        let edges: Vec<(usize, usize)> = (0..n / 4).map(|k| (2 * k, n - 1 - k)).collect();
+        let got = topo_order(n, &edges).expect("large acyclic graph must succeed");
+        let want: Vec<usize> = (0..n).collect();
+        assert!(got == want, "topo_order(200000, edges (2k, 199999-k) for 0 <= k < 50000): {}", harness_mismatch(&got, &want));
         let secs = start.elapsed().as_secs_f64();
-        assert!(secs < 5.0, "too slow: two graphs with 200000 nodes took {:.1} s", secs);
+        assert!(secs < 5.0, "too slow: three graphs with 200000 nodes took {:.1} s", secs);
     }
 }

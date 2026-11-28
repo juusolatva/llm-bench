@@ -1,14 +1,16 @@
+#include "solution.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <optional>
 #include <string>
-#include "solution.hpp"
+#include <utility>
 
 static std::string harness_text(const std::string& s) { return "\"" + s + "\""; }
 static std::string harness_text(int x) { return std::to_string(x); }
-static std::string harness_text(const std::optional<int>& o) { return o ? std::to_string(*o) : "std::nullopt"; }
+template <typename V>
+static std::string harness_text(const std::optional<V>& o) { return o ? harness_text(*o) : "std::nullopt"; }
 
 // A key type with only == and std::hash, all the prompt promises: it has no operator<, so a cache built on an ordered
 // container (std::map, std::set) doesn't compile with it.
@@ -22,28 +24,28 @@ struct std::hash<harness_key> {
 };
 static std::string harness_text(const harness_key& k) { return "harness_key{" + std::to_string(k.id) + "}"; }
 
-// Runs calls on an LruCache<K, int> and records them, so a failure can show every call made so far.
-template <typename K>
+// Runs calls on an LruCache<K, V> and records them, so a failure can show every call made so far.
+template <typename K, typename V = int>
 struct harness_cache {
-    LruCache<K, int> cache;
+    LruCache<K, V> cache;
     std::string log;
     explicit harness_cache(std::size_t capacity) : cache(capacity), log("LruCache(" + std::to_string(capacity) + ")") {}
     void fail(const std::string& what) {
         std::fprintf(stderr, "FAIL: after %s: %s\n", log.c_str(), what.c_str());
         std::exit(1);
     }
-    void put(const K& key, int value) {
+    void put(const K& key, const V& value) {
         cache.put(key, value);
-        log += ", put(" + harness_text(key) + ", " + std::to_string(value) + ")";
+        log += ", put(" + harness_text(key) + ", " + harness_text(value) + ")";
     }
-    void get(const K& key, std::optional<int> want) {
-        std::optional<int> got = cache.get(key);
+    void get(const K& key, const std::optional<V>& want) {
+        std::optional<V> got = cache.get(key);
         if (got != want)
             fail("get(" + harness_text(key) + ") returned " + harness_text(got) + ", want " + harness_text(want));
         log += ", get(" + harness_text(key) + ")";
     }
     void size(std::size_t want) {
-        std::size_t got = cache.size();
+        std::size_t got = std::as_const(cache).size();
         if (got != want) fail("size() returned " + std::to_string(got) + ", want " + std::to_string(want));
         log += ", size()";
     }
@@ -90,6 +92,17 @@ int main() {
     h.get(harness_key{2}, std::nullopt);
     h.get(harness_key{3}, 3);
     h.size(2);
+
+    harness_cache<int, std::string> s(2);
+    s.put(1, "one");
+    s.put(2, "two");
+    s.get(1, std::string("one"));
+    s.put(3, "three");                                 // evicts 2
+    s.get(2, std::nullopt);
+    s.put(1, "uno");
+    s.get(1, std::string("uno"));
+    s.get(3, std::string("three"));
+    s.size(2);
 
     // Timing: put(i, i) for i < n; from i = capacity / 2 on, every third step also get(i - capacity / 2), which is
     // still cached. The elapsed time is checked every 1000 puts, so an O(capacity) get or put fails here quickly.

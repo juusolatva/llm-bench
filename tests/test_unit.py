@@ -431,6 +431,9 @@ def test_builtin_harnesses_print_the_final_line(task):
             r"^(?:const|let|var|function|class|type|interface|async function) (?!harness_)(\w+)", test, re.MULTILINE
         )
         assert not unprefixed, f"unprefixed harness declarations: {unprefixed}"
+    if task["lang"] == "cpp":
+        # The solution header comes first, so one that relies on the harness's includes doesn't compile.
+        assert test.startswith('#include "solution.hpp"\n')
 
 
 def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):

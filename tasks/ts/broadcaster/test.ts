@@ -28,12 +28,20 @@ class harness_Client implements Client {
 /** One Broadcaster and the steps done to it, which every failure message replays. */
 class harness_Run {
   readonly counts: number[] = [];
-  readonly steps: string[] = ["new Broadcaster({ maxBufferedBytes: 100, drainTimeoutMs: 1000, onCount })"];
+  readonly steps: string[];
   readonly b: Broadcaster;
 
-  constructor() {
-    const options: BroadcasterOptions = { maxBufferedBytes: 100, drainTimeoutMs: 1000, onCount: (n) => this.counts.push(n) };
-    this.b = new Broadcaster(options);
+  /** withOnCount false: the options leave out the optional onCount. */
+  constructor(withOnCount = true) {
+    const options: BroadcasterOptions = { maxBufferedBytes: 100, drainTimeoutMs: 1000 };
+    if (withOnCount) options.onCount = (n) => this.counts.push(n);
+    const shown = withOnCount ? "maxBufferedBytes: 100, drainTimeoutMs: 1000, onCount" : "maxBufferedBytes: 100, drainTimeoutMs: 1000";
+    this.steps = [`new Broadcaster({ ${shown} })`];
+    try {
+      this.b = new Broadcaster(options);
+    } catch (error) {
+      throw new Error(`${this.steps[0]} threw ${harness_describe(error)}`);
+    }
   }
 
   where(): string {
@@ -372,6 +380,32 @@ function harness_remove(): void {
   r.expectDestroyed(c2, 0);
 }
 
+/** Clients removed while blocked and with a missed update keep nothing of that state, also once added again. */
+function harness_removeBlocked(): void {
+  const r = new harness_Run();
+  const c1 = new harness_Client("c1");
+  const c2 = new harness_Client("c2");
+  r.add(c1, "S", 0);
+  r.add(c2, "S", 0);
+  r.accept(c1, false);
+  r.accept(c2, false);
+  r.broadcast("U1", 1);
+  r.broadcast("U2", 2);
+  r.remove(c1);
+  r.remove(c2);
+  r.accept(c2, true);
+  r.add(c2, "S2", 3);
+  r.broadcast("U3", 4);
+  r.expectWritten(c2, ["S", "U1", "S2", "U3"]);
+  r.drained(c2, 5);
+  r.expectWritten(c2, ["S", "U1", "S2", "U3"]);
+  r.tick(1001);
+  r.expectDestroyed(c1, 0);
+  r.expectDestroyed(c2, 0);
+  r.expectCounts([1, 2, 1, 0, 1]);
+  r.expectSize(1);
+}
+
 function harness_readd(): void {
   const r = new harness_Run();
   const c1 = new harness_Client("c1");
@@ -381,6 +415,20 @@ function harness_readd(): void {
   r.expectCounts([1, 0, 1]);
   r.expectWritten(c1, ["S", "S2"]);
   r.expectSize(1);
+}
+
+function harness_withoutOnCount(): void {
+  const r = new harness_Run(false);
+  const c1 = new harness_Client("c1");
+  const c2 = new harness_Client("c2");
+  r.add(c1, "S", 0);
+  r.add(c2, "S", 0);
+  r.expectSize(2);
+  r.remove(c1);
+  r.buffered(c2, 99);
+  r.broadcast("U1", 1);
+  r.expectDestroyed(c2, 1);
+  r.expectSize(0);
 }
 
 const harness_scenarios: (() => void)[] = [
@@ -400,6 +448,8 @@ const harness_scenarios: (() => void)[] = [
   harness_drainedOverCap,
   harness_remove,
   harness_readd,
+  harness_removeBlocked,
+  harness_withoutOnCount,
 ];
 
 for (const scenario of harness_scenarios) {
