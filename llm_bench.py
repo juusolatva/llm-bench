@@ -61,6 +61,8 @@ BEFORE_MODEL_OUTPUT_BYTES = 2000  # end of a failed --before-model command's out
 BEFORE_MODEL_OUTPUT_GRACE_S = 1  # read the rest of its output for at most this long after it exits
 # Context check: a trial needs roughly BASE + (attempts - 1) * PER_RETRY + max tokens of context
 # (system + task prompt; each retry adds the previous reply and the clipped build/test output).
+# PER_RETRY is a typical retry, not the worst case: a failing reply that isn't cut off can be up to max tokens
+# long (minus its stripped reasoning), so long failing replies can still overflow a context that passed.
 CONTEXT_BASE_TOKENS = 1000
 CONTEXT_PER_RETRY_TOKENS = 4000
 CONTEXT_CALIBRATION_WORDS = 2000  # filler words used to measure the tokenizer's tokens per word
@@ -1199,7 +1201,7 @@ def run_cmd(cmd, cwd, timeout=None, go_cache_rw=None):
     timeout: run time limit (default CMD_TIMEOUT_S). go_cache_rw: host directory mounted writable as the Go
     build cache, used only to warm GO_CACHE with trusted code; otherwise GO_CACHE (if set) is mounted as an
     overlay whose writes go to a private tmpfs."""
-    timeout = timeout or CMD_TIMEOUT_S
+    timeout = CMD_TIMEOUT_S if timeout is None else timeout
     tools = {name: shutil.which(name) for name in ("bwrap", "systemd-run", "systemctl")}
     if not all(tools.values()):
         return CmdResult(-1, "sandbox requires bwrap, systemd-run and systemctl; refusing host execution", False)
@@ -2703,11 +2705,18 @@ def finite_float(value):
 
 
 def same_json_value(a, b):
-    """Whether two request parameter values are the same JSON value: False and 0 (or True and 1) aren't."""
+    """Whether two request parameter values are the same JSON value: False and 0 (or True and 1) aren't, also
+    inside lists and objects, where Python's == would treat them as equal."""
     numbers = (int, float)
     if type(a) in numbers and type(b) in numbers:
         return a == b
-    return type(a) is type(b) and a == b
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, list):
+        return len(a) == len(b) and all(map(same_json_value, a, b))
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(same_json_value(a[key], b[key]) for key in a)
+    return a == b
 
 
 def reject_constant(name):
@@ -2923,6 +2932,8 @@ def parse_args():
     args = ap.parse_args()
     if not args.summary and (args.format or args.per_task):  # no default, so an explicit table is caught too
         ap.error("--format and --per-task work only with --summary")
+    if args.summary and args.endpoints:  # checked before LLM_BENCH_ENDPOINTS fills them in
+        ap.error(f"--summary takes no endpoints: {' '.join(args.endpoints)}")
     args.format = args.format or "table"
     if not args.endpoints:
         args.endpoints = os.environ.get("LLM_BENCH_ENDPOINTS", "").split()
@@ -2933,17 +2944,26 @@ def parse_args():
     args.api_key = args.api_key or os.environ.get("LLM_BENCH_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if args.tag:
         args.tag = safe_name(args.tag)
-    args.params = dict(args.param)
-    if args.temperature is not None and not same_json_value(
-        args.params.get("temperature", args.temperature), args.temperature
-    ):
-        ap.error("--temperature conflicts with --param temperature=...")
-    if args.temperature is not None:
-        args.params["temperature"] = args.temperature
-    reserved = sorted(RESERVED_PARAMS & args.params.keys())
+    args.params = request_params(ap, args.param, args.temperature)
+    return args
+
+
+def request_params(ap, param, temperature):
+    """The extra request parameters from --param (KEY, VALUE) pairs and --temperature; conflicting values or
+    parameters the benchmark sets itself end the program with a usage error."""
+    params = {}
+    for key, value in param:
+        if key in params and not same_json_value(params[key], value):
+            ap.error(f"--param {key}=... is given twice with different values")
+        params[key] = value
+    if temperature is not None:
+        if not same_json_value(params.get("temperature", temperature), temperature):
+            ap.error("--temperature conflicts with --param temperature=...")
+        params["temperature"] = temperature
+    reserved = sorted(RESERVED_PARAMS & params.keys())
     if reserved:
         ap.error(f"--param can't set {', '.join(reserved)}")
-    return args
+    return params
 
 
 def check_results_file(path):
