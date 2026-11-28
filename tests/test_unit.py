@@ -50,7 +50,8 @@ def test_parse_endpoint_rejects_credentials(spec):
     # Any user info counts, with or without a password; the message names the host but not the user info.
     with pytest.raises(ValueError, match="credentials in the URL") as e:
         llm_bench.parse_endpoint(spec)
-    assert "alice" not in str(e.value) and "gpu-box" in str(e.value)
+    assert "alice" not in str(e.value)
+    assert "gpu-box" in str(e.value)
 
 
 def test_parse_endpoint_name_is_path_safe():
@@ -661,9 +662,11 @@ def test_deadline_socket_stops_sending_at_the_deadline():
             return 100
 
     sock = Sock()
+    data = b"x" * 1_000_000
     start = time.monotonic()
+    deadline_sock = llm_bench.DeadlineSocket(sock, start + 0.5)
     with pytest.raises(TimeoutError):
-        llm_bench.DeadlineSocket(sock, time.monotonic() + 0.5).sendall(b"x" * 1_000_000)
+        deadline_sock.sendall(data)
     assert time.monotonic() - start < 1
     assert sock.timeout == 5  # restored for the reads that follow
 
@@ -680,8 +683,9 @@ def test_deadline_socket_send_of_nothing_fails_at_once():
             return 0
 
     start = time.monotonic()
+    deadline_sock = llm_bench.DeadlineSocket(Sock(), start + 5)
     with pytest.raises(OSError, match="connection closed while sending the request"):
-        llm_bench.DeadlineSocket(Sock(), time.monotonic() + 5).sendall(b"x")
+        deadline_sock.sendall(b"x")
     assert time.monotonic() - start < 1
 
 
@@ -713,10 +717,12 @@ def test_deadline_create_connection_gives_all_addresses_one_deadline(monkeypatch
 
     monkeypatch.setattr(llm_bench.socket, "socket", Socket)
     start = time.monotonic()
+    deadline = start + 0.5
     with pytest.raises(TimeoutError):
-        llm_bench.deadline_create_connection(("gpu-box", 80), time.monotonic() + 0.5, 10)
+        llm_bench.deadline_create_connection(("gpu-box", 80), deadline, 10)
     assert time.monotonic() - start < 1
-    assert attempts[0] == pytest.approx(0.5, abs=0.05) and len(attempts) <= 2
+    assert attempts[0] == pytest.approx(0.5, abs=0.05)
+    assert len(attempts) <= 2
 
 
 def test_deadline_create_connection_tries_the_next_address(monkeypatch):
@@ -1400,7 +1406,8 @@ def test_run_cmd_stops_the_sandbox_at_the_output_limit(fake_sandbox, tmp_path, m
     assert (rc, timed_out) == (-1, False)
     assert out == "z" * 100 + "\n[output limit exceeded]"
     stops = (tmp_path / "systemctl").read_text().splitlines()
-    assert len(stops) == 2 and stops[0] == stops[1]  # at the limit, and again once it has ended
+    assert len(stops) == 2  # at the limit, and again once it has ended
+    assert stops[0] == stops[1]
 
 
 def test_run_cmd_reports_the_time_limit_with_the_output_limit(fake_sandbox, tmp_path, monkeypatch):
