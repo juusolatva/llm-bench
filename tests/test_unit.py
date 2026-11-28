@@ -431,6 +431,9 @@ def test_builtin_harnesses_print_the_final_line(task):
             r"^(?:const|let|var|function|class|type|interface|async function) (?!harness_)(\w+)", test, re.MULTILINE
         )
         assert not unprefixed, f"unprefixed harness declarations: {unprefixed}"
+    if task["lang"] == "cpp":
+        # The solution header comes first, so one that relies on the harness's includes doesn't compile.
+        assert test.startswith('#include "solution.hpp"\n')
 
 
 def make_task(root, lang, name, prompt="Write it.", test="echo ok\n"):
@@ -599,6 +602,11 @@ def test_connection_stops_a_trickling_proxy_reply_at_its_timeout():
         ("192.168.1.20", True),
         ("10.0.0.5", True),
         ("fe80::1", True),
+        ("100.64.0.1", True),  # shared address space: carrier-grade NAT, mesh VPNs
+        ("100.127.255.254", True),
+        ("::ffff:100.100.1.2", True),
+        ("100.128.0.1", False),
+        ("100.63.255.255", False),
         ("gpu-box", True),
         ("gpu-box.lan", True),
         ("gpu-box.local.", True),

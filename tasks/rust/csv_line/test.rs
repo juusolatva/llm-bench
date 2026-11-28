@@ -3,11 +3,11 @@ mod harness_tests {
     use solution::parse_csv_line;
     fn harness_ok(line: &str, want: &[&str]) {
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
-        let got = parse_csv_line(line);
+        let got: Result<Vec<String>, String> = parse_csv_line(line);
         assert!(got.as_ref() == Ok(&want), "parse_csv_line({:?}): got {:?}, want Ok({:?})", line, got, want);
     }
     fn harness_err(line: &str) {
-        let got = parse_csv_line(line);
+        let got: Result<Vec<String>, String> = parse_csv_line(line);
         assert!(got.is_err(), "parse_csv_line({:?}): got {:?}, want an Err", line, got);
     }
 
@@ -32,5 +32,10 @@ mod harness_tests {
         harness_err("\"a\"b");
         harness_err("a\"b");
         harness_err("x,\"a\"\"");
+        harness_err("\"a\"b\"c\"");
+        harness_err("\"a\" \"b\"");
+        harness_err("a\"b\"");
+        harness_err(" \"a\"");
+        harness_err("\"a\" ,b");
     }
 }

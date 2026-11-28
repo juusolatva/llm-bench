@@ -1,9 +1,9 @@
+#include "solution.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
-#include "solution.hpp"
 
 #define HARNESS_CHECK(c, ...) do { if (!(c)) { std::fprintf(stderr, "FAIL: " __VA_ARGS__); std::fputc('\n', stderr); std::exit(1); } } while (0)
 
@@ -80,6 +80,17 @@ int main() {
                   "and the same pointer (move assignment must transfer the memory)",
                   harness_desc(n).c_str(), n.data() == p ? "==" : "!=");
     HARNESS_CHECK(m.size() == 0, "n = std::move(m): moved-from m.size() = %zu, want 0", m.size());
+    {
+        Buffer e = m;                                  // copies of an empty, moved-from Buffer
+        HARNESS_CHECK(e.size() == 0, "Buffer e = m (m was moved from): e.size() = %zu, want 0", e.size());
+        Buffer f(3);
+        f = m;
+        HARNESS_CHECK(f.size() == 0, "Buffer f(3); f = m (m was moved from): f.size() = %zu, want 0", f.size());
+        m = n;
+        HARNESS_CHECK(harness_holds(m, "wxyz") && m.data() != n.data(),
+                      "m = n (m was moved from, n has \"wxyz\"): m has %s; want \"wxyz\" in its own memory",
+                      harness_desc(m).c_str());
+    }
 
     // Buffers of 16 bytes with distinct first and last bytes, so a copy of only part of the bytes is caught.
     std::vector<Buffer> v;

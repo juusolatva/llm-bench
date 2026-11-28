@@ -47,6 +47,8 @@ int main(void) {
     harness_t("20/-4*2", 0, -10);
     harness_t("3000000000 * 2", 0, 6000000000L);
     harness_t("1 + 2 * (3 - 4) / 2 - 8", 0, -8);
+    harness_t("- 2", 0, -2);
+    harness_t("- ( - 2 )", 0, 2);
     harness_t("", -1, 0);
     harness_t("   ", -1, 0);
     harness_t("1+", -1, 0);
@@ -57,6 +59,17 @@ int main(void) {
     harness_t("()", -1, 0);
     harness_t("1 2", -1, 0);
     harness_t("2*(3+)", -1, 0);
+    harness_t("2*(3+)4", -1, 0);
+    harness_t("1 + () 2", -1, 0);
+    harness_t("3 + (-) 2", -1, 0);
+    harness_t("1(+2)", -1, 0);
+    harness_t("(1)(2)", -1, 0);
+    harness_t("2 (3)", -1, 0);
+    harness_t("-", -1, 0);
+    harness_t("1-", -1, 0);
+    harness_t("1 - -", -1, 0);
+    harness_t("1 + +2", -1, 0);
+    harness_t("(+1)", -1, 0);
     harness_t("1/0", -1, 0);
     harness_t("5/(2-2)", -1, 0);
     harness_t("4 % 2", -1, 0);
